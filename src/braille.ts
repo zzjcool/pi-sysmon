@@ -1,0 +1,163 @@
+/**
+ * braille 折线图渲染器 —— 纯字符，零依赖。
+ *
+ * 原理：每个 braille 字符（U+2800..U+28FF）可编码 2 列 × 4 行的点子像素，
+ *      相当于把终端分辨率横向×2、纵向×4，用来画折线图足够细腻。
+ *      这是 bottom 用的技术（ratatui Marker::Braille）。
+ *
+ * 点阵位映射（2×4）：
+ *     左列 bit0/1/2/6（点 1,2,3,7）   右列 bit3/4/5/7（点 4,5,6,8）
+ */
+
+const BRAILLE_BASE = 0x2800;
+
+/** (col: 0|1, row: 0..3) → bit 值 */
+function dotBit(col: number, row: number): number {
+	// 左列：row0->0x01, row1->0x02, row2->0x04, row3->0x40
+	// 右列：row0->0x08, row1->0x10, row2->0x20, row3->0x80
+	const left = [0x01, 0x02, 0x04, 0x40];
+	const right = [0x08, 0x10, 0x20, 0x80];
+	return (col === 0 ? left : right)[row] ?? 0;
+}
+
+export interface ChartSeries {
+	label: string;
+	/** 数值序列，索引 0 是最旧的数据 */
+	values: number[];
+}
+/**
+ * 把多组序列画成一张 braille 折线图。
+ *
+ * @param series   曲线（各自带标签，用于图例）
+ * @param width    字符宽度
+ * @param height   字符高度（行数）
+ * @param yMax     纵轴上限（固定值；传 undefined 则自动取各序列最大值）
+ * @param opts.stretch  数据点少于可用列数时是否拉伸铺满。
+ *                      false（默认）= 右侧对齐，x 轴严格对应固定时间窗（与 bottom 一致），
+ *                      但启动初期因历史尚短，曲线只占右侧一小段；
+ *                      true = 把现有历史拉伸铺满整宽，启动即可看清趋势（x 轴含义="当前缓冲区全部内容"）。
+ */
+export function renderChart(
+	series: ChartSeries[],
+	width: number,
+	height: number,
+	yMax?: number,
+	opts?: { stretch?: boolean },
+): string[] {
+	if (width <= 2 || height <= 0) return [];
+	const subW = width * 2; // 子像素列数
+	const subH = height * 4; // 子像素行数
+
+	// 所有序列共用的数据点数量（取最长）
+	const maxLen = Math.max(0, ...series.map((s) => s.values.length));
+	if (maxLen === 0) return [];
+
+	// y 轴上限：显式值也要归一化（yMax=0/负数/NaN 会让 v/top 变 NaN → 坐标 NaN → 越界崩溃）
+	let top = yMax;
+	if (top === undefined) {
+		top = 0;
+		for (const s of series) for (const v of s.values) if (v > top) top = v;
+	}
+	if (!Number.isFinite(top) || top <= 0) top = 1;
+
+	// 每张图一个点阵缓冲（[行][列]）
+	const grids: number[][][] = series.map(() =>
+		Array.from({ length: subH }, () => new Array<number>(subW).fill(0)),
+	);
+
+	series.forEach((s, si) => {
+		const grid = grids[si];
+		if (!grid) return;
+		const n = s.values.length;
+		if (n === 0) return;
+		// 把数据点映射到子像素坐标。
+		// 默认右侧对齐（与 bottom 一致）：x 轴代表固定时间窗，最新数据在最右、历史向左延伸。
+		// 传 opts.stretch 则拉伸铺满，避免启动初期图表过空。
+		const pts: Array<{ x: number; y: number }> = [];
+		const stretch = opts?.stretch ?? false;
+		for (let i = 0; i < n; i++) {
+			const x = stretch
+				? Math.round((i / Math.max(1, n - 1)) * (subW - 1))
+				: subW - n + i;
+			if (x < 0 || x >= subW) continue; // 超过窗口的旧数据丢弃
+			const raw = s.values[i] ?? 0;
+			// NaN / Infinity 容错：污染物直接当 0，避免整张图被毁
+			const v = Number.isFinite(raw) ? Math.max(0, Math.min(top, raw)) : 0;
+			// y: 0 在底部 → subH-1
+			const y = Math.round((1 - v / top) * (subH - 1));
+			if (!Number.isFinite(y)) continue; // 兑底：坐标非有限就不画，避免越界
+			pts.push({ x, y: Math.max(0, Math.min(subH - 1, y)) });
+		}
+		// 用 Bresenham 把相邻点连成线，避免锯齿断裂
+		for (let i = 1; i < pts.length; i++) {
+			const a = pts[i - 1];
+			const b = pts[i];
+			if (a && b) plotLine(grid, a, b);
+		}
+		// 只有 1 个点时 Bresenham 无从画线，手工打点（双重防御：行/列都先取再写）
+		const solo = pts[0];
+		if (pts.length === 1 && solo) {
+			const row = grid[solo.y];
+			if (row) row[solo.x] = 1;
+		}
+	});
+
+	// 把点阵合成 braille 字符串。
+	// 多序列在同一格命中时用**位或合并**（而非后画覆盖），这样两线相交处不会丢线；
+	// 代价是该格只能用一种颜色，因此取第一个命中的序列颜色。
+	const lines: string[] = [];
+	for (let row = 0; row < height; row++) {
+		let line = "";
+		for (let col = 0; col < width; col++) {
+			let merged = 0;
+			for (const grid of grids) {
+				for (let dy = 0; dy < 4; dy++) {
+					for (let dx = 0; dx < 2; dx++) {
+						const sy = row * 4 + dy;
+						const sx = col * 2 + dx;
+						if (sy < subH && sx < subW && grid[sy]?.[sx]) {
+							merged |= dotBit(dx, dy);
+						}
+					}
+				}
+			}
+			line += merged ? String.fromCodePoint(BRAILLE_BASE | merged) : " ";
+		}
+		lines.push(line);
+	}
+	return lines;
+}
+
+/** Bresenham 直线，写入点阵 */
+function plotLine(
+	grid: number[][],
+	a: { x: number; y: number },
+	b: { x: number; y: number },
+) {
+	let { x: x0, y: y0 } = a;
+	const { x: x1, y: y1 } = b;
+	const dx = Math.abs(x1 - x0);
+	const dy = Math.abs(y1 - y0);
+	const sx = x0 < x1 ? 1 : -1;
+	const sy = y0 < y1 ? 1 : -1;
+	let err = dx - dy;
+	const cols = grid[0]?.length ?? 0;
+	// guard 按实际最长边推导，避免极宽图被 10000 提前截断
+	const maxSteps = dx + dy + 2;
+	for (let step = 0; step <= maxSteps; step++) {
+		if (y0 >= 0 && y0 < grid.length && x0 >= 0 && x0 < cols) {
+			const grow = grid[y0];
+			if (grow) grow[x0] = 1;
+		}
+		if (x0 === x1 && y0 === y1) break;
+		const e2 = 2 * err;
+		if (e2 > -dy) {
+			err -= dy;
+			x0 += sx;
+		}
+		if (e2 < dx) {
+			err += dx;
+			y0 += sy;
+		}
+	}
+}

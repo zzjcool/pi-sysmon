@@ -346,9 +346,9 @@ export const MIN_TPS_SCALE = 10;
 /**
  * Tick column width for the TPS chart.
  *
- * Wider than `RATE_GUTTER` (5) because the unit is `tok/s` — the unit alone is
- * 5 columns, so squeezing digits in would inevitably overflow. 8 columns are
- * needed to hold unit-carrying ticks like `1.5Kt/s`.
+ * Wider than `RATE_GUTTER` (5): the widest tick this axis can emit is the
+ * `>999Kt/s` clamp, which is 8 columns (`1.5Kt/s` is 7). The unit is the
+ * **compact** `t/s`, not `tok/s` — see `fmtTps` for why.
  *
  * Like `RATE_GUTTER` it is **constant width**: when the tick label width
  * changes, the overlay width follows → the plot area's left edge jumps

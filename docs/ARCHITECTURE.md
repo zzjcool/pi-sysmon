@@ -674,8 +674,8 @@ So `blocks.ts` has a dedicated `tokenAxis`: same algorithm (×1.5, top-only, fix
 right-aligned), but the unit is `t/s` and the base is **1000** (tokens are a decimal
 quantity, consistent with API billing).
 
-Tick column width `TPS_GUTTER = 8`, wider than `RATE_GUTTER` (5), because the `t/s` unit
-alone takes 3 columns.
+Tick column width `TPS_GUTTER = 8`, wider than `RATE_GUTTER` (5) — the widest tick this axis
+can emit is the `>999Kt/s` clamp, which is 8 columns wide (`1.5Kt/s` is 7).
 Width is still constant — tick width changes shift the overprint area, and the plot area's
 left edge jitters frame to frame (see pitfall #6).
 

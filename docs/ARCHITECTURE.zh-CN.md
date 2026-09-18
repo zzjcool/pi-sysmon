@@ -568,7 +568,8 @@ setInterval 1s ──► meter.tick(now)    // 出桶 → tps → hist.tps 环�
 所以 `blocks.ts` 里有独立的 `tokenAxis`：算法相同（×1.5、只标顶端、定宽右对齐），
 但单位是 `t/s`，进制用 **1000**（token 是十进制量纲，与 API 账单一致）。
 
-刻度列宽 `TPS_GUTTER = 8`，比 `RATE_GUTTER`（5）宽，因为光 `t/s` 单位就 3 列。
+刻度列宽 `TPS_GUTTER = 8`，比 `RATE_GUTTER`（5）宽 —— 这条轴能吐出的最宽刻度是
+钳制值 `>999Kt/s`，正好 8 列（`1.5Kt/s` 是 7 列）。
 宽度仍然恒定 —— 刻度宽度一变，叠印区就变，绘图区左边界会逐帧跳（见坑 6）。
 
 量程下限 `MIN_TPS_SCALE = 10`：否则空闲期一个 1 tok/s 的尾点会把量程钉到 1.5，

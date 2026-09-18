@@ -1,9 +1,11 @@
 /**
- * 指标块的构造 —— 把「历史 + 最新快照」变成 chart-panel 能画的 `MetricBlock[]`。
+ * Metric block construction — turns "history + latest snapshot" into the
+ * `MetricBlock[]` that chart-panel can draw.
  *
- * 单独成文件的原因：这是**唯一**决定「每张图显示什么、读数写什么」的地方，
- * 抽出来才能被测试和渲染 harness 直接复用，而不是让它们在别处复制一份再慢慢漂移。
- * 这里不碰 pi API、不碰 TUI，纯数据 → 纯数据。
+ * Why a dedicated file: this is the **only** place that decides "what each
+ * chart shows and what its readouts say". Extracting it lets tests and the
+ * render harness reuse it directly instead of copying a version elsewhere
+ * that slowly drifts. No pi API, no TUI here — pure data in, pure data out.
  */
 import {
 	percentAxis,
@@ -13,11 +15,12 @@ import {
 	type StyledLine,
 } from "./chart-panel.ts";
 import { fmtBytes, fmtRate, type Snapshot } from "./metrics.ts";
-// TPS 的格式化函数住在 token 模块里（那里才是「token 相关」的归属地），
-// 这里 import 而不是自己再写一份 —— 同一个量有两份 formatter 迟早漂移。
+// The TPS formatter lives in the tokens module (the rightful home of anything
+// token-related); import it here rather than writing a second copy — two
+// formatters for the same quantity will drift sooner or later.
 import { fmtTps } from "./tokens.ts";
 
-/** 需要画成曲线的历史序列（都是数值数组，索引 0 最旧） */
+/** History series to plot as curves (all numeric arrays, index 0 = oldest) */
 export interface History {
 	cpu: number[];
 	mem: number[];
@@ -26,107 +29,119 @@ export interface History {
 	diskR: number[];
 	diskW: number[];
 	/**
-	 * LLM token 吞吐（tok/s），由 pi 的 `message_update` 流式事件估算而来。
+	 * LLM token throughput (tok/s), estimated from pi's streaming `message_update` events.
 	 *
-	 * 它不是系统指标（不来自 `/proc`），而是「本 pi 进程与 LLM API 之间的吞吐」，
-	 * 所以由 `src/tokens.ts` 的 meter 供给，详见那里的注释。
+	 * It is not a system metric (nothing to do with `/proc`) but the throughput
+	 * between this pi process and the LLM API, so it is fed by the meter in
+	 * `src/tokens.ts` — see the comments there.
 	 */
 	tps: number[];
 }
 
 /**
- * 速率图量程取样比例的默认值。
+ * Default sampling fraction of the rate-chart scale window.
  *
- * `1` = **量程窗 == 显示窗（60s）**，即 y 轴顶端就是这 60 秒里的真实最高值。
- * 这是用户明确要的行为：
- *   「我不需要 + 啊，我就是想要显示最高的地方就可以了，然后 60s 一个窗口」
- * 好处：屏幕上任何一根曲线的高度都能用顶端刻度直接读出来（**刻度永不撒谎**），
- * 不需要溢出标记 `+`。
+ * `1` = **scale window == display window (60s)**, i.e. the top of the y axis is
+ * the true maximum within these 60 seconds. This is the behavior the user
+ * explicitly asked for:
+ *   "I don't need + ... I just want it to show the highest point, with a 60s window"
+ * Benefit: the height of any curve on screen can be read directly off the top
+ * tick (**the scale never lies**), and no overflow marker `+` is needed.
  *
- * 代价（已知、已被用户明确接受）：一根尖峰会把量程钉住到它滞出 60s 窗口为止，
- * 期间后面的值看起来偏小。此前曾默认用 `1/6`（只看最近 10s）来缓解，
- * 但那反而造成「刻度只报 293KB、屏幕上却有根顶到天的尖峰」的撒谎问题。
+ * Cost (known and explicitly accepted by the user): one spike pins the scale
+ * until it rolls out of the 60s window, during which later values look small.
+ * We used to default to `1/6` (only the last 10s) to mitigate that, but it
+ * created a lying-scale problem: "tick says 293KB while a spike reaches the top
+ * of the screen".
  *
- * 想要旧的自动回落行为：设 `PI_SYSMON_SCALE_WINDOW=1/6`（或任意 <1 的比例），
- * 那时溢出标记 `+` 会自动生效来保证刻度仍然不撒谎。
+ * To get the old auto-fallback behavior: set `PI_SYSMON_SCALE_WINDOW=1/6` (or
+ * any fraction < 1); the overflow marker `+` then kicks in automatically so the
+ * scale still doesn't lie.
  */
 export const DEFAULT_SCALE_WINDOW_FRAC = 1;
 
 export interface BlockOptions {
-	/** 每张图显示最近多少个数据点（由布局的绘图宽度算出，见 plotWidthFor） */
+	/** How many recent data points each chart shows (derived from the layout's plot width, see plotWidthFor) */
 	points: number;
-	/** 是否额外加一块磁盘 I/O */
+	/** Whether to add an extra disk I/O block */
 	showDisks?: boolean;
 	/**
-	 * 是否显示 TPS（LLM token 吞吐）图。**默认开**（用户要求默认四图）。
+	 * Whether to show the TPS (LLM token throughput) chart. **On by default** (the user asked for four charts by default).
 	 *
-	 * 它和磁盘图不同：磁盘图默认关（四块并排只在宽终端才好看），
-	 * 而 TPS 是用户点名要的常驻指标。
+	 * Unlike the disk chart: disks default to off (four side-by-side blocks only
+	 * look good on wide terminals), while TPS is a standing indicator the user
+	 * explicitly requested.
 	 */
 	showTokens?: boolean;
-	/** 当前 TPS 读数（tok/s）。由 `src/tokens.ts` 的 meter 供给，供标题栏显示 */
+	/** Current TPS reading (tok/s). Fed by the meter in `src/tokens.ts`, shown in the title bar */
 	tpsNow?: number;
 	/**
-	 * 会话累计的**上行** token（我们发给模型的提示词），
-	 * 取自 `message_end` 的精确 `usage.input`（不是估算）。
+	 * Session-cumulative **uplink** tokens (the prompts we send to the model),
+	 * taken from the exact `usage.input` of `message_end` (not an estimate).
 	 */
 	tokensIn?: number;
-	/** 会话累计的**下行** token（模型返回的输出），取自精确 `usage.output` */
+	/** Session-cumulative **downlink** tokens (model output), from the exact `usage.output` */
 	tokensOut?: number;
-	/** 会话累计的缓存读取 token（`usage.cacheRead`），显示为 `R…` */
+	/** Session-cumulative cache-read tokens (`usage.cacheRead`), shown as `R…` */
 	tokensCacheRead?: number;
 	/**
-	 * 读数放哪里：`title`（默认）= 边框标题栏；`box` = 右上角浮动框；
-	 * `both` = 两者都画；`none` = 都不画。
+	 * Where to put the readouts: `title` (default) = border title bar; `box` =
+	 * floating box at the top-right corner; `both` = draw both; `none` = draw neither.
 	 *
-	 * 两个位置的数据是分开提供的：`MetricBlock.titleInfo` 给标题栏，
-	 * `MetricBlock.legend` 给浮动框。这样两种模式各自都能写最合适的文案
-	 * （例如标题栏可以省略 `RX:` 前缀，因为颜色已经区分了 RX/TX）。
+	 * The two positions are fed separately: `MetricBlock.titleInfo` for the title
+	 * bar, `MetricBlock.legend` for the floating box. That way each mode can use
+	 * the wording that suits it best (e.g. the title bar can drop the `RX:` prefix
+	 * because colors already distinguish RX/TX).
 	 */
 	labelMode?: LabelMode;
 	/**
-	 * 速率图（Network / Disks / Tokens）的**量程取样比例**，默认 `1`。
+	 * **Scale sampling fraction** for rate charts (Network / Disks / Tokens), default `1`.
 	 *
-	 * 含义：y 轴量程看**整个窗口**（60s）的最大值，而不是只取最近一小段。
-	 * 这样屏幕上任何一根曲线的高度都能直接用顶端刻度读出来（刻度不撒谎）。
-	 * 代价：比 10s 更旧的尖峰会被裁顶（画成贴顶平顶）。
+	 * Meaning: the y-axis scale looks at the maximum over the **whole window**
+	 * (60s), not just a recent slice. That way the height of any curve on screen
+	 * can be read directly off the top tick (the scale doesn't lie).
+	 * Cost: spikes older than 10s get clipped at the top (drawn as a flat ceiling).
 	 *
-	 * 参照 btop 验证过的做法（`btop_collect.cpp` 的 `net_auto`：
-	 * 滞后计数 5 帧后把量程降到「近期均值 × 1.3」，带 10KiB 下限）。
-	 * 取「10 秒」而不是 btop 的「5 帧」，是把它换算到本项目的时间尺度：
-	 * 5 秒太敏感，正常的短突发刚画上去就被裁顶。
+	 * Reference: btop's proven approach (`net_auto` in `btop_collect.cpp`:
+	 * after a hysteresis of 5 frames, drop the scale to "recent mean × 1.3" with
+	 * a 10KiB floor).
+	 * Using "10 seconds" instead of btop's "5 frames" translates it to this
+	 * project's time scale: 5 seconds is too twitchy — normal short bursts would
+	 * be clipped the moment they're drawn.
 	 *
-	 * 传 `1` 可退回「整个窗口取 max」的旧行为。
-	 * 百分比图不受影响（量程固定 0..100）。
+	 * Pass `1` to fall back to the old "max over the whole window" behavior.
+	 * Percent charts are unaffected (fixed 0..100 scale).
 	 */
 	scaleWindowFrac?: number;
 }
 
-/** 读数渲染位置 */
+/** Where readouts are rendered */
 export type LabelMode = "title" | "box" | "both" | "none";
 
 /**
- * 图表作为 widget 时挂在编辑器的上方还是下方。
+ * Whether the chart widget hangs above or below the editor.
  *
- * 对应 pi 官方的 `setWidget(key, content, { placement })`（`WidgetPlacement`
- * 自 0.8x 起就是公开 API）。只有 `chart` 模式用得上 ——
- * `footer` 模式是替换整个底部（footer 本来就在编辑器下方），`status` 模式只是一个状态行。
+ * Maps to pi's official `setWidget(key, content, { placement })`
+ * (`WidgetPlacement` has been public API since 0.8x). Only `chart` mode uses it —
+ * `footer` mode replaces the whole bottom (which is below the editor anyway),
+ * and `status` mode is just a status line.
  */
 export type Placement = "aboveEditor" | "belowEditor";
 
 /**
- * 解析 `PI_SYSMON_PLACEMENT`。
+ * Parse `PI_SYSMON_PLACEMENT`.
  *
- * **默认（不设）= `belowEditor`**（图表在输入框下方）——
- * 这是用户选的默认：图表贴底，不占聊天区上方的位置。
+ * **Default (unset) = `belowEditor`** (chart below the input box) —
+ * the default chosen by the user: charts hug the bottom and don't take space
+ * above the chat area.
  *
- * 宽容取值：`above` / `aboveEditor` / `top` 都当“上方”，
- * 其余（含 undefined、拼错的值）一律回退到默认的 `belowEditor` ——
- * 与 `PI_SYSMON_LABEL` / `PI_SYSMON_MODE` 的容错方式一致：
- * 配错一个环境变量不应该让整个扩展不工作。
+ * Lenient values: `above` / `aboveEditor` / `top` all mean "above";
+ * everything else (including undefined and typos) falls back to the default
+ * `belowEditor` — consistent with the error tolerance of `PI_SYSMON_LABEL` /
+ * `PI_SYSMON_MODE`: one misconfigured env var shouldn't break the whole extension.
  *
- * 注意旧版本默认是 `aboveEditor`，所以 `PI_SYSMON_PLACEMENT=above`
- * 是升级后保持旧观感的开关。
+ * Note that older versions defaulted to `aboveEditor`, so
+ * `PI_SYSMON_PLACEMENT=above` is the switch to keep the old look after upgrading.
  */
 export function parsePlacement(v: string | undefined): Placement {
 	const s = (v ?? "").trim().toLowerCase();
@@ -136,20 +151,26 @@ export function parsePlacement(v: string | undefined): Placement {
 }
 
 /**
- * 会话累计输出 token 的短格式（`1.2M` / `345K` / `1200`）。
+ * Short format for session-cumulative output tokens (`1.2M` / `345K` / `1200`).
  *
- * 不进图表刻度，所以不用定宽；但必须有上界，否则一场极长会话的累计值
- * 会把标题行撑破（宽度越界 = pi 崩溃退出）。进制用 1000（token 是十进制量纲）。
+ * It doesn't feed chart scales, so no fixed width needed; but it must have an
+ * upper bound, otherwise a very long session's cumulative value would blow up
+ * the title row (exceeding width = pi crashes). Base 1000 (tokens are a
+ * decimal quantity).
  */
 /**
- * 格式化一个 token 计数。
+ * Format a token count.
  *
- * **刻意逐字对齐 pi footer 的 `formatTokens`**（`dist/modes/interactive/components/footer.js`）：
- * 这样图上的 `↑5.7k ↓11` 与 pi 底部那行 `↑5.7k ↓11 R640` 数字完全一致，可互相对照。
- * 包括**小写 `k`** —— 大写 `K` 既与宿主不一致，也会和 `fmtTps` 的 `Kt/s` 混淆。
+ * **Deliberately byte-identical to pi footer `formatTokens`**
+ * (`dist/modes/interactive/components/footer.js`): that way the chart's
+ * `↑5.7k ↓11` matches the numbers in pi's bottom line `↑5.7k ↓11 R640`
+ * exactly and they can be cross-checked. Including the **lowercase `k`** —
+ * an uppercase `K` would both diverge from the host and collide with
+ * `fmtTps`'s `Kt/s`.
  *
- * 唯一与 pi 不同的是**加了上界钳制**：本仓库的铁律是任何渲染行超宽就让 pi
- * 崩溃退出，所以极端值必须收口（pi 那边没有上限，会一路长到 `1000000M`）。
+ * The only difference from pi is the **added upper-bound clamp**: this repo's
+ * iron rule is that any over-wide rendered line crashes pi, so extreme values
+ * must be capped (pi has no cap and grows all the way to `1000000M`).
  */
 export function fmtTokensTotal(n: number): string {
 	if (!Number.isFinite(n) || n <= 0) return "0";
@@ -161,75 +182,85 @@ export function fmtTokensTotal(n: number): string {
 	return Math.floor(n).toString();
 }
 
-/** 取数组尾部 n 个元素（不足则全取） */
+/** Take the last n elements of an array (all of it if shorter) */
 export function tail(arr: number[], n: number): number[] {
 	return n >= arr.length ? arr : arr.slice(arr.length - n);
 }
 
 /**
- * TPS 图的 y 轴 —— 与 `rateAxis` 算法相同（量程 = 最大值 × 1.5、只标顶端一个值、
- * 定宽 `RATE_GUTTER` 列），但**单位是 token 而不是字节**。
+ * Y axis for the TPS chart — same algorithm as `rateAxis` (scale = max × 1.5,
+ * only the top value labeled, fixed width `RATE_GUTTER` columns), but the
+ * **unit is tokens, not bytes**.
  *
- * 为什么不直接用 `rateAxis`：它硬编码了 1024 进制和 `B/KB/MB` 后缀，
- * 拿它画 tok/s 会输出 `2.2KB`（1500 tok/s）这种错单位的刻度 ——
- * 图上写着 KB，实际是 token，比没刻度还糟。
+ * Why not just use `rateAxis`: it hardcodes the 1024 base and the `B/KB/MB`
+ * suffixes; using it for tok/s would print scales like `2.2KB` (1500 tok/s) —
+ * wrong units. A chart saying KB when it's really tokens is worse than no scale.
  *
- * 1K = 1000（不是 1024）：token 计数是十进制量纲，
- * 而且 API 账单里的 token 数也是十进制（`total_tokens`），不应用二进制换算。
+ * 1K = 1000 (not 1024): token counts are a decimal quantity, and token counts
+ * in API billing are decimal too (`total_tokens`), so no binary conversion.
  *
- * 刻度下限：`MIN_TPS_SCALE`。没有它的话，空闲期一个 1 tok/s 的尾点会把量程钉到 1.5，
- * 下一句回复 200 tok/s 就直接顶格。有下限则从 10 tok/s 起步，曲线仍然接近贴底，
- * 但不会因为一个噪声点就压缩整个量程。
+ * Scale floor: `MIN_TPS_SCALE`. Without it, a 1 tok/s tail point during idle
+ * would pin the scale at 1.5, and the next reply at 200 tok/s would slam the
+ * ceiling. With the floor the scale starts at 10 tok/s; the curve still hugs
+ * the bottom, but one noise point can't compress the entire scale.
  */
 /**
- * TPS 图量程下限（tok/s）。没有它的话，空闲期一个 1 tok/s 的尾点会把量程钉到 1.5，
- * 下一句回复 200 tok/s 就直接顶格；有下限则从 10 tok/s 起步。
+ * Scale floor for the TPS chart (tok/s). Without it, a 1 tok/s tail point
+ * during idle would pin the scale at 1.5 and the next 200 tok/s reply would
+ * slam the ceiling; with the floor the scale starts at 10 tok/s.
  */
 export const MIN_TPS_SCALE = 10;
 
 /**
- * TPS 图的刻度列宽。
+ * Tick column width for the TPS chart.
  *
- * 比 `RATE_GUTTER`（5）宽，因为单位是 `tok/s` —— 光单位就 5 列，
- * 再塞数字就必然超宽。宽到 8 列才能装下 `1.5Kt/s` 这种带单位的刻度。
+ * Wider than `RATE_GUTTER` (5) because the unit is `tok/s` — the unit alone is
+ * 5 columns, so squeezing digits in would inevitably overflow. 8 columns are
+ * needed to hold unit-carrying ticks like `1.5Kt/s`.
  *
- * 和 `RATE_GUTTER` 一样是**恒定宽**：刻度标签宽度一变，
- * 叠印宽度就跟着变 → 绘图区左边界逐帧左右跳（ARCHITECTURE 坑 6）。
+ * Like `RATE_GUTTER` it is **constant width**: when the tick label width
+ * changes, the overlay width follows → the plot area's left edge jumps
+ * left/right every frame (ARCHITECTURE pitfall 6).
  */
 export const TPS_GUTTER = 8;
 
 /**
- * TPS 图的 y 轴。
+ * Y axis for the TPS chart.
  *
- * 算法与 `rateAxis` 一致（量程 = 最大值 × 1.5、只标顶端一个值、定宽右对齐），
- * 但**单位是 token 而不是字节**。
+ * Same algorithm as `rateAxis` (scale = max × 1.5, only the top value labeled,
+ * fixed-width right-aligned), but the **unit is tokens, not bytes**.
  *
- * 为什么不直接用 `rateAxis`：它硬编码了 1024 进制和 `B/KB/MB` 后缀 ——
- * 拿它画 tok/s 会输出 `2.2KB`（实际是 1500 tok/s）这种错单位的刻度。
- * 图上写着 KB 而实际是 token，比没有刻度更糟。
+ * Why not just use `rateAxis`: it hardcodes the 1024 base and the `B/KB/MB`
+ * suffixes — using it for tok/s would print scales like `2.2KB` (actually
+ * 1500 tok/s). A chart saying KB when it's really tokens is worse than no scale.
  *
- * 进制用 **1000** 而非 1024：token 是十进制量纲，API 账单里的 `total_tokens` 也是十进制。
+ * Base **1000**, not 1024: tokens are a decimal quantity, and `total_tokens`
+ * in API billing is decimal too.
  */
 export function tokenAxis(dataMax: number): AxisSpec {
-	// NaN/Infinity/负数先落回 0：否则 `Math.max` 会把 NaN 一路带到刻度文字里，
-	// 再往下就是 NaN 坐标 → 越界崩溃（见 ARCHITECTURE.md 坑 4）。
+	// NaN/Infinity/negatives fall back to 0 first: otherwise `Math.max` carries
+	// NaN all the way into the tick text, and next stop is NaN coordinates →
+	// out-of-bounds crash (see ARCHITECTURE.md pitfall 4).
 	const dm = Number.isFinite(dataMax) && dataMax > 0 ? dataMax : 0;
-	// 量程 = 最大值 × 1.5（峰值落在轴高约 2/3 处，与 rateAxis 同口径）；
-	// 空数据/极小值用下限，避免量程为 0（图会直接贴顶）。
+	// Scale = max × 1.5 (the peak lands at about 2/3 of the axis height, same
+	// convention as rateAxis); empty/tiny data uses the floor to avoid a zero
+	// scale (the chart would slam against the top).
 	const top = Math.max(dm * 1.5, MIN_TPS_SCALE);
-	// 定宽右对齐：所有分支都必须恰好返回 TPS_GUTTER 列。
+	// Fixed width, right-aligned: every branch must return exactly TPS_GUTTER columns.
 	const fit = (v: number): string => {
 		let s: string;
 		if (v >= 1e6)
-			s = ">999Kt/s"; // 极端值：给个上界，绝不输出科学计数法
+			s = ">999Kt/s"; // extreme values: give an upper bound, never scientific notation
 		else if (v >= 1000) {
 			const k = (v / 1000).toFixed(1);
 			s = `${k}Kt/s`;
-			// 放不下就降精度（`100.5K` → `101K`），而不是截断出 `100.5Kt/` 这种残串。
+			// If it doesn't fit, reduce precision (`100.5K` → `101K`) instead of
+			// truncating into a mangled stub like `100.5Kt/`.
 			if (s.length > TPS_GUTTER) {
-				// 取整后可能得 1000（如 v=999999 → `1000K`），必须落回钳制值：
-				// 否则刻度会写 `1000Kt/s`，与上面的 `>999Kt/s` 口径自相矛盾
-				// （而且 `1000K` 读着像 1M，却还带 K 后缀）。
+				// Rounding may yield 1000 (e.g. v=999999 → `1000K`), so fall back to
+				// the clamped value: otherwise the tick would say `1000Kt/s`,
+				// contradicting the `>999Kt/s` convention above (and `1000K` reads
+				// like 1M yet still carries a K suffix).
 				const n = Math.round(v / 1000);
 				s = n >= 1000 ? ">999Kt/s" : `${n}Kt/s`;
 			}
@@ -241,64 +272,76 @@ export function tokenAxis(dataMax: number): AxisSpec {
 	return { labels: [fit(top)], max: top };
 }
 
-/** 时间窗口的解析结果 */
+/** Result of resolving the time window */
 export interface WindowSpec {
-	/** 应该取多少个数据点画图 */
+	/** How many data points to plot */
 	points: number;
-	/** x 轴左端标签显示的时长（秒） */
+	/** Duration (seconds) shown by the x-axis left label */
 	windowSecs: number;
 }
 
 /**
- * 解析「该显示多长的历史」。
+ * Resolve "how much history to show".
  *
- * **这是横轴时间尺度的唯一来源。** 抽成纯函数的理由是它曾经是一个真 bug：
- * 以前在原地按「绘图区能装多少点」反推窗口（`plotWidthFor(blockW) * 2 / interval`），
- * 结果同一台机器上改个终端宽度，x 轴标签就从 `60s` 漂到 `44s`/`84s`/`118s` ——
- * 时间尺度随窗口尺寸变化，跨宽度、跨机器都没法对比。
- * 而且那段逻辑写在组件闭包里，没有测试能碰到它（渲染 harness 还各自抄了一遗，
- * 导致改了一处另一处照旧漂移）。现在只有这一份，且可单测。
+ * **This is the single source of truth for the horizontal time scale.** It was
+ * extracted into a pure function because it used to be a real bug: the window
+ * used to be derived in place from "how many points fit the plot area"
+ * (`plotWidthFor(blockW) * 2 / interval`), so on the same machine, changing the
+ * terminal width drifted the x-axis label from `60s` to `44s`/`84s`/`118s` —
+ * the time scale changed with window size, making comparisons across widths
+ * and machines impossible. And that logic lived inside a component closure
+ * that no test could reach (the render harnesses each copied their own
+ * version, so fixing one left the others drifting). Now there's only one copy,
+ * and it's unit-testable.
  *
- * 两个关键行为：
- *  1. **默认按时间取点，不按宽度**（对齐 bottom 的 `default_time_value = 60_000`）；
- *  2. **标签永远显示配置的窗口长度**（启动 3 秒也显示 `60s`）——
- *     以前这里会按已攒点数缩成 `3s`，导致启动期横轴时长一直变，
- *     看的人没法把“现在这一段”和“满窗口”对比。配合右对齐渲染
- *     （`stretch: false`，数据从右侧长出来），`60s` 这个读数才是诚实的：
- *     3 秒的数据就只占右边 1/20 宽度，而不是被拉伸冒充 60 秒。
+ * Two key behaviors:
+ *  1. **Pick points by time, not by width** (aligned with bottom's
+ *     `default_time_value = 60_000`);
+ *  2. **The label always shows the configured window length** (shows `60s`
+ *     even 3 seconds after startup) — it used to shrink to `3s` based on
+ *     points collected so far, making the horizontal duration grow during
+ *     startup so you couldn't compare "this stretch now" with "a full window".
+ *     Combined with right-aligned rendering (`stretch: false`, data grows in
+ *     from the right), the `60s` reading is honest: 3 seconds of data only
+ *     occupy the rightmost 1/20 of the width instead of being stretched to
+ *     impersonate 60 seconds.
  */
 export function resolveWindow(opts: {
-	/** 目标窗口时长（秒） */
+	/** Target window duration (seconds) */
 	windowSecs: number;
-	/** 采样间隔（毫秒）—— 窗口换算成点数时要用 */
+	/** Sampling interval (milliseconds) — needed to convert the window into a point count */
 	intervalMs: number;
-	/** 显式指定的点数（PI_SYSMON_POINTS），设了就忽略窗口秒数 */
+	/** Explicitly specified point count (PI_SYSMON_POINTS); when set, the window seconds are ignored */
 	fixedPoints?: number;
 	/**
-	 * 目前缓冲区里实际有多少点。
-	 * @deprecated 不再用它缩短窗口时长（那会使横轴刻度漂移）。
-	 * 保留参数是为了不改动现有调用点；传入值被忽略。
+	 * How many points are actually in the buffer right now.
+	 * @deprecated No longer used to shorten the window duration (that made the
+	 * horizontal scale drift). The parameter is kept so existing call sites don't
+	 * change; the passed value is ignored.
 	 */
 	available?: number;
 }): WindowSpec {
 	const points =
 		opts.fixedPoints ??
 		Math.max(2, Math.round((opts.windowSecs * 1000) / opts.intervalMs));
-	// 窗口时长**不随已攒历史变化**：刻度必须稳定。
-	// 之前用 `min(points, available)` 是为了“不让标签谎报”，
-	// 但那让启动期的横轴一直在长（3s→14s→30s→60s）。
-	// 真正诚实的做法是**按时间比例渲染**（数据从右边长出来、一秒的屏宽恒定），
-	// 而不是把刻度改成当前已有的时长。
+	// The window duration **does not change with collected history**: the scale must be stable.
+	// The previous `min(points, available)` was meant to "keep the label honest",
+	// but it made the horizontal axis keep growing during startup (3s→14s→30s→60s).
+	// The truly honest approach is **time-proportional rendering** (data grows in
+	// from the right, one second of screen width is constant), not rewriting the
+	// scale to whatever duration happens to be buffered.
 	//
-	// 时长必须由**实际点数**反推，而不是直接返回 `windowSecs`：
-	// `PI_SYSMON_POINTS` 可显式改点数，那时真实窗口就是 `points` 个采样间隔，
-	// 与 `windowSecs` 无关（否则 `POINTS=200` 会谎报 `60s`）。
+	// The duration must be derived from the **actual point count**, not returned
+	// as `windowSecs` directly: `PI_SYSMON_POINTS` can explicitly change the
+	// point count, and then the real window is `points` sampling intervals,
+	// unrelated to `windowSecs` (otherwise `POINTS=200` would falsely report `60s`).
 	return { points, windowSecs: (points * opts.intervalMs) / 1000 };
 }
 
 /**
- * 构造各指标块。`snap === undefined`（采集失败/尚未采集）时仍然返回结构完整的块，
- * 只是没有读数、曲线为空 —— 行数因此保持恒定。
+ * Build the metric blocks. When `snap === undefined` (collection failed / not
+ * collected yet) still returns structurally complete blocks — just without
+ * readouts and with empty curves — so the row count stays constant.
  */
 export function buildBlocks(
 	hist: History,
@@ -306,18 +349,21 @@ export function buildBlocks(
 	opts: BlockOptions,
 ): MetricBlock[] {
 	const points = Math.max(1, Math.floor(opts.points));
-	// 读数位置开关：默认 `title`（标题栏），也就是只填 titleInfo、不填 legend。
-	// 这里统一决定，避免每个块里各写一遗 `labelMode` 判断而漏掉某个块。
+	// Readout position switch: default `title` (title bar), i.e. only fill
+	// titleInfo, not legend. Decided once here so each block doesn't repeat its
+	// own `labelMode` check and risk missing one.
 	const mode: LabelMode = opts.labelMode ?? "title";
 	const wantTitle = mode === "title" || mode === "both";
 	const wantBox = mode === "box" || mode === "both";
-	/** 按开关取舍：不要的那一份直接置空，renderBlock/renderPanel 会自然跳过 */
+	/** Pick per switch: the unwanted copy is blanked out so renderBlock/renderPanel naturally skip it */
 	const at = (title: StyledLine | undefined): StyledLine | undefined =>
 		wantTitle ? title : undefined;
 	const ab = (box: StyledLine[]): StyledLine[] => (wantBox ? box : []);
-	// 速率图的量程取样点数：由**目标窗口**折算，与当前已经攒了多少点无关。
-	// 用绝对点数而非比例，是因为比例会随启动初期的短数组得到越来越长的量程窗，
-	// 使恢复耗时飘忽（实测会从 10s 漂到 18s）。
+	// Scale sampling point count for rate charts: derived from the **target
+	// window**, independent of how many points have been collected so far.
+	// Absolute point count rather than a fraction, because a fraction applied to
+	// the short arrays of early startup yields a growing scale window, making
+	// recovery time erratic (measured drifting from 10s to 18s).
 	const rateScalePts = Math.max(
 		1,
 		Math.round(points * (opts.scaleWindowFrac ?? DEFAULT_SCALE_WINDOW_FRAC)),
@@ -325,11 +371,11 @@ export function buildBlocks(
 
 	const blocks: MetricBlock[] = [
 		{
-			// 名字与 bottom 的边框标题一致
+			// Name matches bottom's border title
 			name: "CPU",
 			color: "success",
-			// 标题栏读数（按重要度降序，窄块时从尾部丢）：
-			// 当前占用率 → 1/5/15 分钟负载（后者的格式对齐 bottom 的 `CPU ─ 1.52 1.71 2.26`）
+			// Title-bar readouts (descending importance; dropped from the tail on narrow blocks):
+			// current usage → 1/5/15 min load averages (the latter formatted like bottom's `CPU ─ 1.52 1.71 2.26`)
 			titleInfo: at(
 				snap
 					? [
@@ -342,8 +388,9 @@ export function buildBlocks(
 					: undefined,
 			),
 			series: [{ values: tail(hist.cpu, points) }],
-			// 供 `PI_SYSMON_LABEL=box` 使用的浮动读数框（内容与标题栏有重叠，
-			// 因为两种模式只启用其一，不必为避免重复而牺牲信息量）
+			// Floating readout box for `PI_SYSMON_LABEL=box` (content overlaps the
+			// title bar's, but since only one of the two modes is enabled, no need
+			// to sacrifice information to avoid duplication)
 			legend: ab(snap ? [[{ text: `AVG ${snap.cpuPct.toFixed(0)}%` }]] : []),
 			windowPoints: points,
 			axis: () => percentAxis(),
@@ -351,7 +398,8 @@ export function buildBlocks(
 		{
 			name: "Memory",
 			color: "warning",
-			// 用户点名要的：把 `30G/62G` 直接接在标题栏的百分比后面
+			// Explicitly requested by the user: append `30G/62G` right after the
+			// percentage in the title bar
 			titleInfo: at(
 				snap
 					? [
@@ -380,39 +428,46 @@ export function buildBlocks(
 		{
 			name: "Network",
 			color: "accent",
-			// 顺序是**瞬时速率在前、累计总流量在后**，因为标题栏宽度不够时
-			// 是**从尾部丢**，所以后面的会先被藏起来。
-			// 速率变化是这张图的主体（曲线画的也是它），放前面保证任何宽度都在；
-			// 总流量是背景信息，窄块时先舍它。
-			// Σ = 累计（∑）。同理 ↓=RX 用 accent、↑=TX 用 warning，
-			// 与图里两条曲线同色，所以不用额外文字区分方向。
+			// Order is **instantaneous rate first, cumulative total after**, because
+			// when the title bar runs out of width it **drops from the tail**, so
+			// the later parts get hidden first.
+			// Rate change is the main subject of this chart (the curves draw it), so
+			// it goes first to survive any width; total traffic is background info
+			// and is sacrificed first on narrow blocks.
+			// Σ = cumulative (∑). Likewise ↓=RX in accent and ↑=TX in warning,
+			// same colors as the two curves in the chart, so no extra text is
+			// needed to tell directions apart.
 			titleInfo: at(
 				snap
 					? [
 							{ text: `↓${fmtRate(snap.rxBps)}`, color: "accent" },
 							{ text: " ", color: "muted" },
 							{ text: `↑${fmtRate(snap.txBps)}`, color: "warning" },
-							// Σ 那一段**拆成三小段**，而不是一整块。
+							// The Σ part is **split into three small segments** instead of one big block.
 							//
-							// 原因：标题栏是「逐段累积，放不下就 break」，所以**段的粒度
-							// 决定了能不能部分显示**。原来 `  Σ↓79G ↑128G` 是一个 14 字符段，
-							// 要么全进要么全丢 —— 四图改造后每块变窄（150 列时只有 38 列，
-							// roomForInfo≈23），整个 Σ 就被一起丢掉了（实测 Σ 要到 164 列
-							// 才重新出现，而三图时 124 列就行）。拆开后 150 列下能保住
-							// `Σ↓79G`，信息不再是非黑即白。
+							// Why: the title bar is "accumulate segment by segment, break when
+							// it doesn't fit", so **segment granularity decides whether partial
+							// display is possible**. The old `  Σ↓79G ↑128G` was one 14-char
+							// segment — all in or all out. After the four-chart rework each
+							// block got narrower (only 38 cols at 150 columns, roomForInfo≈23),
+							// and the whole Σ was dropped (measured: Σ only reappeared at 164
+							// columns, while the three-chart layout managed at 124). Split
+							// apart, 150 columns can keep `Σ↓79G` — the info is no longer
+							// all-or-nothing.
 							{ text: "  Σ", color: "muted" },
 							{ text: `↓${fmtBytes(snap.rxTotal)}`, color: "accent" },
 							{ text: ` ↑${fmtBytes(snap.txTotal)}`, color: "warning" },
 						]
 					: undefined,
 			),
-			// RX/TX 画在同一张图里但各占一色（对齐 bottom 的蓝/黄双线）
+			// RX/TX share one chart but each gets a color (aligned with bottom's blue/yellow dual lines)
 			series: [
 				{ values: tail(hist.netRx, points), color: "accent" },
 				{ values: tail(hist.netTx, points), color: "warning" },
 			],
-			// 单行（浮框只放累计流量，它是图上唯一看不到的信息）——
-			// 两行浮框 legendH=4 会在默认 plotRows=4 时溢出绘图区而被整块丢掉。
+			// Single line (the floating box only carries cumulative traffic, the one
+			// thing not visible on the chart) — a two-line box has legendH=4 and
+			// would overflow the default plotRows=4 plot area and get dropped entirely.
 			legend: ab(
 				snap
 					? [
@@ -431,33 +486,42 @@ export function buildBlocks(
 		},
 	];
 
-	// TPS（LLM token 吞吐）—— 默认开，是用户点名要的常驻第四图。
-	// 它排在最后：这样前三个位置（CPU/Memory/Network）既有的索引与文档不变，
-	// 而“默认四图”仍然成立。
+	// TPS (LLM token throughput) — on by default, the standing fourth chart the
+	// user explicitly asked for.
+	// It goes last: that way the existing indexes and docs for the first three
+	// positions (CPU/Memory/Network) stay unchanged, while "four charts by
+	// default" still holds.
 	if (opts.showTokens !== false) {
-		// 曲线只画**下行（output）速率**，而读数把两个方向都列出来。
+		// The curve only draws the **downlink (output) rate**, while the readouts
+		// list both directions.
 		//
-		// 为什么不画两条曲线（像 Network 的 RX/TX）：两个方向的**时间形状根本不同**。
-		// 实测一次真实调用：上行 input = 5671 tokens（**一次性整块**上传），
-		// 下行 output = 11 tokens（**逐字流式**），比例约 516:1。
-		// 画在同一根 y 轴上，input 会把量程顶到 5671，output 被压成 0.2% 高度、
-		// 完全看不见 —— 这正是用户之前抱怨过的「尖峰钉死量程」的极端版。
-		// 所以：曲线给唯一有意义的连续量（output 速率），
-		// 两个方向的**累计量**放标题栏 —— 它们本来就不是速率，不该上速率轴。
+		// Why not two curves (like Network's RX/TX): the two directions have
+		// **fundamentally different time shapes**. Measured on a real call:
+		// uplink input = 5671 tokens (uploaded in **one bulk chunk**),
+		// downlink output = 11 tokens (**streamed token by token**) — a ~516:1 ratio.
+		// On the same y axis, input would pin the scale at 5671 and output would
+		// be squashed to 0.2% height, completely invisible — an extreme version
+		// of the "spike pins the scale" problem the user complained about before.
+		// So: the curve shows the only meaningful continuous quantity (output rate),
+		// and the **cumulative** amounts of both directions go in the title bar —
+		// they aren't rates and don't belong on a rate axis.
 		//
-		// 读数口径**逐字对齐 pi footer**（`↑input ↓output RcacheRead`，会话累计），
-		// 这样图上的数字与 pi 底部那行可以直接对照。
-		// 顺序按重要度降序（窄块时从尾部丢）：当前速率 → 上行 → 下行 → 缓存读。
+		// The readout convention is **byte-identical to pi footer**
+		// (`↑input ↓output RcacheRead`, session cumulative), so the numbers on the
+		// chart can be checked directly against pi's bottom line.
+		// Order by descending importance (dropped from the tail on narrow blocks):
+		// current rate → uplink → downlink → cache read.
 		const cur = opts.tpsNow ?? 0;
 		const tokIn = opts.tokensIn ?? 0;
 		const tokOut = opts.tokensOut ?? 0;
 		const tokR = opts.tokensCacheRead ?? 0;
-		// `~` 只加在**速率**上：它是从 delta 文本估算的，不是计量。
-		// 累计值来自 `message_end` 的精确 `usage`，所以不加 `~` ——
-		// 这个区分本身就是给用户的信息（哪个数字可信）。
+		// `~` only goes on the **rate**: it's estimated from delta text, not metered.
+		// Cumulative values come from the exact `usage` of `message_end`, so no `~` —
+		// the distinction itself is information for the user (which number to trust).
 		const curTxt = `~${fmtTps(cur)}`;
-		// 分段构造：`↑`/`↓`/`R` 与 pi footer 同字同序。
-		// 用 muted 给累计值：它们是背景信息，不该和曲线的 accent 抢眼。
+		// Segmented construction: `↑`/`↓`/`R` same characters, same order as pi footer.
+		// Cumulative values use muted: they're background info and shouldn't fight
+		// the curve's accent for attention.
 		const ioSegs: StyledLine = [];
 		if (tokIn > 0) ioSegs.push({ text: `  \u2191${fmtTokensTotal(tokIn)}` });
 		if (tokOut > 0) ioSegs.push({ text: ` \u2193${fmtTokensTotal(tokOut)}` });
@@ -465,8 +529,10 @@ export function buildBlocks(
 		blocks.push({
 			name: "Tokens",
 			color: "accent",
-			// 与其他块一致：拿不到快照（如非 Linux 上采集失败）时就不写读数。
-			// TPS 本身不依赖 /proc，但这个不变式（无快照 ⇒ 无读数）值得保留。
+			// Consistent with other blocks: when there's no snapshot (e.g. collection
+			// failed on non-Linux), don't write readouts.
+			// TPS itself doesn't depend on /proc, but the invariant (no snapshot ⇒
+			// no readouts) is worth keeping.
 			titleInfo: at(
 				snap ? [{ text: curTxt, color: "accent" }, ...ioSegs] : undefined,
 			),
@@ -474,7 +540,7 @@ export function buildBlocks(
 			legend: ab([[{ text: curTxt }]]),
 			scaleWindowPoints: rateScalePts,
 			windowPoints: points,
-			// 用 token 单位的刻度（不能复用 rateAxis：它会把 tok/s 标成 KB）
+			// Token-unit ticks (can't reuse rateAxis: it would label tok/s as KB)
 			axis: (dataMax) => tokenAxis(dataMax),
 		});
 	}

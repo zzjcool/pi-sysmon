@@ -2,172 +2,186 @@
 
 # pi-sysmon
 
-**在 [pi](https://github.com/earendil-works/pi) 里显示 bottom 风格的 braille 折线图**
+**bottom-style braille line charts inside [pi](https://github.com/earendil-works/pi)**
 
-CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史曲线
+CPU · Memory · Network · Tokens — real-time history curves drawn with braille dot-matrix characters
 
-[![test](https://img.shields.io/badge/tests-92%2F92-brightgreen)](#测试)
+[![test](https://img.shields.io/badge/tests-92%2F92-brightgreen)](#testing)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-<img src="docs/images/overview.png" alt="四图并排：CPU / Memory / Network / Tokens" width="100%">
+<img src="docs/images/overview.png" alt="Four charts side by side: CPU / Memory / Network / Tokens" width="100%">
 
-<sub>150 列宽下的默认四图。曲线由盲文字符绘制，y 刻度叠印在绘图区内侧、
-时间标签嵌在下边框里。</sub>
+<sub>The default four charts at 150 columns wide. Curves are drawn with braille characters,
+y-axis tick marks are overlaid inside the plot area, and time labels are embedded in the bottom border.</sub>
 
 </div>
+
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 ```
 ┌ CPU ─ 8%  3.45 3.61 2.85 ──────────┐┌ Memory ─ 53%  33G/62G ─────────────┐┌ Network ─ ↓23K/s ↑3.4K/s  Σ↓79G ──┐┌ Tokens ─ ~58t/s  ↑5.9k ↓60 R2.7k ─┐
 │100%                                ││100%                                ││1.0MB                              ││ 1.6Kt/s                           │
 │                                    ││                                    ││                                   ││                                   │
-│                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀││                                  ⢸││  ⡇     ⢰     ⢠      ⡆     ⢸      ⡆│
+│                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀││                                  ⢸││  ⡇     ⢰     ⢠      ⡆     ⢸      ⡆│
 │                                    ││                                    ││                                  ⢸││ ⢠⢇     ⣿     ⢸⡄    ⢀⡇     ⡼⡀    ⢀⡇│
 │ ⢀⡀ ⢀         ⡀    ⢀ ⡀  ⡀     ⢀  ⡀ ⡀││                                    ││                                  ⡇││ ⢸⢸    ⢠⠃⡇    ⡇⡇    ⢸⢸     ⡇⡇    ⢸⢸│
-│⠒⠁⠑⢦⠋⠒⠊⠑⢦⠒⠲⡔⠒⠚⠑⠒⠒⠲⡔⠙⡜⢣⠔⢶⢣⠴⡔⠒⠒⠒⠃⠑⠊⢣⠜⠑││                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣇││⠉⠉⠈⠉⠉⠑⠒⠚ ⠣⠤⠤⠤⠤⠇⠸⠤⠤⠤⠤⠜⠘⠒⠒⠊⠉⠉⠁⠉⠉⠉⠒⠒⠚⠘│
+│⠒⠁⠑⢦⠋⠒⠊⠑⢦⠒⠲⡔⠒⠚⠑⠒⠒⠲⡔⠙⡜⢣⠔⢶⢣⠴⡔⠒⠒⠒⠃⠑⠊⢣⠜⠑││                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣇││⠉⠉⠈⠉⠉⠑⠒⠚ ⠣⠤⠤⠤⠤⠇⠸⠤⠤⠤⠤⠜⠘⠒⠒⠊⠉⠉⠁⠉⠉⠉⠒⠒⠚⠘│
 └ 60s ─────────────────────────── 0s ┘└ 60s ─────────────────────────── 0s ┘└ 60s ────────────────────────── 0s ┘└ 60s ────────────────────────── 0s ┘
 ```
 
-## 特性
+## Features
 
-- **真正的折线图**，不是进度条或 sparkline —— 每个字符编码 2×4 个盲文点子像素，等效把终端分辨率放大 8 倍
-- **零依赖** —— 只用 Node 内置模块 + pi 的公开扩展 API
-- **直接读 `/proc`** —— 不需要 `systeminformation` / `pidusage` 之类的包
-- **默认四图** —— CPU / 内存 / 网络 / **Tokens（LLM 吞吐速率）**；
-  Tokens 图实时显示本 pi 进程与模型 API 之间的输出 token 速率，
-  并与 pi 自身在状态栏显示的 `⚡ 23.0 t/s (avg)` 相互印证
-- **带坐标轴** —— y 轴刻度、x 轴线、时间窗标签，复刻 bottom 的排版
-- **y 轴顶端 = 整窗真实最高值** —— 60s 窗口内任何一处的高度都能直接用顶端刻度读出来，
-  刻度绝不撒谎（配合 `PI_SYSMON_SCALE_WINDOW=<1` 还能开启尖峰后自动回落）
-- **自动剔除本机环回/容器流量** —— `lo` / `veth*` / `docker*` / `br-*` 不计入网速
-  （实测：本机推 30 MB/s 环回流量时，网速图只报物理网卡的 178 KB/s）
-- **响应式并排** —— 终端宽时四张图并排一行，变窄自动降级成 2×2 / 1 列竖排，不会把曲线挤成噪声
-- **Tokens 图分上下行** —— 读数与 pi 自己的状态栏同口径（`↑` 上行 input / `↓` 下行 output /
-  `R` 缓存读），两边数字可以直接对照；上行是**精确值**，速率是估算值（带 `~`）
-- **图表利用率高** —— 刻度叠在绘图区内侧、时间标签嵌进边框。**同样的块高**下
-  绘图面积比「刻度独占列 + 轴线独占行」的旧排版大 **~71%**
-  （50 列宽、8 行高：168 格 → 288 格）
-- **读数写在边框标题栏里**（默认）—— 复用那行本来就有的 `─` 填充，零成本、不遮曲线；也可用 `PI_SYSMON_LABEL=box` 换回 bottom 的右上角浮框
-- **状态持久化** —— 开关和模式记在配置文件里，重启保留
-- **多种显示模式** —— 图表（默认）/ 一行文字 / 整块底部
-- **纯 Linux 友好，其他平台不崩** —— 非 Linux 上采集自动退化为零值
+- **Real line charts**, not progress bars or sparklines — each character encodes 2×4 braille dot sub-pixels, effectively multiplying terminal resolution by 8
+- **Zero dependencies** — only Node built-ins plus pi's public extension API
+- **Reads `/proc` directly** — no need for packages like `systeminformation` / `pidusage`
+- **Four charts by default** — CPU / Memory / Network / **Tokens (LLM throughput rate)**;
+  the Tokens chart shows, in real time, the output-token rate between this pi process and the model API,
+  and cross-checks against the `⚡ 23.0 t/s (avg)` that pi itself shows in the status bar
+- **Proper axes** — y-axis tick marks, an x-axis line, and time-window labels, replicating bottom's layout
+- **Top of y-axis = true window maximum** — the height at any point in the 60s window can be read
+  directly off the top tick; the scale never lies (set `PI_SYSMON_SCALE_WINDOW=<1` to also enable
+  automatic falloff after a spike)
+- **Automatically excludes loopback/container traffic** — `lo` / `veth*` / `docker*` / `br-*` don't
+  count toward network speed (measured: while pushing 30 MB/s of loopback traffic locally, the network
+  chart reports only the physical NIC's 178 KB/s)
+- **Responsive side-by-side layout** — four charts in a row on wide terminals, automatically degrading
+  to 2×2 / 1-column stacking as it narrows, so curves never get crushed into noise
+- **Tokens chart shows both directions** — the readings use the same convention as pi's own status bar
+  (`↑` upstream input / `↓` downstream output / `R` cache reads), so the numbers can be compared
+  directly; the upstream figure is an **exact value**, while the rate is an estimate (marked with `~`)
+- **High plot-area efficiency** — tick marks overlay the plot area and time labels sit inside the border.
+  At the **same block height**, the plot area is **~71%** larger than the old layout where ticks owned
+  a column and the axis owned a row (50 columns wide, 8 rows tall: 168 cells → 288 cells)
+- **Readings live in the border title bar** (default) — reusing the `─` fill that line already has:
+  zero cost, no curve occlusion; or set `PI_SYSMON_LABEL=box` to bring back bottom's top-right floating box
+- **Persistent state** — on/off and mode are remembered in a config file across restarts
+- **Multiple display modes** — chart (default) / single text line / full footer
+- **Linux-friendly, doesn't crash elsewhere** — collection degrades to zero values on non-Linux platforms
 
-## 截图
+## Screenshots
 
-四张图各自的读数都写在**边框标题栏**里（复用那行本来就有的 `─` 填充，
-不遮任何曲线）。y 轴刻度**叠印在绘图区内侧**、时间标签**嵌在下边框里**。
+Each chart's readings are written into the **border title bar** (reusing the `─` fill that line
+already has, so no curve is covered). Y-axis tick marks are **overlaid inside the plot area**, and
+time labels are **embedded in the bottom border**.
 
-这两处省下的空间是可量化的。**按同样的块高（8 行）、块宽 50 列比**：
+The space these two choices save is quantifiable. **Comparing at the same block height (8 rows) and block width (50 columns)**:
 
-| 排版 | 每块 chrome | 绘图区 |
+| Layout | Chrome per block | Plot area |
 | --- | --- | --- |
-| 旧（刻度独占 5 列 + 轴线独占 1 行） | 4 行 | 42 × 4 = 168 |
-| 现在（叠印 + 边框兼任轴） | 2 行 | 48 × 6 = 288 |
+| Old (ticks own 5 columns + axis owns 1 row) | 4 rows | 42 × 4 = 168 |
+| Now (overlay + border doubles as axis) | 2 rows | 48 × 6 = 288 |
 
-增益拆开是两个因数相乘：宽度 42 → 48（**+14%**，刻度不再占列）×
-行数 4 → 6（**+50%**，省下的两行还给数据）≈ **+71%**。
+The gain factors into two multipliers: width 42 → 48 (**+14%**, ticks no longer own a column) ×
+rows 4 → 6 (**+50%**, the two saved rows go back to data) ≈ **+71%**.
 
-### 窄终端自动降级（95 列）
+### Automatic degradation on narrow terminals (95 columns)
 
-<img src="docs/images/narrow.png" alt="2×2 降级布局" width="100%">
+<img src="docs/images/narrow.png" alt="2×2 degraded layout" width="100%">
 
-终端变窄时排成 2×2，再窄就变 1 列竖排。断点在 96 列：
-≥ 96 是四图并排一行（上方那张），< 96 就降到 2×2（这张是 95 列）。
-bottom 在同样宽度下会把四张图硬挤成一行（每张 16 列左右），曲线就不可读了。
+When the terminal narrows, the charts go 2×2, and narrower still, 1 column stacked. The breakpoint
+is 96 columns: ≥ 96 gives four charts in a row (the screenshot above), < 96 drops to 2×2 (this one
+is 95 columns). At the same width, bottom would crush all four charts into one row (about 16 columns
+each), making the curves unreadable.
 
-### Tokens 图的上下行
+### The two directions of the Tokens chart
 
 ```
 ┌ Tokens ─ ~58t/s  ↑5.9k ↓60 R2.7k ─┐
 ```
 
-读数与 pi 自己的状态栏同口径（`↑` 上行 input / `↓` 下行 output / `R` 缓存读），
-所以两边可以直接对照。几个细节：
+The readings use the same convention as pi's own status bar (`↑` upstream input / `↓` downstream
+output / `R` cache reads), so the two can be compared directly. A few details:
 
-- **曲线只画下行速率**。两个方向的时间形状完全不同（上行是一次性整块上传、
-  下行是逐字流式，实测比例约 516:1），画同一根轴上会将下行压成 0.2% 高度。
-- **`~` 只加在速率上** —— 它是从流式增量估算的；累计值来自 provider 的
-  精确 `usage`，所以不带 `~`。哪个数字可信，一眼能看出来。
-- 块变窄时按重要度逐段丢弃：速率 → 上行 → 下行 → 缓存读。
+- **The curve only plots the downstream rate.** The two directions have completely different shapes
+  over time (upstream is one bulk upload; downstream streams token by token — a measured ratio of
+  about 516:1), so plotting them on the same axis would flatten downstream to 0.2% of the height.
+- **`~` only appears on the rate** — it's estimated from streaming deltas; the cumulative figures
+  come from the provider's exact `usage`, so they carry no `~`. Which number to trust is obvious at a glance.
+- As the block narrows, segments are dropped by importance: rate → upstream → downstream → cache reads.
 
-## 安装
+## Installation
 
-### 单文件（推荐，最简单）
+### Single file (recommended, simplest)
 
 ```bash
-npm run build:single    # 生成 dist/pi-sysmon.ts
+npm run build:single    # produces dist/pi-sysmon.ts
 cp dist/pi-sysmon.ts ~/.pi/agent/extensions/pi-sysmon.ts
 ```
 
-重启 pi 即可看到曲线，**默认就是开启的**。
+Restart pi and the curves appear — **enabled by default**.
 
-### 目录形式（多文件）
+### Directory form (multiple files)
 
 ```bash
 cp -r . ~/.pi/agent/extensions/pi-sysmon
 ```
 
-> ⚠️ 目录形式**必须放在子目录里**。pi 的自动发现会把 `extensions/` 下的每个 `.ts`
-> 都当成扩展加载，平铺多个文件会导致 `braille.ts` 被当作扩展而整个加载失败。
+> ⚠️ The directory form **must live in a subdirectory**. pi's auto-discovery treats every `.ts`
+> directly under `extensions/` as an extension; laying out multiple files flat would make
+> `braille.ts` get loaded as an extension and break the whole load.
 
-### 从 npm / git 安装
+### Install from npm / git
 
 ```bash
 pi install git:github.com/zzjcool/pi-sysmon
 ```
 
-## 使用
+## Usage
 
 ```
-/sysmon                开 / 关（会持久化）
-/sysmon on | off       显式开 / 关
-/sysmon chart          图表模式（默认）
-/sysmon below|above    图表放编辑器下方（默认）/ 上方（持久化）
-/sysmon line           一行文字模式
-/sysmon footer         用图表替换整个底部（可以比 widget 模式更高）
+/sysmon                toggle on / off (persisted)
+/sysmon on | off       explicit on / off
+/sysmon chart          chart mode (default)
+/sysmon below|above    place the chart below (default) / above the editor (persisted)
+/sysmon line           single-line text mode
+/sysmon footer         replace the entire footer with the charts (can be taller than widget mode)
 ```
 
-图表按终端宽度**响应式**排版（以默认四图为例）：
+The charts lay out **responsively** by terminal width (using the default four charts as an example):
 
-| 终端宽度 | 布局 |
+| Terminal width | Layout |
 | --- | --- |
-| ≥ 96 列 | 4 张图并排一行（共 8 行） |
-| 48 – 95 列 | 2 列 × 2 行 |
-| < 48 列 | 1 列竖排 |
+| ≥ 96 columns | 4 charts side by side in one row (8 rows total) |
+| 48 – 95 columns | 2 columns × 2 rows |
+| < 48 columns | 1 column stacked |
 
-> 行数按 widget 模式默认预算计算（`PI_SYSMON_CHART_HEIGHT=6`、`WIDGET_MAX_ROWS=18`）；
-> footer 模式预算更大（40 行），行数会更多。
+> Row counts assume the default widget-mode budget (`PI_SYSMON_CHART_HEIGHT=6`, `WIDGET_MAX_ROWS=18`);
+> footer mode has a larger budget (40 rows), so it gets more rows.
 
-每张图最少需要 24 列（边框 2 + 绘图区 22）。刻度是**叠印**在绘图区上的、
-不占独立列，所以这个下限比旧排版（刻度独占 5 列）低不少。
-比这更窄时 bottom 会把 N 张图硬挤成一团（50 列时每张只有 16 列，曲线已不可读），
-本项目改为降级排列。
+Each chart needs at least 24 columns (2 for the border + 22 for the plot). Tick marks are
+**overlaid** on the plot area rather than owning a column, so this floor is much lower than the
+old layout (where ticks owned 5 columns). Below that, bottom would crush N charts together (at 50
+columns, 16 columns each — the curves are already unreadable), while this project degrades the
+arrangement instead.
 
-列数还会随**块数**自适应（块数由 `PI_SYSMON_TOKENS` / `PI_SYSMON_DISKS` 决定）：
-三图时 ≥ 72 列即并排（旧行为不变）；块数 ≥4 时**跳过 3 列档**，避免排成
-「3+1」那种第二组只有一个块加一整行空格子的形态。
+The column count also adapts to the **number of blocks** (controlled by `PI_SYSMON_TOKENS` /
+`PI_SYSMON_DISKS`): with three charts, ≥ 72 columns already goes side by side (unchanged old
+behavior); with ≥ 4 blocks, the **3-column tier is skipped**, avoiding a "3+1" shape where the
+second group has a single block plus a full row of blanks.
 
-### 配置
+### Configuration
 
-| 环境变量 | 默认 | 说明 |
+| Environment variable | Default | Description |
 | --- | --- | --- |
-| `PI_SYSMON_INTERVAL` | `1000` | 采样间隔（毫秒，下限 500） |
-| `PI_SYSMON_POINTS` | `60` | 历史点数（覆盖 `PI_SYSMON_WINDOW` 换算出的点数） |
-| `PI_SYSMON_CHART_HEIGHT` | `6` | 每张图的绘图行数（不含上/下边框那 2 行） |
-| `PI_SYSMON_LABEL` | `title` | 读数位置：`title`（边框标题栏）/ `box`（右上角浮框）/ `both` / `none` |
-| `PI_SYSMON_WINDOW` | `60` | 横轴时间窗长度（秒） |
-| `PI_SYSMON_SCALE_WINDOW` | `1`（= 量程窗 == 显示窗） | 速率图**量程取样比例**：`1` = y 轴顶端为整窗真实最高值；设 `<1`（如 `1/6`）开启「尖峰过去约 10s 后自动回落」（此时超出量程的尖峰会显示为 `+` 标记） |
-| `PI_SYSMON_MODE` | `chart` | 初始模式 |
-| `PI_SYSMON_PLACEMENT` | `belowEditor` | 图表挂在编辑器**下方**（默认）还是**上方**：`belowEditor` / `aboveEditor`（也可用 `/sysmon below` / `/sysmon above` 随时切换，会持久化） |
-| `PI_SYSMON_TOKENS` | 开 | LLM token 吞吐图。设 `0` 回到旧的三图形态 |
-| `PI_SYSMON_DISKS` | — | 设 `1` 再加一块磁盘 I/O 图（第 5 块） |
+| `PI_SYSMON_INTERVAL` | `1000` | Sampling interval (milliseconds, floor 500) |
+| `PI_SYSMON_POINTS` | `60` | History point count (overrides the count derived from `PI_SYSMON_WINDOW`) |
+| `PI_SYSMON_CHART_HEIGHT` | `6` | Plot rows per chart (excluding the 2 border rows) |
+| `PI_SYSMON_LABEL` | `title` | Reading placement: `title` (border title bar) / `box` (top-right floating box) / `both` / `none` |
+| `PI_SYSMON_WINDOW` | `60` | Horizontal time-window length (seconds) |
+| `PI_SYSMON_SCALE_WINDOW` | `1` (= scale window == display window) | **Scale sampling ratio** for rate charts: `1` = top of y-axis is the true window maximum; set `<1` (e.g. `1/6`) to enable "auto-falloff about 10s after a spike passes" (spikes beyond the scale then show as `+` markers) |
+| `PI_SYSMON_MODE` | `chart` | Initial mode |
+| `PI_SYSMON_PLACEMENT` | `belowEditor` | Whether the charts hang **below** (default) or **above** the editor: `belowEditor` / `aboveEditor` (also switchable anytime via `/sysmon below` / `/sysmon above`, persisted) |
+| `PI_SYSMON_TOKENS` | on | LLM token throughput chart. Set `0` to return to the old three-chart form |
+| `PI_SYSMON_DISKS` | — | Set `1` to add a disk I/O chart (the 5th block) |
 
-开关状态写在 `<configDir>/pi-sysmon.json`（`configDir` 默认 `~/.pi/agent`）。
+On/off state is written to `<configDir>/pi-sysmon.json` (`configDir` defaults to `~/.pi/agent`).
 
-## 实现说明
+## Implementation Notes
 
-图表没有用任何 TUI 绘图库，而是自己合成字符。核心是 **braille 点阵**：
+The charts use no TUI drawing library; the characters are composed by hand. The core is the
+**braille dot matrix**:
 
-每个 braille 字符（U+2800–U+28FF）对应 8 个可独立点亮的点，排成 2 列 × 4 行：
+Each braille character (U+2800–U+28FF) maps to 8 independently lit dots, arranged in 2 columns × 4 rows:
 
 ```
 (0,0) (1,0)      bit0  bit3
@@ -176,152 +190,164 @@ pi install git:github.com/zzjcool/pi-sysmon
 (0,3) (1,3)      bit6  bit7
 ```
 
-所以一个 `width × height` 的字符区域，实际分辨率是 `2*width × 4*height`。
-把数据点线性映射到子像素坐标，再用 **Bresenham** 连成线，就能得到平滑的折线。
+So a character region of `width × height` actually resolves to `2*width × 4*height`.
+Linearly mapping data points into sub-pixel coordinates and connecting them with **Bresenham**
+yields smooth polylines.
 
-这与 [bottom](https://github.com/ClementTsang/bottom) 的做法一致（ratatui 的
-`Marker::Braille`）。我们对齐了 bottom 的这些参数：
+This matches what [bottom](https://github.com/ClementTsang/bottom) does (ratatui's
+`Marker::Braille`). We align with bottom on these parameters:
 
-| 项 | bottom | 本项目 |
+| Item | bottom | This project |
 | --- | --- | --- |
-| 绘制字符 | `Marker::Braille`（2×4 子像素） | 同 |
-| 连线算法 | Bresenham | 同 |
-| 百分比图 y 轴 | 固定 `0 .. 100.5` | 同 |
-| 动态图 y 轴 | 窗口内最大值 × 1.5（留白） | 同 |
-| 网格线 | 无，只有轴线 + y 刻度 + 两端时间标签 | 同 |
-| 默认采样间隔 | 1000 ms | 同 |
-| 每张图 | `Block` 边框，标题嵌在上边框里 | 同 |
-| y 刻度位置 | 独立列（占 5 列宽） | **叠印在绘图区内侧**（不占列） |
-| y 刻度数量 | 百分比 2 个、速率 4 个 | **只标顶端 1 个**（带单位） |
-| x 时间标签 | 单独占一行 | **嵌在下边框里**（省 1 行） |
-| x 轴线 | 单独占一行 | 由 0 基线兼任（省 1 行） |
-| 右上角读数框 | 覆盖画在绘图区右上角，空间不够就整块消失 | 同（阈值算法不同，见下） |
-| 宽度不够时 | 把 N 张图硬挤到一行（50 列时每张 16 列） | **降级成 2 列 / 1 列** |
-| 横轴默认窗口 | 60 s | 同 |
-| 自动量程回落 | 滞后计数后降档（`net_auto`） | 默认**不回落**（顶端 = 整窗最高值）；可选 `PI_SYSMON_SCALE_WINDOW=1/6` 开启 |
+| Drawing characters | `Marker::Braille` (2×4 sub-pixels) | Same |
+| Line algorithm | Bresenham | Same |
+| Percentage-chart y-axis | Fixed `0 .. 100.5` | Same |
+| Dynamic-chart y-axis | Window maximum × 1.5 (headroom) | Same |
+| Grid lines | None; only axis line + y ticks + time labels at both ends | Same |
+| Default sampling interval | 1000 ms | Same |
+| Per chart | `Block` border, title embedded in the top border | Same |
+| Y-tick position | Own column (5 columns wide) | **Overlaid inside the plot area** (no column) |
+| Y-tick count | 2 for percentages, 4 for rates | **Only the top 1** (with units) |
+| X time labels | Own a row | **Embedded in the bottom border** (saves 1 row) |
+| X axis line | Owns a row | Doubled by the 0 baseline (saves 1 row) |
+| Top-right reading box | Painted over the plot's top-right; disappears entirely if space is short | Same (different threshold algorithm, see below) |
+| When width runs out | Crushes N charts into one row (16 columns each at 50 columns) | **Degrades to 2 / 1 columns** |
+| Default horizontal window | 60 s | Same |
+| Auto-scale falloff | Drops a tier after a lag counter (`net_auto`) | **No falloff by default** (top = window maximum); optionally enable with `PI_SYSMON_SCALE_WINDOW=1/6` |
 
-### 架构
+### Architecture
 
 ```
 src/
-├── metrics.ts      # 采集层：读 /proc/{stat,meminfo,net/dev,diskstats} + os.loadavg
-├── braille.ts      # 渲染层：数据 → braille 点阵 → 字符行（纯函数，无副作用）
-├── tokens.ts       # 估算层：LLM 流式增量 → token 数（纯函数 + 闭包 meter）
-├── blocks.ts       # 组装层：历史 + 快照 → MetricBlock[]（纯数据 → 纯数据）
-├── chart-panel.ts  # 布局层：响应式列数、边框、刻度、浮动读数框、并排拼接
-└── index.ts        # 扩展层：pi 生命周期、命令、配置持久化、定时刷新
+├── metrics.ts      # collection layer: reads /proc/{stat,meminfo,net/dev,diskstats} + os.loadavg
+├── braille.ts      # rendering layer: data → braille dot matrix → character rows (pure functions, no side effects)
+├── tokens.ts       # estimation layer: LLM streaming deltas → token counts (pure functions + closure meter)
+├── blocks.ts       # assembly layer: history + snapshot → MetricBlock[] (pure data → pure data)
+├── chart-panel.ts  # layout layer: responsive columns, borders, ticks, floating reading box, side-by-side joining
+└── index.ts        # extension layer: pi lifecycle, commands, config persistence, timed refresh
 ```
 
-依赖方向单向：`index → {chart-panel, blocks, metrics}`，`blocks → chart-panel`，
-`chart-panel → braille`、`blocks → tokens`。`braille.ts` 与 `tokens.ts`
-**不依赖任何其它本模块**。
+Dependencies flow one way: `index → {chart-panel, blocks, metrics}`, `blocks → chart-panel`,
+`chart-panel → braille`, `blocks → tokens`. `braille.ts` and `tokens.ts`
+**depend on no other module in this project**.
 
-分层原则：`braille.ts` 是**纯函数**（输入数值数组，输出字符串数组），因此可以脱离
-pi 单独测试与复用；`metrics.ts` 只负责读数，不关心怎么显示。
+Layering principles: `braille.ts` is **pure functions** (numeric arrays in, string arrays out), so
+it can be tested and reused without pi; `metrics.ts` only reads numbers and doesn't care how they're displayed.
 
-### 与 bottom 的排版是怎么对齐的
+### How the layout was aligned with bottom
 
-不是靠肉眼调参数，而是读 bottom/ratatui 的源码把算法抄准，再用受控宽度的真实
-`btm` 抓帧逐字符核对（`┌ CPU ─ 1.91 1.80 2.17 ───┐` 那种）。
-例如：
+Not by eyeballing parameters, but by reading bottom/ratatui source to copy the algorithm exactly,
+then verifying character by character against frames captured from a real `btm` at controlled
+widths (the `┌ CPU ─ 1.91 1.80 2.17 ───┐` kind). For example:
 
-- **x 轴线不延伸到 y 轴那一列** —— ratatui 的 `Chart::layout` 在放下 y 轴后执行了 `x += 1`；
-- **左下时间标签的末位落在 y 轴列上** —— `labels_alignment = Left` 时首个 x 标签的区域是
-  `[chart_left, graph_left)`（左含右不含）再右对齐；
-- **y 刻度位置** 用 `dy = i * (plotH - 1) / (n - 1)`（索引 0 在**底部**）。
+- **The x-axis line does not extend into the y-axis column** — ratatui's `Chart::layout` does
+  `x += 1` after placing the y-axis;
+- **The last digit of the bottom-left time label lands on the y-axis column** — with
+  `labels_alignment = Left`, the first x-label's region is `[chart_left, graph_left)`
+  (left-inclusive, right-exclusive), right-aligned;
+- **Y-tick positions** use `dy = i * (plotH - 1) / (n - 1)` (index 0 at the **bottom**).
 
-**三处有意偏离**：
+**Three intentional deviations**:
 
-1. **读数默认写在边框标题栏里**（`PI_SYSMON_LABEL=title`），而不是 bottom 的右上角浮框。
-   标题栏那一行本来就要写块名，剩下的 `─` 填充是**纯装饰** —— 拿来放读数零成本，
-   且不遮任何曲线。bottom 的浮框是覆盖画在绘图区右上角的，会真的吃掉一块绘图区。
-   想换回 bottom 那种浮框就设 `PI_SYSMON_LABEL=box`。
+1. **Readings default to the border title bar** (`PI_SYSMON_LABEL=title`) instead of bottom's
+   top-right floating box. The title-bar line already has to carry the block name, and the
+   remaining `─` fill is **pure decoration** — putting readings there costs nothing and covers no
+   curve. bottom's floating box is painted over the plot's top-right and genuinely eats plot area.
+   Set `PI_SYSMON_LABEL=box` to bring back bottom-style floating boxes.
 
-2. **浮框显隐阈值**（仅在 `box`/`both` 模式生效）。bottom 用 `hidden_legend_constraints`
-   这套**按比例**的阈值（Network 是 9/10 × 3/4），但它是按 40+ 列宽的图校准的，
-   套到本项目 20~30 列的块上会导致读数框永远不显示。
-   本项目改成「放得下（`legendW <= plotW`）且浮框下面还留得出一行曲线（`legendH < rows`）」——
-   后者是为了避免浮框下边框与绘图区底部的 0% 基线叠成一条双横线。
+2. **Floating-box show/hide thresholds** (only effective in `box`/`both` mode). bottom uses the
+   `hidden_legend_constraints` set of **proportional** thresholds (Network is 9/10 × 3/4), but
+   those were calibrated for charts 40+ columns wide; applied to this project's 20~30-column
+   blocks, the reading box would never show. This project instead requires "it fits
+   (`legendW <= plotW`) and at least one curve row remains below the box (`legendH < rows`)" —
+   the latter avoids the box's bottom border fusing with the plot's 0% baseline into a double line.
 
-3. **读数是分级片段**，块窄时从尾部逐段丢弃。比如 Network 的顺序是
-   `瞬时速率 → 累计流量`，窄块下先丢累计流量，保住更重要的瞬时速率。
+3. **Readings are tiered segments**, dropped from the tail as the block narrows. For example,
+   Network's order is `instantaneous rate → cumulative traffic`; on narrow blocks the cumulative
+   figure is dropped first, preserving the more important instantaneous rate.
 
-## 测试
+## Testing
 
 ```bash
-npm test          # 92 项单元测试（braille 13 + layout 56 + tokens 23）
+npm test          # 92 unit tests (braille 13 + layout 56 + tokens 23)
 ```
 
 ```bash
 npm run typecheck # tsc strict
-npm run check     # 两者都跑
+npm run check     # runs both
 ```
 
-`test/braille.test.ts` 覆盖 braille 位映射（对照 Unicode 标准逐点验证）、坐标映射、
-输出尺寸、边界输入（空数据 / 全零 / 单点 / `NaN` / `Infinity` / 极小宽度）。
+`test/braille.test.ts` covers the braille bit mapping (verified dot by dot against the Unicode
+standard), coordinate mapping, output dimensions, and boundary inputs (empty data / all zeros /
+single point / `NaN` / `Infinity` / extremely small widths).
 
-`test/layout.test.ts` 覆盖响应式布局（列数断点、列宽之和恒等于总宽、行数恒定）
-以及**两条会让 pi 崩掉/错位的硬约束**：对 8..220 列全宽度 × 多个高度与块数组合，
-断言每行可见宽度不越界、行数与布局声明一致 —— 这两条是扫全宽度而不是抽查几个宽度。
+`test/layout.test.ts` covers the responsive layout (column breakpoints, column widths always
+summing exactly to the total, constant row count) plus **two hard constraints that would crash
+or misalign pi**: across the full width range 8..220 columns × multiple heights and block counts,
+it asserts no row's visible width overflows and the row count matches the layout's claim — these
+sweep the whole width range rather than spot-checking a few widths.
 
-`test/tokens.test.ts` 覆盖 token 估算（英文 `chars/4`、CJK 逐字、emoji 算一个、
-非字符串防御）、每秒桶的排空语义（关闭期积压不得变成假尖峰），
-以及 `fmtTps` / `tokenAxis` 的**宽度上界**（标题栏读数越界会让 pi 退出）。
+`test/tokens.test.ts` covers token estimation (English `chars/4`, per-character CJK, emoji count
+as one, non-string defenses), the drain semantics of per-second buckets (backlog during an off
+period must not turn into a fake spike), and the **width upper bounds** of `fmtTps` / `tokenAxis`
+(title-bar readings that overflow would make pi exit).
 
-### 验证方法：真机抓帧才是唯一可信的
+### Verification method: real-machine frame capture is the only truth
 
-单元测试能捉住几何与坏值，但捉不住**打包/加载**类问题 ——
-例如扩展在真实 pi 里根本没被加载、或 bundle 残留相对 import。
-本项目用 `pty` 启动真实 pi、用 `pyte` 回放屏幕来验证，
-这一步捉到过多次「单测全绿但真机不显示」的事故。
+Unit tests catch geometry and bad values, but not **packaging/loading** problems — e.g. the
+extension never actually loading in a real pi, or a bundle with leftover relative imports. This
+project launches a real pi under `pty` and replays the screen with `pyte` to verify; this step has
+caught multiple "all unit tests green but nothing shows on a real machine" incidents.
 
-## 开发时踩过的坑
+## Pitfalls Hit During Development
 
-这些是实际踩到并修复的，记下来避免重犯：
+These were actually hit and fixed; recorded here to avoid repeats:
 
-1. **宽度算错会让 pi 直接崩溃退出。** pi 的渲染器发现某行超过终端宽度会抛
-   `uncaughtException` 并退出。自定义组件必须用 `truncateToWidth()` 截断，
-   且不能用 `String.slice()`（它按字节算，会把 ANSI 转义也算进去）。
-2. **面板高度变化会挪动编辑器，破坏鼠标选区。** 若组件在有/无数据时行数不同，
-   编辑器会上下位移，导致「选中文字后复制不了」。所以高度必须恒定，
-   无数据时也要占满同样的行数。
-3. **多文件平铺安装会让 pi 启动失败。** 见上文安装说明。
-4. **`yMax <= 0` 或数据含 `NaN` 会算出 `NaN` 坐标**，非空断言 `!` 会掩盖这个
-   问题并在运行时崩溃。所有坐标都要做有限性检查。
-5. **不同扩展的 `setStatus` 共享同一行**，窄终端上会互相挤压截断。
+1. **A width miscalculation crashes pi outright.** pi's renderer throws `uncaughtException` and
+   exits when a row exceeds the terminal width. Custom components must truncate with
+   `truncateToWidth()` and must not use `String.slice()` (it counts bytes, including ANSI escapes).
+2. **Panel height changes shift the editor and break mouse selections.** If a component returns
+   different row counts with vs. without data, the editor jumps up and down, causing "selected
+   text can't be copied". So height must be constant — occupy the same number of rows even with no data.
+3. **Flat multi-file installation makes pi fail to start.** See the installation notes above.
+4. **`yMax <= 0` or data containing `NaN` produces `NaN` coordinates**; a non-null assertion `!`
+   masks the problem and crashes at runtime. All coordinates need finiteness checks.
+5. **`setStatus` from different extensions shares the same line**, and they squeeze/truncate each
+   other on narrow terminals.
 
-## 贡献
+## Contributing
 
-欢迎 issue 和 PR。跑 `npm run check` 确保测试与类型检查通过。
+Issues and PRs are welcome. Run `npm run check` to make sure tests and type checking pass.
 
-## 致谢
+## Acknowledgements
 
-**本项目受 [bottom](https://github.com/ClementTsang/bottom)（`btm`）启发。**
+**This project is inspired by [bottom](https://github.com/ClementTsang/bottom) (`btm`).**
 
-pi-sysmon 最初的想法就是「把 btm 那种终端里的 braille 折线图搬进 pi」。
-不只是视觉上的致敬 —— 本项目把 bottom 当作**行为基准**，去读它的源码、
-用受控宽度抓它的帧，逐字符核对排版：
+The original idea of pi-sysmon was simply "bring btm's in-terminal braille line charts into pi".
+More than a visual homage — this project treats bottom as a **behavioral baseline**: reading its
+source, capturing its frames at controlled widths, and verifying the layout character by character:
 
-- 盲文点阵（`Marker::Braille`，2×4 子像素）与 Bresenham 连线
-- 百分比图固定 `0 .. 100.5`、动态图取窗口最大值 × 1.5 的留白
-- y 刻度位置 `dy = i * (plotH - 1) / (n - 1)`（索引 0 在底部）
-- x 轴线不延伸到 y 轴那一列（ratatui `Chart::layout` 的 `x += 1`）
-- 左下时间标签的末位落在 y 轴列上（`labels_alignment = Left` 的半开区间再右对齐）
+- Braille dot matrix (`Marker::Braille`, 2×4 sub-pixels) and Bresenham line drawing
+- Percentage charts fixed at `0 .. 100.5`; dynamic charts take the window maximum × 1.5 headroom
+- Y-tick positions `dy = i * (plotH - 1) / (n - 1)` (index 0 at the bottom)
+- The x-axis line not extending into the y-axis column (ratatui `Chart::layout`'s `x += 1`)
+- The last digit of the bottom-left time label landing on the y-axis column
+  (`labels_alignment = Left`'s half-open interval, right-aligned)
 
-也正因为它是个成熟工具，我们才看得出**哪里不该照抄** ——
-比如本项目把读数放进边框标题栏（bottom 是画在右上角浮框，会吃掉一块绘图区），
-以及宽度不够时选择降级排列而不是把 N 张图硬挤成 16 列。
-这些偏离都在上文「与 bottom 的排版是怎么对齐的」里逐条记了原因。
+And precisely because it's a mature tool, we could see **where not to copy it** — e.g. this project
+puts readings in the border title bar (bottom paints a top-right floating box that eats plot area),
+and degrades the arrangement when width runs out instead of crushing N charts into 16 columns.
+The reasons for each deviation are recorded above in "How the layout was aligned with bottom".
 
-感谢 [Clement Tsang](https://github.com/ClementTsang) 和 bottom 的贡献者们。
+Thanks to [Clement Tsang](https://github.com/ClementTsang) and bottom's contributors.
 
-本项目的另一个前提是 [pi](https://github.com/earendil-works/pi) 提供的扩展 API ——
-`setWidget` 的 `placement`、`message_update` 的流式事件、`Theme` 取色，
-没有这些就没有这个扩展。
+Another prerequisite of this project is the extension API provided by
+[pi](https://github.com/earendil-works/pi) — `setWidget`'s `placement`, `message_update`'s
+streaming events, `Theme` colors; without these there would be no extension.
 
-## 许可证
+## License
 
-[MIT](LICENSE) —— 随便用。
+[MIT](LICENSE) — use it however you like.
 
-本项目的**灵感与排版算法参照**来自 bottom（MIT 许可），但**没有复制它的代码**：
-所有实现都是按它的可观察行为重写的。
+This project borrows **inspiration and layout algorithms** from bottom (MIT licensed) but
+**copies none of its code**: everything was reimplemented from its observable behavior.

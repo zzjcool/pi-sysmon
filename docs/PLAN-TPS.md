@@ -1,80 +1,101 @@
-# 设计记录：Tokens（LLM 吞吐）图
+[English](PLAN-TPS.md) | [简体中文](PLAN-TPS.zh-CN.md)
 
-这份文档记录了第四张图（Tokens）的设计过程与决策依据 ——
-从可行性调研、分工实现，到对抗式审查找出的问题与修法。
+# Design Record: The Tokens (LLM Throughput) Chart
 
-原始需求：「能不能增加一个 token 的速度的图，就是 pi 和 llm api 吞吐 tps 的速度，
-这样默认四个图。」
+This document records the design process and rationale for the fourth chart (Tokens) —
+from feasibility research and the parallel implementation split, to the problems found by
+adversarial review and their fixes.
 
-## 调研结论（两份独立调研报告交叉验证，关键事实均已复核）
+Original request: "Can we add a chart for token speed — the tps throughput between pi and
+the LLM API — so there are four charts by default."
 
-### 关键事实
+## Research conclusions (two independent research reports, cross-validated; all key facts re-verified)
 
-1. `pi.on("message_update")` 在交互式 TUI **每 delta 都发**
-   （agent-loop 发出 → agent-session 转发 → 扩展收到）。
-2. **`partial.usage` 流式期间不可用**：`text_delta` 事件里 0 处 usage；
-   Anthropic 只在末尾 `message_delta` 给 output，OpenAI/Google 同样只在末块。
-   ⇒ 逐帧只能用 **delta 文本估算**，精确值只能在 `message_end` 拿。
-3. `chooseColumns` 目前**写死最多 3 列**，count=4 会排成 3+1（第二行只有 1 块 + 空位）。
-   实测 w=150/200 → cols=3 bands=2 rows=16。
-4. 4 图布局修复只需改 `chooseColumns`：≥96 列用 4 列（4×1，8 行），
-   48–95 用 2 列（2×2，16 行），<48 用 1 列。行预算 18 永远够。
+### Key facts
 
-## 决策
+1. `pi.on("message_update")` fires **on every delta** in the interactive TUI
+   (emitted by agent-loop → forwarded by agent-session → received by the extension).
+2. **`partial.usage` is unavailable during streaming**: `text_delta` events contain usage
+   in 0 places; Anthropic only provides output in the final `message_delta`, and
+   OpenAI/Google likewise only in the final chunk.
+   ⇒ Per-frame values can only be **estimated from delta text**; exact values are only
+   available at `message_end`.
+3. `chooseColumns` is currently **hard-capped at 3 columns**; count=4 lays out as 3+1
+   (second row holds only 1 block + an empty slot).
+   Measured at w=150/200 → cols=3 bands=2 rows=16.
+4. Fixing the 4-chart layout only requires changing `chooseColumns`: ≥96 columns → 4
+   columns (4×1, 8 rows), 48–95 → 2 columns (2×2, 16 rows), <48 → 1 column. The row
+   budget of 18 is always sufficient.
 
-- **TPS 默认开启**（用户要求默认 4 图），可用 `PI_SYSMON_TOKENS=0` 关闭。
-- 采样：事件侧 O(1) 累加，复用现有 1s interval 出桶 → `hist.tps` 环形缓冲，
-  复用 `rateAxis` 的 60s 窗口与「顶端=窗口最高值」语义。
-- 估算器：`ceil(asciiish/4) + cjk`（CJK 1 字≈1 token），读数带 `~` 表示估算。
-- 计入 `text_delta + thinking_delta + toolcall_delta`；**不碰** `*_end.content`（重复计数）。
-- 新模块 `src/tokens.ts`（纯函数 + 闭包 meter），可单测。
+## Decisions
 
-## 分工（不同 agent 并行，按文件不相交划分）
+- **TPS on by default** (the user asked for 4 charts by default), disabled with
+  `PI_SYSMON_TOKENS=0`.
+- Sampling: O(1) accumulation on the event side, reusing the existing 1s interval to roll
+  buckets → `hist.tps` ring buffer, reusing `rateAxis`'s 60s window and "top = window
+  maximum" semantics.
+- Estimator: `ceil(asciiish/4) + cjk` (1 CJK char ≈ 1 token); readouts carry `~` to mark
+  them as estimates.
+- Count `text_delta + thinking_delta + toolcall_delta`; **never touch** `*_end.content`
+  (double counting).
+- New module `src/tokens.ts` (pure functions + closure-based meter), unit-testable.
 
-| 执行者 | 负责文件 | 内容 |
+## Work split (different agents in parallel, partitioned by non-overlapping files)
+
+| Owner | Files | Scope |
 | --- | --- | --- |
-| worker A | `src/tokens.ts`、`test/tokens.test.ts`（**全新文件**） | 估算器 + 累积 meter + fmtTps |
-| worker B | `src/chart-panel.ts`、`test/layout.test.ts` | `chooseColumns(width, count)` 支持 4 列 |
-| 主 agent | `src/blocks.ts`、`src/index.ts`、其余测试与文档 | 集成：History.tps、第 4 块、事件接线 |
+| worker A | `src/tokens.ts`, `test/tokens.test.ts` (**brand-new files**) | estimator + accumulating meter + fmtTps |
+| worker B | `src/chart-panel.ts`, `test/layout.test.ts` | `chooseColumns(width, count)` supporting 4 columns |
+| main agent | `src/blocks.ts`, `src/index.ts`, remaining tests and docs | integration: History.tps, the 4th block, event wiring |
 
-## 验收
+## Acceptance criteria
 
-- `npm run check` 全绿（严格 TS：noUncheckedIndexedAccess + noUnusedLocals）
-- 打包两条自检通过
-- **真机 pi 抓帧**：4 图并排、窄宽度降级、无越界崩溃
-- 对抗式 review 后再交付
+- `npm run check` fully green (strict TS: noUncheckedIndexedAccess + noUnusedLocals)
+- Both bundle self-checks pass
+- **Real pi frame capture**: 4 charts side by side, narrow-width degradation, no overflow
+  crashes
+- Delivered after adversarial review
 
 ---
 
-## 实施结果（已完成）
+## Implementation results (completed)
 
-| 执行者 | 产出 |
+| Owner | Output |
 | --- | --- |
-| worker A | `src/tokens.ts` + `test/tokens.test.ts`（估算器 / meter / fmtTps） |
-| worker B | `src/chart-panel.ts` 的 `chooseColumns(width, count)` 支持 4 列 + 4 条布局测试 |
-| 主 agent | `src/blocks.ts`（History.tps、tokenAxis、fmtTokensTotal、Tokens 块）、`src/index.ts`（message_update 接线、meter、stop 排水）、文档 |
-| 2 个独立 review agent | 对抗式审查，找出 2 critical + 3 major，已全部修复 |
+| worker A | `src/tokens.ts` + `test/tokens.test.ts` (estimator / meter / fmtTps) |
+| worker B | `chooseColumns(width, count)` in `src/chart-panel.ts` supporting 4 columns + 4 layout tests |
+| main agent | `src/blocks.ts` (History.tps, tokenAxis, fmtTokensTotal, Tokens block), `src/index.ts` (message_update wiring, meter, stop drain), docs |
+| 2 independent review agents | adversarial review: found 2 critical + 3 major, all fixed |
 
-### 对抗式审查找出的真问题（已修 + 已加回归测试）
+### Real problems found by adversarial review (fixed + regression tests added)
 
-1. **全宽度扫描静默丢弃 Tokens 块**（critical）：`count = showDisks ? 4 : 3` 手算，
-   而 Tokens 默认开 → 4 块渲染进 3 格网格，第 4 块永远不被索引。
-   本仓库最重要的崩溃防线（越界 = pi 退出）对 Tokens **一次都没验证过**。
-   改为 `count = blocks.length`，并覆盖 4 种开关组合 × 非零读数。
-2. **`tokenAxis` / `fmtTokensTotal` 零测试**（critical）：与 `rateAxis` 同款的定宽约束
-   没有任何测试。已加全量级扫描 + 单位断言（绝不允许出现 `KB`）。
-3. **窄块 + 高 TPS 时读数整块消失**（major）：实测 `~12.3K tok/s`（12 列）在
-   24 列块里放不下 → 只剩空框。改用紧凑格式 `~12.3Kt/s`（与 y 轴刻度同款）。
-4. **块数双账本**（critical）：`index.ts` 手算 `blockCount` 与 `buildBlocks` 内部 if
-   是两个独立来源，漂移时静默画残缺面板。改为单一真相来源 `blocks.length`。
-5. **stop-drain 与坏输入防御零测试**（major）：已补 meter 级序列测试 +
-   `add(null/undefined/42)` 容忍测试。
+1. **Full-width sweep silently dropped the Tokens block** (critical): `count = showDisks ? 4 : 3`
+   was hand-computed, while Tokens is on by default → 4 blocks rendered into a 3-slot grid,
+   with the 4th block never indexed.
+   This repo's most important crash-defense line (overflow = pi exits) had **never once
+   been exercised** against Tokens.
+   Changed to `count = blocks.length`, covering all 4 switch combinations × non-zero
+   readouts.
+2. **`tokenAxis` / `fmtTokensTotal` had zero tests** (critical): the same fixed-width
+   constraint as `rateAxis` had no test at all. Added a full-magnitude sweep + unit
+   assertions (`KB` must never appear).
+3. **Readout vanished entirely on narrow blocks with high TPS** (major): measured
+   `~12.3K tok/s` (12 columns) doesn't fit in a 24-column block → only an empty frame
+   remained. Switched to the compact format `~12.3Kt/s` (same style as the y-axis ticks).
+4. **Double ledger for block count** (critical): `index.ts` hand-computed `blockCount`
+   while `buildBlocks` had its own internal `if`s — two independent sources that, when they
+   drift, silently draw an incomplete panel. Changed to the single source of truth
+   `blocks.length`.
+5. **Stop-drain and bad-input defense had zero tests** (major): added meter-level sequence
+   tests + tolerance tests for `add(null/undefined/42)`.
 
-### 最终验收
+### Final acceptance
 
-- `npm run check` 全绿，typecheck 干净
-- 打包两条自检通过（含新增的 `tokens.ts` 模块）
-- **真机 pi 抓帧**：四图并排（150 列 4×1）、60 列 2×2、40 列 1×4 均正常
-- **真实 LLM 流式验证**：Tokens 图画出真实曲线，读数与 pi 状态栏的
-  `⚡ t/s (avg)` 相互印证
-- 回归测试经**注入旧行为验证**（注入后 2 条失败，还原后全绿）
+- `npm run check` fully green, typecheck clean
+- Both bundle self-checks pass (including the newly added `tokens.ts` module)
+- **Real pi frame capture**: four charts side by side (4×1 at 150 columns), 2×2 at 60
+  columns, 1×4 at 40 columns — all working
+- **Real LLM streaming verification**: the Tokens chart drew a real curve, and its readout
+  corroborated pi's status bar `⚡ t/s (avg)`
+- Regression tests **validated by injecting the old behavior** (2 failures with the
+  injection, all green after reverting)

@@ -1,14 +1,18 @@
 /**
- * pi-sysmon —— 在 pi 里显示 bottom 风格的 braille 系统监控图。
+ * pi-sysmon — bottom-style braille system monitor charts inside pi.
  *
- * 默认用 ctx.ui.setWidget 把图表挂在编辑器**下方**（`placement: "belowEditor"`），
- * 想放上方就设 `PI_SYSMON_PLACEMENT=above`；也可以用 footer 模式替换整个底部。
+ * By default the charts are hung **below** the editor via ctx.ui.setWidget
+ * (`placement: "belowEditor"`); set `PI_SYSMON_PLACEMENT=above` to put them
+ * above; footer mode can also replace the entire bottom bar.
  *
- * 关于「有没有 10 行上限」：pi 的 `InteractiveMode.MAX_WIDGET_LINES = 10` 只在
- * `setWidget` 收到 **字符串数组** 时才裁剪（interactive-mode.js 的 Array.isArray 分支）。
- * 本项目传的是**组件工厂**，走的是另一条分支，没有任何行数裁剪（widgetsAbove 在
- * chat-viewport.js 里只是 `{ component, shrink, minSize }`）。所以面板高度是自由的，
- * 但为了不吃掉聊天区，仍然给 widget 模式一个行数预算（见 WIDGET_MAX_ROWS）。
+ * About the "is there a 10-line cap" question: pi's
+ * `InteractiveMode.MAX_WIDGET_LINES = 10` only clips when `setWidget` receives
+ * a **string array** (the Array.isArray branch in interactive-mode.js).
+ * This project passes a **component factory**, which goes through another
+ * branch with no line clipping at all (widgetsAbove in chat-viewport.js is
+ * just `{ component, shrink, minSize }`). So panel height is free — but to
+ * avoid eating the chat area, widget mode still gets a row budget (see
+ * WIDGET_MAX_ROWS).
  */
 import type {
 	ExtensionAPI,
@@ -35,7 +39,7 @@ import {
 	type Snapshot,
 } from "./metrics.ts";
 
-// ThemeLike 统一从 chart-panel.ts 导入，避免两处定义不一致
+// ThemeLike is imported uniformly from chart-panel.ts, avoiding two diverging definitions
 type Mode = "chart" | "status" | "footer";
 type UiHost = Pick<ExtensionCommandContext, "hasUI" | "ui">;
 
@@ -43,25 +47,26 @@ const STATUS_KEY = "sysmon";
 const WIDGET_KEY = "sysmon-chart";
 
 /**
- * 面板总行数预算（仅 widget 模式）。
+ * Total row budget for the panel (widget mode only).
  *
- * 先澄清一个常见误解：pi 的 `InteractiveMode.MAX_WIDGET_LINES = 10` 只对
- * **字符串数组**形态的 setWidget 生效（会 slice）；本项目传的是**组件工厂**，
- * 没有任何行数裁剪 —— 所以这不是硬限制。
+ * First, clear up a common misconception: pi's
+ * `InteractiveMode.MAX_WIDGET_LINES = 10` only applies to setWidget in the
+ * **string array** form (it slices); this project passes a **component
+ * factory** and gets no line clipping at all — so it's not a hard limit.
  *
- * 那为什么还要设？因为面板越高，聊天区越小。按列数分摊：
- * 1 行摆图（3 列）→ 每块 6 个绘图行，共 8 行；
- * 2 行摆图（2 列）→ 每块 6 个绘图行，共 16 行；
- * 3 行摆图（1 列）→ 每块 2 个绘图行，共 12 行。
+ * Why set one anyway? The taller the panel, the smaller the chat area. Budget by columns:
+ * 1 row of charts (3 cols) → 6 plot rows per block, 8 rows total;
+ * 2 rows of charts (2 cols) → 6 plot rows per block, 16 rows total;
+ * 3 rows of charts (1 col) → 2 plot rows per block, 12 rows total.
  */
 const WIDGET_MAX_ROWS = 18;
-/** footer 模式占有整个底部，可以铺得开一些 */
+/** footer mode owns the whole bottom bar and can spread out a bit more */
 const FOOTER_MAX_ROWS = 40;
 
-/** 历史缓冲区上限（点数）。实际显示的窗口由当前布局的绘图宽度决定。 */
+/** History buffer cap (in points). The window actually displayed is decided by the current layout's plot width. */
 const STORE_CAP = 4000;
 
-// ── 持久化：开关与模式跨重启保留（写 <configDir>/pi-sysmon.json）──
+// ── Persistence: on/off state and mode survive restarts (written to <configDir>/pi-sysmon.json) ──
 function configPath(): string {
 	const dir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 	return join(dir, "pi-sysmon.json");
@@ -92,17 +97,17 @@ function writeCfg(c: Cfg) {
 		mkdirSync(dirname(configPath()), { recursive: true });
 		writeFileSync(configPath(), `${JSON.stringify(c, null, 2)}\n`, "utf8");
 	} catch {
-		/* 只读文件系统等：忽略 */
+		/* read-only filesystem etc.: ignore */
 	}
 }
 
-/** 指标历史（环形缓冲） */
+/** Metric history (ring buffer) */
 function pushCapped(arr: number[], v: number, cap: number) {
 	arr.push(v);
 	while (arr.length > cap) arr.shift();
 }
 
-/** 读一个环境变量整数，超出 [min,max] 或非有限值时返回 undefined */
+/** Read an integer env var; returns undefined when outside [min,max] or non-finite */
 function envInt(name: string, min: number, max: number): number | undefined {
 	const v = Number(process.env[name]);
 	if (!Number.isFinite(v) || v < min) return undefined;
@@ -114,67 +119,82 @@ export default function (pi: ExtensionAPI) {
 	const intervalMs = envInt("PI_SYSMON_INTERVAL", 500, 60_000) ?? 1000;
 
 	/**
-	 * 每块图的绘图行数（不含那 2 行边框）。
+	 * Plot rows per chart block (excluding the 2 border rows).
 	 *
-	 * 默认 6：时间标签嵌进下边框、x 轴线由 0 基线兼任后，chrome 从 4 行降到 2 行，
-	 * 同样 8 行的总高里绘图区多了 2 行。配合「刻度不再占列」，
-	 * 150 列/3 块时的图表面积从 168 格提到 288 格（+71%）。
+	 * Default 6: with time labels embedded in the bottom border and the x-axis
+	 * line served by the 0 baseline, chrome dropped from 4 rows to 2, giving the
+	 * plot area 2 more rows within the same 8-row total. Together with "ticks no
+	 * longer occupy columns", the chart area at 150 cols / 3 blocks went from
+	 * 168 cells to 288 (+71%).
 	 */
 	const chartH = envInt("PI_SYSMON_CHART_HEIGHT", 1, 40) ?? 6;
 	/**
-	 * 默认时间窗口（秒），对齐 bottom 的 `default_time_value = 60_000`。
+	 * Default time window (seconds), aligned with bottom's `default_time_value = 60_000`.
 	 *
-	 * **为什么固定窗口而不按宽度自适应**：以前是拿「绘图区能装多少个数据点」
-	 * 反推窗口（`plotWidthFor(blockW) * 2 / interval`），结果同一台机器上
-	 * 改个终端宽度，x 轴标签就从 `60s` 漂到 `44s`/`84s`/`118s` ——
-	 * 时间尺度随窗口大小变化，跨宽度、跨机对比都不可能。
-	 * 固定成 bottom 的 60s 后，图上的一秒永远是一秒。
+	 * **Why a fixed window instead of adapting to width**: the window used to be
+	 * derived from "how many data points fit the plot area"
+	 * (`plotWidthFor(blockW) * 2 / interval`), so on the same machine, changing
+	 * the terminal width drifted the x-axis label from `60s` to
+	 * `44s`/`84s`/`118s` — the time scale changed with window size, making
+	 * comparisons across widths and machines impossible.
+	 * Once fixed to bottom's 60s, one second on the chart is always one second.
 	 *
-	 * 分辨率仍然与宽度有关（宽终端每点多占几个子像素列），
-	 * 但那是「画得细不细」，不影响「横轴代表多久」——这才是可比较的。
+	 * Resolution still depends on width (wide terminals give each point more
+	 * sub-pixel columns), but that's "how finely it's drawn", not "how long the
+	 * horizontal axis represents" — and the latter is what must be comparable.
 	 */
 	const defaultWindowSecs = envInt("PI_SYSMON_WINDOW", 5, 24 * 3600) ?? 60;
 	/**
-	 * 采样点数上限（环形缓冲的容量）。
+	 * Sampling point cap (ring buffer capacity).
 	 *
-	 * 注意与窗口的关系：**点数 = 窗口秒数 × 1000 / 采样间隔**。
-	 * 窗口固定后，间隔越小需要的点数越多（500ms 时 60s 要 120 点）。
-	 * 留 4 倍余量，保证改 INTERVAL 时窗口不会被默默截短。
+	 * Note the relationship with the window: **points = window seconds × 1000 /
+	 * sampling interval**. With the window fixed, a smaller interval needs more
+	 * points (60s at 500ms = 120 points). A 4× margin is kept so changing
+	 * INTERVAL doesn't silently shorten the window.
 	 */
 	const fixedPoints = envInt("PI_SYSMON_POINTS", 10, STORE_CAP);
 	/**
-	 * 速率图（Network / Disks）的**量程取样比例**，默认 1/6。
+	 * **Scale sampling fraction** for rate charts (Network / Disks), default 1/6.
 	 *
-	 * y 轴量程只看最近这么长一段（占窗口的比例）。
+	 * The y-axis scale only looks at the most recent slice of the window (this
+	 * fraction of it).
 	 *
-	 * 默认**不设**（即 `1`）= 量程窗 == 显示窗，y 轴顶端就是这 60s 里的真实最高值，
-	 * 屏幕上任何高度都能用顶端刻度直接读出来。
+	 * Default **unset** (i.e. `1`) = scale window == display window: the top of
+	 * the y axis is the true maximum of these 60s, and any on-screen height can
+	 * be read directly off the top tick.
 	 *
-	 * 设为小于 1 的值（如 `1/6`）可开启「自动回落」：量程只看最近 1/6 窗口，
-	 * 尖峰过去约 10s 后量程就回落，后面的数据能重新看清（但旧尖峰会超出量程被裁顶，
-	 * 此时顶端刻度会带 `+` 表示“至少这么多”）。
+	 * Set to a value < 1 (e.g. `1/6`) to enable "auto-fallback": the scale only
+	 * looks at the last 1/6 of the window, so ~10s after a spike passes the
+	 * scale falls back and later data becomes readable again (the old spike
+	 * exceeds the scale and is clipped at the top; the top tick then carries a
+	 * `+` meaning "at least this much").
 	 */
 	const scaleWindowFrac = (() => {
 		const v = Number(process.env.PI_SYSMON_SCALE_WINDOW);
 		return Number.isFinite(v) && v > 0 && v <= 1 ? v : undefined;
 	})();
 	/**
-	 * 是否显示 TPS（LLM token 吞吐）图。**默认开** —— 用户要求默认四图。
+	 * Whether to show the TPS (LLM token throughput) chart. **On by default** —
+	 * the user asked for four charts by default.
 	 *
-	 * 与 Disks 相反：Disks 默认关（只在宽终端摆得好看），
-	 * 而 TPS 是用户点名要的常驻指标。想要回到旧的三图：`PI_SYSMON_TOKENS=0`。
+	 * The opposite of Disks: Disks default to off (they only lay out nicely on
+	 * wide terminals), while TPS is a standing indicator the user explicitly
+	 * requested. To go back to the old three charts: `PI_SYSMON_TOKENS=0`.
 	 */
 	const showTokens = process.env.PI_SYSMON_TOKENS !== "0";
-	/** 是否额外显示磁盘 I/O 一块（默认关：四块并排已经是默认形态） */
+	/** Whether to show an extra disk I/O block (default off: four blocks side by side is already the default form) */
 	const showDisks = process.env.PI_SYSMON_DISKS === "1";
 	/**
-	 * 读数放哪里：`title`（默认）= 边框标题栏；`box` = 右上角浮动框；
-	 * `both` = 两者都画；`none` = 都不画（只要曲线）。
+	 * Where to put the readouts: `title` (default) = border title bar; `box` =
+	 * floating box at the top-right corner; `both` = draw both; `none` = draw
+	 * neither (curves only).
 	 *
-	 * 默认 `title` 的理由：标题栏那一行本来就存在（要写 `CPU`/`Memory`/`Network`），
-	 * 而且底部还用 `─` 填充到右边框 —— 那段填充列是**纯装饰**，
-	 * 拿来放读数等于零成本。浮动框则是**覆盖在曲线右上角**画的，
-	 * 会真的遮掉一块绘图区，所以不做默认。
+	 * Why `title` is the default: the title-bar row exists anyway (it has to
+	 * show `CPU`/`Memory`/`Network`), and its bottom padding fills to the right
+	 * border with `─` — those filler columns are **pure decoration**, so putting
+	 * readouts there costs nothing. The floating box, on the other hand, is
+	 * **painted over the top-right corner of the curve** and really covers a
+	 * chunk of plot area, so it isn't the default.
 	 */
 	const labelMode: LabelMode = (() => {
 		const v = process.env.PI_SYSMON_LABEL;
@@ -188,7 +208,7 @@ export default function (pi: ExtensionAPI) {
 		return m === "status" || m === "footer" || m === "chart" ? m : "chart";
 	})();
 
-	/** 图表挂编辑器下方还是上方（仅 chart 模式生效；默认下方，可由配置文件恢复/覆盖） */
+	/** Whether the chart hangs below or above the editor (chart mode only; default below, can be restored/overridden by the config file) */
 	let placement: Placement = parsePlacement(process.env.PI_SYSMON_PLACEMENT);
 
 	const hist: History = {
@@ -200,28 +220,34 @@ export default function (pi: ExtensionAPI) {
 		diskW: [],
 		tps: [],
 	};
-	// ── TPS 计量（LLM token 吞吐）──────────────────────────────────
-	// 事件侧只做 O(1) 累加，采样侧（上面的 sample）才出桶算速率。
-	// 两边完全解耦：没有事件时就是 0，事件密集时也只是一个整数加法，
-	// 不会因为 TPS 高而拖慢流式渲染（agent-loop 的 emit 是 await 的）。
+	// ── TPS metering (LLM token throughput) ──────────────────────────────────
+	// The event side only does O(1) accumulation; the sampling side (sample
+	// above) closes buckets and computes the rate.
+	// The two sides are fully decoupled: no events means 0, dense events are
+	// still just one integer addition, so high TPS never slows down streaming
+	// rendering (agent-loop's emit is awaited).
 	const tpsMeter = createTpsMeter(performance.now());
 	let lastTps = 0;
-	// 会话累计的精确 token 计数（上行/下行/缓存读），口径同 pi footer。
-	// 从 `message_end` 的 `usage` 累加 —— 那是 provider 报的**精确值**，
-	// 不是从 delta 文本估算的（只有每帧「速率」才需要估算）。
+	// Session-cumulative exact token counts (uplink/downlink/cache read), same
+	// convention as pi footer.
+	// Accumulated from the `usage` of `message_end` — that's the **exact value**
+	// reported by the provider, not an estimate from delta text (only the
+	// per-frame "rate" needs estimation).
 	//
-	// 用「累加」而不是「取最后一个 message 的值」是因为 pi footer 也是
-	// 扫全部 session entries 求和（`addUsageToTotals`），要与之对得上。
+	// "Accumulate" rather than "take the last message's value", because pi
+	// footer also sums over all session entries (`addUsageToTotals`), and we
+	// need to match it.
 	let tokIn = 0;
 	let tokOut = 0;
 	let tokCacheRead = 0;
 
-	/** 把一条 assistant 消息的精确 usage 计入累计（防重/防坏值） */
+	/** Add one assistant message's exact usage into the cumulative totals (guards against duplicates/bad values) */
 	const addUsage = (u: unknown): void => {
 		if (!u || typeof u !== "object") return;
 		const o = u as Record<string, unknown>;
-		// 每个字段都过一遍 Number.isFinite：provider 可能给 null/undefined，
-		// 而 NaN 一旦进累计值就会污染标题行（宽度算错 → 越界 → pi 退出）。
+		// Every field goes through Number.isFinite: providers may give null/undefined,
+		// and once NaN enters the cumulative values it poisons the title row
+		// (wrong width computation → overflow → pi exits).
 		const n = (v: unknown) =>
 			typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
 		tokIn += n(o.input);
@@ -244,13 +270,17 @@ export default function (pi: ExtensionAPI) {
 			pushCapped(hist.netTx, snap.txBps, STORE_CAP);
 			pushCapped(hist.diskR, snap.readBps, STORE_CAP);
 			pushCapped(hist.diskW, snap.writeBps, STORE_CAP);
-			// TPS 不是 /proc 指标，而是「从上个 tick 到现在累积的输出 token / 时间」。
-			// 用 performance.now() 而不是假定间隔恰好是 intervalMs：
-			// setInterval 在系统忙时会被推迟，按名义间隔除会系统性高估 TPS。
+			// TPS is not a /proc metric; it's "output tokens accumulated since the
+			// last tick / time".
+			// Use performance.now() instead of assuming the interval is exactly
+			// intervalMs: setInterval gets delayed under load, and dividing by the
+			// nominal interval would systematically overestimate TPS.
 			const { tps, tokens } = tpsMeter.tick(performance.now());
 			lastTps = tps;
-			// 这里的 tokens 只用于**排空桶**（防止停用期积压变成假尖峰），
-			// 不再计入任何显示值 —— 累计量现在走 message_end 的精确 usage。
+			// `tokens` here is only used to **drain the bucket** (preventing backlog
+			// during disabled periods from becoming a fake spike); it no longer feeds
+			// any displayed value — cumulative amounts now come from the exact usage
+			// of message_end.
 			void tokens;
 			pushCapped(hist.tps, tps, STORE_CAP);
 		} catch {
@@ -261,27 +291,33 @@ export default function (pi: ExtensionAPI) {
 	function stop() {
 		if (timer) clearInterval(timer);
 		timer = undefined;
-		// 关闭时把当前桶倒掉。否则关闭期间累积的 token 会在**重新启用后的第一个 tick**
-		// 全部当成「这一秒的速率」报出去 —— 实测关闭 30s 后重新打开会报出
-		// 6000 tok/s 的假尖峰（真实瞬时值接近 0）。
-		// 倒掉的 token 不进入任何显示值（累计量另有精确来源）。
+		// Drain the current bucket on stop. Otherwise tokens accumulated while
+		// disabled would all be reported as "this second's rate" on the **first
+		// tick after re-enabling** — measured: after being off for 30s, re-enabling
+		// reported a fake 6000 tok/s spike (the true instantaneous value was ~0).
+		// Drained tokens don't enter any displayed value (cumulative amounts have
+		// their own exact source).
 		tpsMeter.tick(performance.now());
 	}
 
 	/*
-	 * 块数（CPU/Memory/Network + Tokens 默认开 + Disks 可选）不再手算 ——
-	 * 它是 `buildBlocks` 的输出长度，在 renderPanelFor 里直接取 `blocks.length`，
-	 * 避免“布局声明的块数”与“实际画出的块数”两个账本悄悄漂移。
+	 * The block count (CPU/Memory/Network + Tokens on by default + optional
+	 * Disks) is no longer hand-computed — it's the length of `buildBlocks`'s
+	 * output, taken directly as `blocks.length` in renderPanelFor, avoiding two
+	 * ledgers ("block count declared by the layout" vs "blocks actually drawn")
+	 * silently drifting apart.
 	 */
 
 	/**
-	 * 渲染整块面板。
+	 * Render the whole panel.
 	 *
-	 * 注意：**显示多少个数据点不再依赖宽度** —— 它由固定时间窗口
-	 * （`PI_SYSMON_WINDOW`，默认 60s）与采样间隔算出。
-	 * 宽度只影响「把这些点画得多细」（braille 子像素列数），
-	 * 不影响「横轴代表多久」。这两件事必须拆开，否则换个终端宽度
-	 * 时间尺度就变了，跨宽度、跨机器都没法对比。
+	 * Note: **how many data points are shown no longer depends on width** — it's
+	 * computed from the fixed time window (`PI_SYSMON_WINDOW`, default 60s) and
+	 * the sampling interval.
+	 * Width only affects "how finely those points are drawn" (braille sub-pixel
+	 * columns), not "how long the horizontal axis represents". These two must be
+	 * decoupled, otherwise changing terminal width changes the time scale and
+	 * comparisons across widths and machines become impossible.
 	 */
 	function renderPanelFor(
 		theme: ThemeLike,
@@ -294,23 +330,25 @@ export default function (pi: ExtensionAPI) {
 			fixedPoints,
 			available: hist.cpu.length,
 		});
-		// 先构造块，再用 **blocks.length** 算布局。
-		// 以前布局用的是一个手算的 `blockCount = 3 + (showTokens?1:0) + ...`，
-		// 而实际块数由 buildBlocks 内部的 if 决定 —— 两个独立账本，
-		// 一旦漂移，renderPanel 会**静默丢弃**多出来的块（按 band*cols+c 索引，
-		// 越界就取不到，不报错），画出残缺面板而所有测试仍然绿。
-		// 现在只有一个真相来源，漂移在结构上不可能。
+		// Build the blocks first, then compute the layout from **blocks.length**.
+		// The layout used to take a hand-computed
+		// `blockCount = 3 + (showTokens?1:0) + ...`, while the actual block count
+		// was decided by ifs inside buildBlocks — two independent ledgers. Once
+		// they drift, renderPanel **silently drops** the extra blocks (indexed by
+		// band*cols+c, out-of-range just yields nothing, no error), drawing an
+		// incomplete panel while all tests stay green.
+		// Now there's a single source of truth; drift is structurally impossible.
 		const blocks = buildBlocks(hist, snap, {
 			points,
 			showDisks,
 			showTokens,
-			// 当前 TPS 速率 + 会话累计的三个精确计数（同 pi footer 口径）。
+			// Current TPS rate + the session-cumulative exact counts (same convention as pi footer).
 			tpsNow: lastTps,
 			tokensIn: tokIn,
 			tokensOut: tokOut,
 			tokensCacheRead: tokCacheRead,
 			labelMode,
-			// `undefined` 会被 buildBlocks 里的 `?? DEFAULT_...` 接管，直接传即可
+			// `undefined` is taken over by the `?? DEFAULT_...` inside buildBlocks, so pass it through
 			scaleWindowFrac,
 		});
 		const layout = computeLayout(width, chartH, blocks.length, maxRows);
@@ -329,7 +367,7 @@ export default function (pi: ExtensionAPI) {
 		return cpu;
 	};
 
-	/** 图表组件的公共实现（widget 与 footer 只差行数预算） */
+	/** Shared implementation of the chart component (widget and footer differ only in row budget) */
 	function makeChart(maxRows: number) {
 		return (tui: { requestRender(): void }, theme: ThemeLike) => {
 			stop();
@@ -373,7 +411,7 @@ export default function (pi: ExtensionAPI) {
 			return true;
 		}
 
-		// footer：整块底部替换
+		// footer: replace the whole bottom bar
 		ctx.ui.setFooter(makeChart(FOOTER_MAX_ROWS));
 		return true;
 	}
@@ -399,9 +437,9 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) return;
 			const want = String(args ?? "").trim();
-			// 位置切换：切换时不用重新开一次会话。
-			// 单开一条分支是因为它跟 mode/on/off 正交，
-			// 而且切完要重新 render 一次（setWidget 得重新调用）。
+			// Placement switching: no need to restart the session to switch.
+			// It gets its own branch because it's orthogonal to mode/on/off,
+			// and a re-render is required after switching (setWidget must be called again).
 			if (want === "above" || want === "below") {
 				placement = want === "below" ? "belowEditor" : "aboveEditor";
 				writeCfg({ enabled, mode, placement });
@@ -410,7 +448,7 @@ export default function (pi: ExtensionAPI) {
 					enabled = enable(ctx);
 				}
 				ctx.ui.notify(
-					`System monitor: ${want === "below" ? "编辑器下方" : "编辑器上方"}`,
+					`System monitor: ${want === "below" ? "below editor" : "above editor"}`,
 					"info",
 				);
 				return;
@@ -452,19 +490,24 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── TPS 数据来源：LLM 流式增量 ──────────────────────────────
-	// 为什么不看 `partial.usage`：它在流式期间**不可用**。
-	// 实测（pi-ai）：Anthropic 只在流的最后一个 `message_delta` 才给 output_tokens，
-	// OpenAI 的 usage chunk / Google 的 usageMetadata 同样都在末块。
-	// `text_delta` 事件里 0 处 usage。逐帧只能用 delta 文本**估算**，
-	// 精确值只能在 `message_end` 拿（目前不用）。
+	// ── TPS data source: LLM streaming deltas ─────────────────────────────
+	// Why not read `partial.usage`: it's **unavailable** during streaming.
+	// Measured (pi-ai): Anthropic only sends output_tokens in the last
+	// `message_delta` of the stream; OpenAI's usage chunk and Google's
+	// usageMetadata likewise only arrive in the final chunk.
+	// Zero occurrences of usage in `text_delta` events. Per-frame values can only
+	// be **estimated** from delta text; exact values are only available at
+	// `message_end` (currently unused there).
 	//
-	// 这三类都算输出 token（都是计费的）：正文、思考、工具调用参数。
-	// `*_end.content` 是整块全文，计入会与已计的 delta **双重计数**，所以绝不碰。
+	// All three kinds count as output tokens (all are billed): body text,
+	// thinking, tool-call arguments.
+	// `*_end.content` is the full text of the whole block; counting it would
+	// **double-count** the deltas already counted, so never touch it.
 	pi.on("message_update", (event) => {
 		const ev = event.assistantMessageEvent;
-		// 类型守卫写全，而不是只判 `"delta" in ev`：三种事件的 delta 字段语义不同，
-		// 显式列出才能在将来新增事件类型时被 TS 提醒。
+		// Write the type guards out in full instead of just checking `"delta" in ev`:
+		// the delta fields of the three event types have different semantics, and
+		// listing them explicitly ensures TS reminds us when new event types are added.
 		if (ev.type === "text_delta") tpsMeter.add({ kind: "text", delta: ev.delta });
 		else if (ev.type === "thinking_delta")
 			tpsMeter.add({ kind: "thinking", delta: ev.delta });
@@ -472,14 +515,17 @@ export default function (pi: ExtensionAPI) {
 			tpsMeter.add({ kind: "toolcall", delta: ev.delta });
 	});
 
-	// ── 精确累计：只在消息结束时取 provider 报的 usage ──────────────
-	// 为什么不在 message_update 里取：那里的 usage 在流式期间**根本不可用**
-	// （实测：text_start 时 input/output 都是 0，要等最后一个事件才有值）。
-	// `message_end` 拿到的 `usage` 是 provider 的权威值，直接累加即可，
-	// 而且与 pi footer 的口径（扫 session entries 求和）一致。
+	// ── Exact cumulative totals: only take the provider-reported usage at message end ──────────────
+	// Why not read it in message_update: usage there is **simply unavailable**
+	// during streaming (measured: input/output are both 0 at text_start; values
+	// only appear in the last event).
+	// The `usage` from `message_end` is the provider's authoritative value, so
+	// just accumulate it — and it matches pi footer's convention (summing over
+	// session entries).
 	pi.on("message_end", (event) => {
-		// 只算 assistant 消息：user 消息也会触发 message_end，
-		// 算进去会把上行重复计数（提示词文本本身不是 token 用量）。
+		// Only count assistant messages: user messages also trigger message_end,
+		// and counting them would double-count the uplink (the prompt text itself
+		// is not token usage).
 		if (event.message.role !== "assistant") return;
 		addUsage(event.message.usage);
 	});
@@ -487,9 +533,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_e, ctx) => {
 		if (enabled || !ctx.hasUI) return;
 		const cfg = readCfg();
-		if (cfg.mode) mode = cfg.mode; // 记住上次模式
-		if (cfg.placement) placement = cfg.placement; // 记住上次位置
-		if (cfg.enabled === false) return; // 上次关了就不再自开
+		if (cfg.mode) mode = cfg.mode; // remember last mode
+		if (cfg.placement) placement = cfg.placement; // remember last placement
+		if (cfg.enabled === false) return; // don't auto-enable if it was turned off last time
 		enabled = enable(ctx);
 	});
 

@@ -1,587 +1,699 @@
-# 架构与设计决策
+[English](ARCHITECTURE.md) | [简体中文](ARCHITECTURE.zh-CN.md)
 
-## 分层
+# Architecture & Design Decisions
+
+## Layers
 
 ```
 src/
-├── metrics.ts      # 采集层  —— 读 /proc，产出 Snapshot
-├── braille.ts      # 渲染层  —— Snapshot 数值 → braille 字符行（纯函数）
-├── blocks.ts       # 组装层  —— 历史 + 快照 → MetricBlock[]（纯数据 → 纯数据）
-├── chart-panel.ts  # 布局层  —— 响应式列数 / 边框 / 刻度 / 浮动读数框 / 并排拼接
-└── index.ts        # 扩展层  —— pi 生命周期 / 命令 / 配置 / 定时器
+├── metrics.ts      # collection  — reads /proc, produces a Snapshot
+├── braille.ts      # rendering   — Snapshot numbers → braille character rows (pure functions)
+├── blocks.ts       # assembly    — history + snapshot → MetricBlock[] (pure data → pure data)
+├── chart-panel.ts  # layout      — responsive columns / borders / ticks / floating readout box / side-by-side splicing
+└── index.ts        # extension   — pi lifecycle / commands / config / timers
 ```
 
-依赖方向是单向的：`index → chart-panel → braille`、`index → blocks → {chart-panel, tokens}`、
-`index → metrics`、`index → tokens`。`braille.ts` 与 `tokens.ts` **不依赖任何其它本模块**。
+Dependencies flow one way: `index → chart-panel → braille`, `index → blocks → {chart-panel, tokens}`,
+`index → metrics`, `index → tokens`. `braille.ts` and `tokens.ts` **depend on nothing else in this module**.
 
-### 为什么要这样分？
+### Why split it this way?
 
-- **`braille.ts` 可独立测试**：它是纯函数 `number[] → string[]`，不读系统、不碰
-  pi API。13 项单元测试全部针对它，跑起来不需要启动 pi。
-- **采集与展示解耦**：`metrics.ts` 的 `collect()` 返回一个普通对象，
-  想换渲染方式（sparkline、进度条）不用动采集代码。
-- **布局单独一层**：坐标轴、刻度、留白策略是「怎么摆」，与「怎么画线」是两回事。
+- **`braille.ts` is independently testable**: it's a pure `number[] → string[]` function
+  that never touches the system or the pi API. All 13 unit tests target it, and they run
+  without starting pi.
+- **Collection decoupled from presentation**: `metrics.ts`'s `collect()` returns a plain
+  object, so swapping the renderer (sparkline, progress bar) doesn't touch collection code.
+- **Layout is its own layer**: axes, ticks, and padding strategy are about "where to put
+  things", which is a different concern from "how to draw the line".
 
-## 关键设计决策
+## Key design decisions
 
-### 1. 为什么用 braille 而不是方块字符
+### 1. Why braille instead of block characters
 
-方块字符（`▁▂▃▄▅▆▇█`）每列只能表达 8 个离散高度，一行就是一个像素高，
-画折线需要多行且纵向精度差。braille 每个字符是 2×4 个可独立点亮的点，
-在同样的字符面积上纵向精度是方块的 4 倍，还能横向画两个点。
+Block characters (`▁▂▃▄▅▆▇█`) only express 8 discrete heights per column, and one row is a
+single pixel tall — drawing a line chart needs multiple rows with poor vertical resolution.
+Each braille character is a 2×4 grid of independently lit dots: 4× the vertical resolution
+in the same character area, plus two dots per column horizontally.
 
-代价：依赖终端字体支持 U+2800–U+28FF（绝大多数等宽字体都支持；
-不支持时 bottom 的退路是 `--dot_marker`，本项目暂未实现）。
+The cost: it depends on terminal font support for U+2800–U+28FF (supported by virtually all
+monospace fonts; bottom's fallback when unsupported is `--dot_marker`, which this project
+has not implemented).
 
-### 2. 为什么默认 `stretch`（拉伸铺满）
+### 2. Why `stretch` is the default (stretch to fill)
 
-`renderChart` 有 `stretch` 选项：
+`renderChart` has a `stretch` option:
 
-- `stretch: true` —— 把现有历史拉伸铺满整个宽度
-- `stretch: false` —— 右侧对齐，x 轴严格对应固定的时间窗（bottom 的做法）
+- `stretch: true` — stretch the existing history to fill the whole width
+- `stretch: false` — right-align, with the x axis strictly mapped to a fixed time window (bottom's approach)
 
-bottom 用右对齐是因为它始终有完整的 10 分钟历史。而扩展刚启动时只有几个数据点，
-右对齐会让图表长时间只有右侧一小段有内容，观感很差。所以默认拉伸，
-等历史攒够后视觉上自然接近右对齐。
+bottom right-aligns because it always has a full 10 minutes of history. A freshly started
+extension only has a few data points, and right-alignment would leave the chart mostly
+empty on the left for a long time — it looks bad. So we stretch by default, and once enough
+history accumulates it visually converges to right-aligned anyway.
 
-### 3. y 轴量程策略
+### 3. y-axis scale strategy
 
-- **百分比类（CPU / 内存）**：固定 `0..100`。这样不同时间的图可以直接比较，
-  不会因为当前峰值低就把小波动放大成剧烈起伏。
-- **速率类（网络）**：动态量程 = 窗口内最大值 × 1.5。乘 1.5 是 bottom 的做法，
-  让峰值落在轴高约 2/3 处，曲线上下留白，不贴顶。
+- **Percentage metrics (CPU / memory)**: fixed `0..100`. Charts at different times are then
+  directly comparable — small fluctuations don't get amplified into dramatic swings just
+  because the current peak is low.
+- **Rate metrics (network)**: dynamic scale = window maximum × 1.5. The ×1.5 comes from
+  bottom: it places peaks at about 2/3 of the axis height, leaving breathing room above and
+  below the curve instead of touching the top.
 
-### 4. 配置持久化用文件而不是 `pi.appendEntry()`
+### 4. Config persistence uses a file, not `pi.appendEntry()`
 
-pi 提供 `pi.appendEntry()` 做持久化，但它写进的是**会话文件**，
-换一个新会话（或重启）就读不到了。用户要的是「我关掉了，下次打开还是关的」，
-这是跨会话的偏好，所以写独立配置文件 `<configDir>/pi-sysmon.json`。
+pi offers `pi.appendEntry()` for persistence, but it writes into the **session file** —
+a new session (or a restart) can't read it. What the user wants is "I turned it off, and it
+stays off next time" — that's a cross-session preference, so it goes into a standalone config
+file at `<configDir>/pi-sysmon.json`.
 
-### 5. 响应式列数必须只依赖宽度
+### 5. Responsive column count must depend on width only
 
-`chooseColumns(width, count)` 是纯函数，**只看宽度与块数，不看数据**。
+`chooseColumns(width, count)` is a pure function: **it looks at width and block count, never at data**.
 
-（`count` 来自环境开关 `PI_SYSMON_TOKENS` / `PI_SYSMON_DISKS`，进程生命周期内恒定。
-所以「同一宽度 ⇒ 同一行数」的不变式仍然成立 —— 变的只有宽度，或用户改配置重启。）
+(`count` comes from the `PI_SYSMON_TOKENS` / `PI_SYSMON_DISKS` environment switches and is
+constant for the process lifetime. So the invariant "same width ⇒ same row count" still
+holds — only the width changes, or the user changes config and restarts.)
 
-如果列数依赖**数据**（比如"峰值大就少放一张图"），那列数会随采样逐帧变化，
-进而让面板行数变化 —— 而行数变化会让编辑器上下位移，破坏锚定在屏幕坐标的鼠标选区
-（表现为"选中文字后复制不了"）。这是本项目前身记录过的真实事故，所以列数/行数
-只允许在 **resize** 时变化（resize 本身就会重排全屏，不新增风险）。
+If the column count depended on **data** (e.g. "fewer charts when the peak is high"), the
+column count would change frame by frame with sampling, which changes the panel's row
+count — and changing the row count shifts the editor vertically, breaking mouse selections
+anchored to screen coordinates (symptom: "I selected text but can't copy it"). This is a
+real incident recorded by this project's predecessor, so column/row counts are only allowed
+to change on **resize** (a resize already reflows the whole screen, adding no new risk).
 
-断点取「每块至少 24 列」（`MIN_BLOCK_W`）：边框 2 + 绘图区 22。
-刻度**叠印**在绘图区上、不再独占列，所以这个下限比旧排版（刻度独占 5 列）低很多；
-22 列绘图区 = 44 个 braille 子像素列。比这更窄时 bottom 会把 N 张图硬挤到一行
-（实测 50 列时每张只有 16 列，曲线已不可读），本项目改为降级排列。
+The breakpoint is "at least 24 columns per block" (`MIN_BLOCK_W`): border 2 + plot area 22.
+Ticks are **overprinted** onto the plot area instead of owning dedicated columns, so this
+floor is much lower than the old layout (where ticks owned 5 columns); 22 plot columns =
+44 braille sub-pixel columns. Below this, bottom would cram all N charts into one row
+(measured at 50 columns: each chart gets only 16 columns and the curves are unreadable);
+this project degrades the arrangement instead.
 
-**列数随块数自适应**（这是 4 图改造的关键）：
+**Column count adapts to block count** (this is the key to the 4-chart rework):
 
-| 块数 | 宽度 | 布局 |
+| Blocks | Width | Layout |
 | --- | --- | --- |
-| 4 图（默认） | ≥ 96 | 4×1（8 行） |
-| 4 图 | 48–95 | 2×2（16 行） |
-| 4 图 | < 48 | 1×4 竖排 |
-| 3 图 | ≥ 72 | 3×1 |
-| 3 图 | 48–71 | 2 列（末格留空） |
+| 4 charts (default) | ≥ 96 | 4×1 (8 rows) |
+| 4 charts | 48–95 | 2×2 (16 rows) |
+| 4 charts | < 48 | 1×4 vertical stack |
+| 3 charts | ≥ 72 | 3×1 |
+| 3 charts | 48–71 | 2 columns (last cell left empty) |
 
-原则：**绝不选一个会留下半空组的列数**。旧实现写死最多 3 列，于是 4 图在
-≥72 列时会排成「3+1」—— 第二组只有 1 块加一个占满整行的空格子
-（200 列时浪费 67 列）。所以 4 图时**跳过 3 列档**，直接在 96 列起上 4 列。
+Principle: **never pick a column count that leaves a half-empty group**. The old
+implementation hard-capped at 3 columns, so 4 charts at ≥72 columns laid out as "3+1" —
+the second group held 1 block plus an empty cell spanning a full row (wasting 67 columns at
+200 columns wide). So with 4 charts we **skip the 3-column tier** and go straight to
+4 columns at 96.
 
-### 6. 为什么用「单元格数组」而不是拼字符串
+### 6. Why a "cell array" instead of string splicing
 
-浮动读数框要**覆盖**画在绘图行上，而绘图行本身混着 ANSI 转义序列。
-如果用 `slice`/`padEnd` 做字符串手术，转义符会被算进可见宽度，宽度账立刻失真，
-直接触发 pi 的越界崩溃。
+The floating readout box has to be **overlaid** onto plot rows that already contain ANSI
+escape sequences. Doing string surgery with `slice`/`padEnd` would count escape sequences
+toward visible width, immediately corrupting the width math and triggering pi's
+out-of-bounds crash.
 
-所以 `renderBlock` 内部把每行表示成 `Cell[]`（定宽单元格），覆盖写入是数组赋值，
-最后 `paint()` 才生成 ANSI。好处是宽度账天然精确，且**不需要在中间过程处理转义序列**。
+So `renderBlock` represents each row internally as a `Cell[]` (fixed-width cells);
+overwriting is array assignment, and `paint()` only generates ANSI at the very end. The
+width math is exact by construction, and **no intermediate step ever touches escape
+sequences**.
 
-### 7. 定时刷新用 `setInterval` + `tui.requestRender()`
+### 7. Timer refresh via `setInterval` + `tui.requestRender()`
 
-pi 的 TUI 是差分渲染的，`requestRender()` 内部有节流去重，所以每秒调用没有压力。
-组件本身是无状态的（只读闭包里的 `snap`），渲染时现算，不需要缓存失效逻辑。
+pi's TUI renders differentially, and `requestRender()` is throttled/deduplicated
+internally, so calling it once per second is cheap. The component itself is stateless (it
+only reads the `snap` captured in its closure) and computes at render time — no cache
+invalidation logic needed.
 
-### 8. 单文件打包的自检（血泪教训）
+### 8. Single-file bundle self-checks (learned the hard way)
 
-打包脚本除了「拼接 + 去 import」，还会做两条自检，都是**实际踩过的坑**：
+Beyond "concatenate + strip imports", the bundle script runs two self-checks, both of which
+come from **bugs we actually hit**:
 
-1. **不许残留本地相对 import** —— 单文件形态下 `./braille.ts` 之类无处可解析。
-2. **每个从本地模块导入的运行期符号，必须在产物里有定义** ——
-   这条是补上一个**真正上过线的事故**：
+1. **No local relative imports may remain** — in single-file form there's nowhere for
+   `./braille.ts` and friends to resolve to.
+2. **Every runtime symbol imported from a local module must have a definition in the
+   output** — this one closes the loop on an incident that **actually shipped**:
 
-   重构时新增了 `src/blocks.ts`（`buildBlocks`），但忘了把 `blocks.ts` 加进
-   打包脚本的 `MODULES` 列表；同时 `RENAMES` 里还留着一条
-   「把 `chart-panel.ts` 的 `renderPanel` 改名成 `renderChartPanel`」——
-   那是我重构**之前**的需求（当时 `index.ts` 自带一个同名 `renderPanel`），
-   重构后 `index.ts` 改成从 chart-panel 导入了，这条改名就把
-   `renderPanel` 的定义改没了、调用处没改。
+   A refactor added `src/blocks.ts` (`buildBlocks`), but forgot to add `blocks.ts` to the
+   bundle script's `MODULES` list; meanwhile `RENAMES` still contained an entry
+   "rename `renderPanel` from `chart-panel.ts` to `renderChartPanel`" — a leftover from
+   **before** the refactor (back when `index.ts` had its own same-named `renderPanel`).
+   After the refactor, `index.ts` imports it from chart-panel, so the rename wiped out the
+   *definition* of `renderPanel` while leaving the *call sites* untouched.
 
-   结果：产物里 `renderPanel(...)` 和 `buildBlocks(...)` **只有调用、没有定义**。
+   Result: the output called `renderPanel(...)` and `buildBlocks(...)` with **no
+   definitions anywhere**.
 
-   这个 bug 最阴的地方在于**所有既有验证手段都拦不住**：
-   - `tsc` 通过（类型检查看的是源码，源码里两个函数都在）；
-   - 40 条单元测试通过（测试直接 `import` 源文件，**根本不走打包**）；
-   - 我的渲染 harness 也通过（同理，用的是源码）。
+   The nastiest part of this bug is that **every existing verification step missed it**:
+   - `tsc` passed (type checking looks at the sources, where both functions exist);
+   - 40 unit tests passed (tests `import` the source files directly and **never go through
+     the bundle**);
+   - my render harness passed too (same reason — it uses the sources).
 
-   它只在 **pi 真的加载扩展**时才炸：`ReferenceError: renderPanel is not defined`
-   → `uncaughtException` → **pi 直接退出**。
-   最后是「启动真实 pi、抓它渲染出来的帧」这个手段抓到的。
+   It only blew up when **pi actually loaded the extension**:
+   `ReferenceError: renderPanel is not defined` → `uncaughtException` → **pi exits**.
+   What finally caught it was "launch a real pi and capture the frames it renders".
 
-   **教训**：打包产物的正确性必须由「**在真实宿主里跑一遍**」来保证，
-   单测和 typecheck 覆盖不到构建产物这一层。
+   **Lesson**: the correctness of a build artifact must be verified by **running it in the
+   real host**; unit tests and typecheck don't cover the bundle layer.
 
-### 9. 单文件打包为什么存在
+### 9. Why the single-file bundle exists
 
-见 `scripts/bundle-single-file.mjs` 顶部注释。简单说：pi 会把
-`extensions/` 下的每个 `.ts` 当成扩展，多文件平铺会导致非入口文件被当作扩展而
-加载失败，进而**整个 pi 启动失败**。单文件形态没有这个约束，对用户最省事。
+See the comment at the top of `scripts/bundle-single-file.mjs`. Short version: pi treats
+every `.ts` under `extensions/` as an extension, so a multi-file layout gets non-entry
+files loaded as extensions, which fails — and **takes down the entire pi startup**. The
+single-file form has no such constraint and is the least hassle for users.
 
-## 与 bottom 的排版对齐
+## Layout parity with bottom
 
-排版参数不是调出来的，而是**读源码抄准 + 用真实 `btm` 抓帧逐字符核对**：
+The layout parameters weren't tuned by feel — they were **copied exactly from the source
+and verified character-by-character against frames captured from a real `btm`**:
 
-| 素材 | 用途 |
+| Material | Used for |
 | --- | --- |
-| `ratatui-widgets-0.3.2/src/chart.rs` | bottom 用的绘图组件本体：轴线/刻度/标签的位置公式 |
-| `bottom/src/canvas/components/time_series/base.rs` | `Block` 边框 + `title_top`、x 标签 `["-Ns","0s"]`、legend 阈值 |
-| `bottom/src/canvas/widgets/network_graph.rs` | 速率图量程 = max×1.5（取顶端 1 个刻度） |
-| `bottom/src/components/time_series/percent.rs` | 百分比图固定量程 `AxisBound::Max(100.5)` |
-| `btm` 在受控宽度的真实抓帧（50/72/100/150 列） | 逐字符核对结果 |
+| `ratatui-widgets-0.3.2/src/chart.rs` | the actual chart widget bottom uses: position formulas for axes/ticks/labels |
+| `bottom/src/canvas/components/time_series/base.rs` | `Block` border + `title_top`, x labels `["-Ns","0s"]`, legend thresholds |
+| `bottom/src/canvas/widgets/network_graph.rs` | rate chart scale = max×1.5 (keep the top 1 tick) |
+| `bottom/src/components/time_series/percent.rs` | percent charts use fixed scale `AxisBound::Max(100.5)` |
+| Real `btm` frame captures at controlled widths (50/72/100/150 columns) | character-by-character verification |
 
-抄准的三个最容易弄错的细节：
+The three details that are easiest to get wrong:
 
-1. **x 轴线不延伸到 y 轴那一列** ⇒ 轴线行是 `│╌╌└───…│`，不是 `│╌╌┴───…│`。
-   来源：`Chart::layout` 放完 y 轴后执行了 `x += 1`。
-2. **左下时间标签的末位落在 y 轴列上** ⇒ `│ 60s` 里 `s` 与 y 轴同列。
-   来源：`labels_alignment = Left` 时首个 x 标签区域是 `[chart_left, graph_left)`（左含右不含）再右对齐。
-3. **y 刻度索引 0 在底部**，位置 `dy = i*(plotH-1)/(n-1)`（**整数除法 = floor**，
-   不是四舍五入），画在 `plotBottom - dy`。
-   这条是抓帧对出来的：bottom 的 Network 块在 plotH=8、4 个刻度时，
-   刻度落在 plot 行 `{0,2,4,7}`（floor）；用 `Math.round` 会得到 `{0,2,5,7}`，
-   第三个刻度差 1 行。`test/layout.test.ts` 里有一条测试专门把这 4 个行号钉死。
+1. **The x axis does not extend into the y-axis column** ⇒ the axis row is `│╌╌└───…│`,
+   not `│╌╌┴───…│`.
+   Source: `Chart::layout` executes `x += 1` after placing the y axis.
+2. **The last character of the bottom-left time label lands on the y-axis column** ⇒ in
+   `│ 60s` the `s` shares a column with the y axis.
+   Source: with `labels_alignment = Left`, the first x-label area is
+   `[chart_left, graph_left)` (left-inclusive, right-exclusive) and right-aligned within it.
+3. **y-tick index 0 is at the bottom**, positioned at `dy = i*(plotH-1)/(n-1)` (**integer
+   division = floor**, not rounding), drawn at `plotBottom - dy`.
+   This one was pinned down from frame captures: bottom's Network block at plotH=8 with 4
+   ticks lands them on plot rows `{0,2,4,7}` (floor); `Math.round` would give `{0,2,5,7}`,
+   off by one row on the third tick. There's a test in `test/layout.test.ts` that nails
+   these 4 row numbers down.
 
-**两处有意偏离**：
+**Two deliberate deviations**:
 
-1. **读数默认写在边框标题栏里**（`PI_SYSMON_LABEL=title`），而不是右上角浮框。
-   标题栏那一行本来就要写块名，剩下的 `─` 填充是纯装饰 —— 放读数是零成本，
-   且完全不遮曲线（bottom 的浮框是 overlay，会吃掉一块绘图区）。
+1. **Readouts live in the border title bar by default** (`PI_SYSMON_LABEL=title`) rather
+   than a floating box in the top-right corner. The title bar row has to render the block
+   name anyway, and the remaining `─` fill is pure decoration — putting the readout there
+   costs nothing and never covers the curve (bottom's floating box is an overlay that eats
+   a chunk of plot area).
 
-2. **浮框显隐阈值**（仅在 `box`/`both` 下生效）。bottom 用 `hidden_legend_constraints`
-   （Network 9/10 × 3/4、Memory 3/4 × 3/4）这套**按比例**的阈值，而它是按 40+ 列宽的图
-   校准的 —— 套到本项目 20~30 列的块上，读数框会永远不显示。
-   本项目改为「放得下（`legendW <= plotW`）+ 浮框下面还留得出一行（`legendH < rows`）」。
-   那条「留一行」很关键：浮框若铺到绘图区最后一行，下边框会与 0% 基线叠成双横线，
-   看起来像渲染坏了。
+2. **Floating box visibility threshold** (only applies under `box`/`both`). bottom uses
+   `hidden_legend_constraints` (Network 9/10 × 3/4, Memory 3/4 × 3/4), a set of
+   **proportional** thresholds calibrated for charts 40+ columns wide — applied to this
+   project's 20–30 column blocks, the readout box would never appear.
+   This project uses "it fits (`legendW <= plotW`) + one row remains below the box
+   (`legendH < rows`)" instead.
+   That "leave one row" clause matters: if the box reaches the last plot row, the bottom
+   border overlaps the 0% baseline into a double horizontal line that looks like a render
+   glitch.
 
-   ⚠️ 这里踩过一个坑：**曾经还多一条「至少留 40% 曲线可见」，结果把 Network 的浮框
-   永久挡掉了** —— 它文字最长，宽度规则先否一次；叠加高度规则后又否一次。
-   「浮框覆盖曲线」本来就是设计意图，没有理由要求留白，那条规则已删除。
-   在 title 模式下这些阈值都不参与（根本不画浮框）。
+   ⚠️ A pitfall we hit here: **there used to be an additional rule "at least 40% of the
+   curve must remain visible", and it permanently blocked the Network box** — it has the
+   longest text, so the width rule rejected it first; then the height rule rejected it
+   again on top.
+   "The box covers the curve" is by design, so there was no reason to demand clearance;
+   that rule has been deleted.
+   In title mode none of these thresholds participate (no box is drawn at all).
 
-## 排版几何：刻度叠印 + 边框兼任轴（提高图表利用率）
+## Layout geometry: overprinted ticks + border doubling as axis (raising chart utilization)
 
-初版是「刻度独占一列、x 轴线独占一行、时间标签独占一行」，每块的开销是：
+The first version was "ticks own a column, x axis owns a row, time labels own a row", and
+each block paid this overhead:
 
 ```
 ┌ CPU ─ 5% ────────┐
-│100%│      plot   │   ← gutter 4 列 + 轴线 1 列，共 5 列不画数据
+│100%│      plot   │   ← gutter 4 columns + axis 1 column = 5 columns drawing no data
 │  0%│             │
-│    └─────────────│   ← x 轴线独占 1 行
-│  60s          0s │   ← 时间标签独占 1 行
-└──────────────────┘   → chrome 4 行
+│    └─────────────│   ← x axis owns 1 row
+│  60s          0s │   ← time labels own 1 row
+└──────────────────┘   → chrome 4 rows
 ```
 
-改成三处共用后，同样的屏幕面积画的数据多得多：
+After making three things share space, the same screen area draws much more data:
 
 ```
 ┌ CPU ─ 5% ────────┐
-│100%        plot  │   ← 刻度**叠印**在绘图区左侧，不占列
+│100%        plot  │   ← ticks **overprinted** on the left of the plot area, owning no columns
 │                  │
-│  0%──────────────│   ← 0 基线兼任 x 轴线
-└ 60s ───────── 0s ┘   ← 时间标签嵌在下边框里（与标题嵌上边框对称）
-                      → chrome 2 行
+│  0%──────────────│   ← 0 baseline doubles as the x axis
+└ 60s ───────── 0s ┘   ← time labels embedded in the bottom border (symmetric with the title in the top border)
+                      → chrome 2 rows
 ```
 
-| 项 | 旧 | 新 |
+| Item | Old | New |
 | --- | --- | --- |
-| y 刻度占列 | 5（4 数字 + 1 竖线） | **0**（叠印） |
-| 每块 chrome 行 | 4 | **2** |
-| 50 列块的绘图区 | 42 × 4 = 168 格 | **48 × 6 = 288 格（+71%）** |
-| 三图并排所需宽度 | ≥ 90 列 | **≥ 72 列** |
+| Columns owned by y ticks | 5 (4 digits + 1 vertical line) | **0** (overprinted) |
+| Chrome rows per block | 4 | **2** |
+| Plot area of a 50-column block | 42 × 4 = 168 cells | **48 × 6 = 288 cells (+71%)** |
+| Width needed for three charts side by side | ≥ 90 columns | **≥ 72 columns** |
 
-**三处配套改动**（不改就不「诚实」）：
+**Three companion changes** (without them the layout would "lie"):
 
-1. **x 轴标签必须按时间比例定位**（`MetricBlock.windowPoints` → `renderChartGlyphs` 的
-   `slots`）。旧的两条路径都不行：
-   `stretch: true` 会把 3 秒的数据拉伸冒充满窗口；
-   `stretch: false` 是「一点 = 一子像素列」，满窗口 60 点只能填满 `60/subW` 的宽度、右侧空着。
-   `slots` 模式是「一点 = `subW/windowPoints` 子像素列」，比例**不随已攒点数变化** ——
-   启动 3 秒的数据只占右侧 1/20 宽，`60s` 这个读数才是真的。
+1. **x-axis labels must be positioned proportionally to time** (`MetricBlock.windowPoints`
+   → the `slots` parameter of `renderChartGlyphs`). Neither old path works:
+   `stretch: true` stretches 3 seconds of data to masquerade as a full window;
+   `stretch: false` is "one point = one sub-pixel column", so a full 60-point window only
+   fills `60/subW` of the width, leaving the right side empty.
+   The `slots` mode is "one point = `subW/windowPoints` sub-pixel columns", and the ratio
+   **does not change as points accumulate** — 3 seconds after startup the data only fills
+   the rightmost 1/20, and only then is the `60s` reading actually true.
 
-2. **窗口时长从第一秒就固定**（`resolveWindow` 不再用 `min(points, available)`）。
-   以前标签会随已攒历史缩成 `3s`/`14s`/`30s`，横轴时长一直在变，没法对比。
-   注意时长要由**实际点数**反推（`points × intervalMs / 1000`），
-   不能直接返回 `windowSecs` —— 否则 `PI_SYSMON_POINTS=200` 会谎报 `60s`。
+2. **Window duration is fixed from the first second** (`resolveWindow` no longer uses
+   `min(points, available)`).
+   Previously labels shrank with accumulated history to `3s`/`14s`/`30s` — the x-axis
+   duration kept changing and nothing was comparable.
+   Note the duration must be derived from the **actual point count**
+   (`points × intervalMs / 1000`), not by returning `windowSecs` directly — otherwise
+   `PI_SYSMON_POINTS=200` would falsely report `60s`.
 
-3. **单标签贴顶**。只标顶端值时，通用公式
-   `y = rows-1 - floor(i*(rows-1)/(n-1))` 在 `n=1` 时退化成 `rows-1`（底部），
-   而唯一的标签语义上是「量程上限」，必须贴顶。
+3. **Single label sticks to the top**. With only the top value labeled, the generic formula
+   `y = rows-1 - floor(i*(rows-1)/(n-1))` degenerates to `rows-1` (the bottom) when `n=1`,
+   but the sole label semantically means "scale ceiling" and must sit at the top.
 
-**刻度为什么只标顶端一个**：0 的位置就是底部基线，一目了然；而刻度叠印在曲线上后，
-底部的 `0B` 会和曲线、基线挤在一起。顶端值才是图上读不出来的信息（「上沿代表多少」）。
-速率图的顶端值**带单位**（`3.0MB`），否则屏幕上只剩一个光秃秃的 `3.0`，看不出量级。
+**Why only the top tick is labeled**: 0's position is the bottom baseline — self-evident;
+and once ticks are overprinted onto the curve, a bottom `0B` would be crammed together with
+the curve and the baseline. The top value is the only information not readable from the
+chart itself ("how much does the top edge represent").
+The top value on rate charts **carries its unit** (`3.0MB`) — otherwise the screen shows a
+bare `3.0` with no sense of magnitude.
 
-### 溢出标记 `+`：自动回落必然带来的「刻度撒谎」问题
+### The overflow marker `+`: the "lying tick" problem that auto-fallback necessarily creates
 
-自动回落（量程只看最近 1/6 窗口）有个**必然副作用**，是用户问出来的：
+Auto-fallback (scale only looks at the most recent 1/6 of the window) has an **inevitable
+side effect**, surfaced by a user's question:
 
-> 「为什么网络图中间达到 10MB/s，过一会最大值又变成几百 KB 了，
-> 都没等到这个 10MB 的时间移除时间窗口？」
+> "Why did the network chart hit 10MB/s in the middle, and a while later the maximum became
+> a few hundred KB — the 10MB point hadn't even left the time window yet?"
 
-根因：量程窗（10s）比显示窗（60s）短。尖峰发生约 10s 后量程就回落了，
-**但那根尖峰还在 60s 的显示窗里**。而绘制时超量程的值会被 clamp 到顶
-（`braille.ts` 的 `Math.min(top, raw)`），于是屏幕上是一根顶到天的尖峰，
-而顶端刻度写着 `293KB` —— 读图的人会以为「最高就到几百 KB」。**刻度在撒谎。**
+Root cause: the scale window (10s) is shorter than the display window (60s). About 10s
+after the spike, the scale falls back, **but the spike is still inside the 60s display
+window**. At render time, over-scale values get clamped to the top (`Math.min(top, raw)` in
+`braille.ts`), so the screen shows a spike hitting the ceiling while the top tick reads
+`293KB` — a reader concludes "it peaked at a few hundred KB". **The tick is lying.**
 
-修法是给顶端刻度加 `+`（`293KB` → `293K+`，读作「至少这么多」）：
+The fix is to append a `+` to the top tick (`293KB` → `293K+`, read as "at least this
+much"):
 
-| 时刻 | 尖峰在显示窗内 | 在量程窗内 | 顶端刻度 |
+| Moment | Spike in display window | Spike in scale window | Top tick |
 | --- | --- | --- | --- |
-| 刚发生 | ✅ | ✅ | `15MB`（包得住，不标） |
-| 10s 后 | ✅ | ❌ | `293K+`（包不住，标记） |
-| 60s 后 | ❌ | ❌ | `293KB`（滚出窗口，不标） |
+| Just happened | ✅ | ✅ | `15MB` (contained, unmarked) |
+| 10s later | ✅ | ❌ | `293K+` (not contained, marked) |
+| 60s later | ❌ | ❌ | `293KB` (rolled out of the window, unmarked) |
 
-⚠️ **`+` 是替换最后一位字符，不是追加**：`rawGutter` 是按原标签算的，
-追加会让叠印宽度逐帧变化 → 绘图区左边界跳一格（见下面第 6 条坑）。
-所以 `"293KB"` 变 `"293K+"`（丢掉 `B` 但仍是 5 列），不是 `"293KB+"`。
+⚠️ **`+` replaces the last character; it is not appended**: `rawGutter` is computed from
+the original label, and appending would make the overprint width change frame to frame →
+the plot area's left edge would jitter by one column (see pitfall #6 below).
+So `"293KB"` becomes `"293K+"` (the `B` is dropped but it stays 5 columns), not `"293KB+"`.
 
-副作用：单位 `B` 被 `+` 占掉。这是有意的取舍 ——
-`293K+` 仍然一眼可读（且和标题栏的 `↓195K/s` 同风格），
-而宽度抖动会让整块图左右闪，那才是不可接受的。
+Side effect: the `B` unit is displaced by `+`. This is a deliberate trade-off —
+`293K+` is still readable at a glance (and matches the `↓195K/s` style in the title bar),
+while width jitter makes the whole chart flash left and right, which is unacceptable.
 
-## 会破坏用户环境的两个坑（务必遵守）
+## Two pitfalls that would break the user's environment (must be respected)
 
-### 行宽不得越界
+### Row width must never overflow
 
-pi 渲染时若发现某行可见宽度 > 终端宽度，会抛 `uncaughtException` **直接退出**。
+If pi finds a row whose visible width exceeds the terminal width during rendering, it
+throws `uncaughtException` and **exits immediately**.
 
-- 必须用 `truncateToWidth(line, width)`，**不能**用 `String.slice()`
-  （`slice` 按 UTF-16 码元切，会把 ANSI 转义序列也算进去，导致宽度算错）
-- 宽字符用 `visibleWidth()` 计算
+- You must use `truncateToWidth(line, width)` — **never** `String.slice()`
+  (`slice` cuts by UTF-16 code units and counts ANSI escape sequences, corrupting the
+  width math)
+- Use `visibleWidth()` for wide characters
 
-### 刻度宽度必须恒定（否则绘图区会逐帧抖动）
+### Tick width must be constant (or the plot area jitters frame to frame)
 
-`renderBlock` 的 gutter（y 刻度列宽）取自「最长刻度标签」，所以**刻度标签宽度一变，
-绘图区左边界就跟着跳一格**。这个坑在速率图上是真实存在的：
+`renderBlock`'s gutter (y-tick column width) comes from "the longest tick label", so
+**whenever a tick label's width changes, the plot area's left edge jumps by one column**.
+This pitfall is real on rate charts:
 
-`rateAxis` 的第四个标签是 `scaled × 1.5`，当它跨过 1000 时比其它三个标签多一位
-（`dataMax = 670` → `1005.0` 是 6 列，其余是 5 列）。网络峰值恰好在 670 附近波动时，
-gutter 会 5↔6 逐帧来回跳 —— 曲线、轴线、时间标签整体左右闪，比刻度难看多了。
+`rateAxis`'s fourth label is `scaled × 1.5`, and when it crosses 1000 it gains a digit over
+the other three labels (`dataMax = 670` → `1005.0` is 6 columns, the rest are 5). When the
+network peak hovers around 670, the gutter flips 5↔6 frame to frame — the curve, the axis,
+and the time labels all flash left and right, far uglier than any tick.
 
-**后来加的溢出标记 `+` 也受这条约束**：必须替换字符而非追加，见上一节。
+**The later-added overflow marker `+` is subject to this constraint too**: it must replace
+a character, not append — see the previous section.
 
-所以 `rateAxis` 用 `fit()` 把所有标签**归一成恰好 `RATE_GUTTER` 列**，
-而且归一策略是**降精度而不是截断**：
+So `rateAxis` uses `fit()` to **normalize every label to exactly `RATE_GUTTER` columns**,
+and the normalization strategy is **reducing precision, not truncating**:
 
 ```ts
 const one = v.toFixed(1);
 if (one.length <= RATE_GUTTER) return one.padStart(RATE_GUTTER);
-return v.toFixed(0).padStart(RATE_GUTTER);   // 放不下就退回整数
+return v.toFixed(0).padStart(RATE_GUTTER);   // fall back to integer when it doesn't fit
 ```
 
-截断会得到 `1005.` 这种残缺字符串；降精度只是少一位小数，而刻度本来就是粗略量程。
-测试里对 `0 .. 10^15` 全量程断言「每个标签恰好 5 列」，并单独盯 600..800 这个原抖动区间。
+Truncation would produce broken strings like `1005.`; reducing precision just drops one
+decimal place, and ticks are only a coarse scale anyway.
+Tests assert "every label is exactly 5 columns" across the full range `0 .. 10^15`, with
+special attention on 600..800, the original jitter band.
 
-### 自动量程：默认「整个窗口取 max」，回落是可选开关
+### Auto-scale: default is "max over the whole window"; fallback is an opt-in switch
 
-速率图（网络/磁盘）的 y 轴量程是动态的：取可见窗口内的最大值 ×1.5
-（对齐 bottom：`auto_y.rs` 扫整个 `visible_duration`）。
+Rate charts (network/disk) have a dynamic y-axis scale: maximum over the visible window ×
+1.5 (matching bottom: `auto_y.rs` scans the entire `visible_duration`).
 
-**默认行为（`DEFAULT_SCALE_WINDOW_FRAC = 1`）：量程窗 == 显示窗 == 60s。**
-y 轴顶端就是这 60 秒里的真实最高值，屏幕上任何一根曲线的高度都能用顶端刻度
-直接读出来 —— **刻度永不撒谎**，也就不需要溢出标记 `+`。
+**Default behavior (`DEFAULT_SCALE_WINDOW_FRAC = 1`): scale window == display window ==
+60s.**
+The top of the y axis is the true maximum over those 60 seconds, and every curve on screen
+can be read directly against the top tick — **the tick never lies**, so the overflow marker
+`+` is never needed.
 
-这中间绕过一圈，记下来避免重走：曾有段时间默认只用最近 1/6 窗口（10s）算量程，
-理由是下面这个真实痛点 ——
+There was a detour in the middle; recorded here so we don't retrace it: for a while the
+default only used the most recent 1/6 of the window (10s) for the scale, motivated by this
+very real pain point —
 
-> 一个 100 倍尖峰会把量程钉住，直到该点**滚出整个窗口**（60s 窗口就是整整 60 秒）。
-> 期间后面的数据全被压成贴底的线，实测基线只占绘图高度的 **0.7%** —— 也就是看不见。
+> A 100× spike pins the scale until that point **rolls out of the entire window** (a full
+> 60 seconds for a 60s window).
+> In the meantime everything after it is squashed into a line hugging the bottom — measured
+> baseline occupying only **0.7%** of the plot height — i.e. invisible.
 
-用户反馈的「高度降不下来，后面的值看起来都很小」就是这个。
+The user report "the height won't come down, all later values look tiny" was exactly this.
 
-当时把默认改成了**量程只看最近的 `scaleWindowPoints` 个点**（窗口的 1/6，60s 窗口即 10s）：
+At the time the default was changed to **scale from only the most recent
+`scaleWindowPoints` points** (1/6 of the window, i.e. 10s for a 60s window):
 
-| 尖峰过去 | 全窗口 max（旧） | 只看最近 10s（新） |
+| Time since spike | Whole-window max (old) | Only last 10s (new) |
 | --- | --- | --- |
-| 0 s | 基线占 0.7% | 0.7% |
+| 0 s | baseline at 0.7% | 0.7% |
 | 10 s | 0.7% | **67%** |
 | 30 s | 0.7% | **67%** |
-| 55 s | 0.7%（仍不可见） | **67%** |
+| 55 s | 0.7% (still invisible) | **67%** |
 
-代价是**比 10s 更旧的尖峰会被裁顶**（画成贴顶平顶）。渲染层已有 clamp
-（`braille.ts` 的 `Math.min(top, raw)`），不会越界；这是终端图表通用的 off-scale 语义。
+The cost is that **spikes older than 10s get clipped at the top** (drawn as a flat line at
+the ceiling). The render layer already clamps (`Math.min(top, raw)` in `braille.ts`), so
+nothing goes out of bounds; this is the standard off-scale semantics of terminal charts.
 
-**但这个默认值后来被用户否掉了**，原话：
+**But this default was later rejected by the user**, verbatim:
 
-> 「我不需要 + 啊，我就是想要显示最高的地方就可以了，然后 60s 一个窗口」
+> "I don't need the + — I just want it to show the highest point, and a 60s window."
 
-因为「尖峰已滑出量程窗、但仍在显示窗内」时会出现**刻度撒谎**：
-屏幕上是一根顶到天的尖峰，顶端刻度却只写 `293KB`。我先加了个 `+` 标记去补救
-（`293K+`，读作「至少这么多」），但用户并不想要额外的符号 —— 他要的就是
-「量程 = 整窗最高值」这个更简单、自洽的语义。
+Because when "the spike has left the scale window but is still in the display window", the
+**tick lies**: the screen shows a spike hitting the ceiling while the top tick reads only
+`293KB`. I first added the `+` marker as a remedy (`293K+`, read as "at least this much"),
+but the user didn't want an extra symbol — what they wanted was the simpler, self-consistent
+semantics of "scale = the window's true maximum".
 
-所以现在的取舍是：
+So the current trade-off is:
 
-| `PI_SYSMON_SCALE_WINDOW` | 量程窗 | 顶端刻度语义 | 溢出标记 `+` |
+| `PI_SYSMON_SCALE_WINDOW` | Scale window | Top tick semantics | Overflow marker `+` |
 | --- | --- | --- | --- |
-| 不设（默认）= `1` | 60s（== 显示窗） | 本窗口真实最高值 | 永不需要 |
-| `< 1`（如 `1/6`） | 最近 10s | 当前量程上限 | 需要，自动生效 |
+| unset (default) = `1` | 60s (== display window) | true maximum of the window | never needed |
+| `< 1` (e.g. `1/6`) | last 10s | current scale ceiling | needed, activates automatically |
 
-两条路都是自洽的，**没有中间态**：要么量程罩住整窗（无需标记），
-要么量程只罩一小段（必须标记超出部分）。`+` 的代码因此保留 ——
-删掉它等于在 opt-in 路径上知情地重新引入「刻度撒谎」。
+Both paths are self-consistent, with **no middle state**: either the scale covers the whole
+window (no marker needed), or it covers only a short slice (overflow must be marked). The
+`+` code is therefore kept — deleting it would knowingly reintroduce "lying ticks" on the
+opt-in path.
 
-这个做法参照了 btop 的 `net_auto`（`linux/btop_collect.cpp:2996-3073`：
-滞后计数 5 帧后把量程降到「近期均值 × 1.3」，带 10 KiB 下限）。
-取「10 秒」而不是 btop 的「5 帧」，是换算到本项目的时间尺度 —— 5 秒太敏感，
-正常短突发刚画上去就被裁顶。
+This approach references btop's `net_auto` (`linux/btop_collect.cpp:2996-3073`:
+after a hysteresis count of 5 frames, lower the scale to "recent average × 1.3", with a
+10 KiB floor).
+We take "10 seconds" rather than btop's "5 frames" as a translation to this project's time
+scale — 5 seconds is too sensitive; normal short bursts would get clipped the moment
+they're drawn.
 
-两个实现要点（都踩过）：
+Two implementation points (both learned the hard way):
 
-1. **量程窗用绝对点数，不用比例。** 比例得乘「当前数组长度」，而启动初期数组很短，
-   于是同样的比例会得到越来越长的量程窗，恢复耗时飘忽（实测 10s↔18s）。
-   点数由 `buildBlocks` 按**目标窗口**折算，恢复耗时因此固定为 10s（有测试断言）。
-2. **它仍然是纯函数**，只依赖本帧数据，不引入跨帧隐藏状态 ——
-   所以渲染 harness 与全宽度扫描断言依然可复现（带状态的指数衰减方案就做不到）。
+1. **The scale window uses an absolute point count, not a ratio.** A ratio multiplies by
+   "the current array length", which is short right after startup, so the same ratio yields
+   an ever-growing scale window and erratic recovery times (measured 10s↔18s).
+   The point count is converted by `buildBlocks` from the **target window**, fixing the
+   recovery time at 10s (asserted by a test).
+2. **It remains a pure function**, depending only on the current frame's data, with no
+   hidden cross-frame state — so the render harness and the full-width sweep assertions
+   stay reproducible (a stateful exponential-decay scheme would not).
 
-`PI_SYSMON_SCALE_WINDOW=1` 可退回「整个窗口取 max」的旧行为。
+`PI_SYSMON_SCALE_WINDOW=1` restores the old behavior of "max over the whole window".
 
-### 单元格模型的隐含不变量：一 cell = 一显示列
+### The cell model's hidden invariant: one cell = one display column
 
-`renderBlock` 内部把每行拆成 `Cell[]` 做覆盖和右对齐（`putRight` 定位刻度与时间标签、
-边框固定落在 `w-1`），这全部依赖一条不变量：
+`renderBlock` splits each row into a `Cell[]` for overwriting and right alignment
+(`putRight` positions ticks and time labels; the border lands fixed at `w-1`), all of which
+depends on one invariant:
 
-> 每个 cell 恰好占一个显示列，即 `row.length === visibleWidth(行文本)`
+> Each cell occupies exactly one display column, i.e. `row.length === visibleWidth(row text)`
 
-ASCII 天然满足，但 `visibleWidth` 是按 `get-east-asian-width` 算的，与「字符数」
-在三种情况下不等（都实测过）：
+ASCII satisfies this naturally, but `visibleWidth` is computed via `get-east-asian-width`
+and differs from "character count" in three cases (all verified by measurement):
 
-| 类别 | 例 | visibleWidth | 字符数 | 处理 |
+| Category | Examples | visibleWidth | char count | Handling |
 | --- | --- | --- | --- | --- |
-| 常规（含 box/braille） | `─` `⣿` `µ` `−` | 1 | 1 | 一个 cell |
-| 宽字符 | `你` `🙂` `\u3000` | 2 | 1 | 字符 cell + `vw-1` 个空占位 cell |
-| 组合 / 零宽 | `e\u0301` `\u200b` | 0 | 1~2 | 并入前一个 cell |
+| Regular (incl. box/braille) | `─` `⣿` `µ` `−` | 1 | 1 | one cell |
+| Wide characters | `你` `🙂` `\u3000` | 2 | 1 | character cell + `vw-1` placeholder cells |
+| Combining / zero-width | `e\u0301` `\u200b` | 0 | 1~2 | merged into the previous cell |
 
-- 不处理宽字符 → 行**变宽**（可见宽度 > 声明宽度）→ pi 抛异常退出；
-- 不处理零宽字符 → 后续内容相对边框**左移** → 边框错位。
+- Not handling wide characters → rows **get wider** (visible width > declared width) → pi
+  throws and exits;
+- Not handling zero-width characters → subsequent content **shifts left** relative to the
+  border → the border misaligns.
 
-补占位 cell 用 `for (k = 1; k < vw; k++)` 而不是硬编码 `vw === 2`，
-这样 pi-tui 将来把某个 ambiguous 字符改判得更宽时也不会突然越界。
+Placeholder cells are added with `for (k = 1; k < vw; k++)` rather than hard-coding
+`vw === 2`, so nothing suddenly overflows if pi-tui ever reclassifies some ambiguous
+character as wider.
 
-**连带的两个坑**（都是加非 ASCII 测试后才暴露的）：
+**Two related pitfalls** (both only surfaced after adding non-ASCII tests):
 
-1. 算标题宽度必须用 `visibleWidth(name)` 而不是 `name.length` ——
-   `.length` 数码点，CJK 占 2 列，会低估占宽 → fill 算多 → 右边框 `┐` 被挤掉。
-2. 截断单元格行**不能**用 `row.slice(0, n)` —— 宽字符的字符 cell 与占位 cell
-   是一体的，硬切会把占位留在外面（返回 9 个 cell 却渲染 10 列），
-   于是 `┐` 被挤出边界。`truncateRow()` 以「字符」为单位累积，放不下整个字符就整体不要。
+1. Title width must be computed with `visibleWidth(name)`, not `name.length` — `.length`
+   counts code points, CJK takes 2 columns, so you'd underestimate the width → overfill →
+   the right border `┐` gets squeezed out.
+2. Truncating a cell row must **never** use `row.slice(0, n)` — a wide character's
+   character cell and its placeholder cells are one unit; a hard cut leaves the placeholder
+   outside (returns 9 cells but renders 10 columns), pushing `┐` past the boundary.
+   `truncateRow()` accumulates whole "characters": if the whole character doesn't fit, it's
+   dropped entirely.
 
-`test/layout.test.ts` 有一条把块名/读数/读数值全换成
-CJK、组合符、零宽符、全角空格、emoji 的扫描测试，逐宽度断言
-「不越界 + 行数恒定 + 边框闭合」。
+`test/layout.test.ts` has a sweep test that replaces block names/readouts/readout values
+with CJK, combining marks, zero-width characters, full-width spaces, and emoji, asserting
+per width "no overflow + constant row count + closed borders".
 
-### 行数必须恒定
+### Row count must be constant
 
-组件渲染的行数变化会让编辑器上下位移，锚定在屏幕坐标的鼠标选区失效，
-表现为「选中输入框文字后复制不了」。这是本项目前身（本机的 `tps.ts` 扩展）
-记录过的真实事故。所以有数据 / 无数据都必须返回相同行数，无数据时填占位内容。
+Changing the number of rows a component renders shifts the editor vertically and breaks
+mouse selections anchored to screen coordinates — symptom: "I selected text in the input
+box but can't copy it". This is a real incident recorded by this project's predecessor (the
+`tps.ts` extension on this machine). So with or without data, the same row count must be
+returned, with placeholder content when there's no data.
 
-于是 `computeLayout` 给出的 `totalRows` 就是硬合同：`renderPanel` 返回的行数
-必须恰好等于它（有 22 条测试盯着这一点，包括对 8..220 全宽度的扫描）。
+Thus `totalRows` from `computeLayout` is a hard contract: `renderPanel` must return exactly
+that many rows (22 tests watch this, including a sweep across all widths 8..220).
 
-### 块数只能有一个真相来源
+### There can be only one source of truth for block count
 
-`renderPanel` 按 `band * cols + c` 索引取块，**越界就取不到且不报错** ——
-多出来的块被静默丢弃，画出一个残缺但看起来正常的面板，所有测试照样绿。
+`renderPanel` indexes blocks by `band * cols + c`, and **out-of-range indexes silently get
+nothing, with no error** — extra blocks are silently dropped, drawing an incomplete but
+normal-looking panel, with all tests still green.
 
-所以块数**绝不能手算**。曾经的写法是：
+So the block count **must never be hand-computed**. It used to be:
 
 ```ts
-// ✗ 两个独立账本 —— 迟早漂移
+// ✗ Two independent ledgers — they drift sooner or later
 const blockCount = 3 + (showTokens ? 1 : 0) + (showDisks ? 1 : 0);
 renderPanel(…, computeLayout(w, h, blockCount, maxRows), …)
 ```
 
-`buildBlocks` 内部有自己的 `if`，两边一旦不一致就会静默丢块。
-现在只有一条路径：
+`buildBlocks` has its own `if`s inside, and the moment the two disagree, blocks get dropped
+silently. Now there is a single path:
 
 ```ts
-// ✓ 单一真相来源
+// ✓ Single source of truth
 const blocks = buildBlocks(hist, snap, opts);
 const layout = computeLayout(w, chartH, blocks.length, maxRows);
 ```
 
-同类隐患：**开关组合没被测试覆盖**。全宽度扫描测试如果固定用 `count = 3`，
-那默认开启的 Tokens 块就**从未被那条崩溃防线验证过** —— 必须按
-`4 种开关组合 × 非零读数` 都跑一遍。
+A hazard of the same family: **switch combinations not covered by tests**. If the
+full-width sweep test always uses `count = 3`, the Tokens block — on by default — would
+**never be checked by that crash-defense line**. All `4 switch combinations × non-zero
+readouts` must be exercised.
 
-### `setWidget` 的 10 行上限：只对字符串数组生效（已核实，纠正旧说法）
+### `setWidget`'s 10-row cap: applies to string arrays only (verified; corrects the old claim)
 
-以前这里写的是「widget 最多 10 行」。**这是不准确的**，已读 pi 源码核实：
+This document previously said "widgets are capped at 10 rows". **That was inaccurate**;
+verified against the pi source:
 
 ```js
 // pi-coding-agent/dist/modes/interactive/interactive-mode.js
 if (Array.isArray(content)) {
-    for (const line of content.slice(0, InteractiveMode.MAX_WIDGET_LINES)) { ... }  // ← 只在这里
+    for (const line of content.slice(0, InteractiveMode.MAX_WIDGET_LINES)) { ... }  // ← only here
     if (content.length > InteractiveMode.MAX_WIDGET_LINES) { /* "... (widget truncated)" */ }
 } else {
-    component = content(this.ui, theme);   // ← 组件工厂分支：无任何裁剪
+    component = content(this.ui, theme);   // ← component factory branch: no clipping whatsoever
 }
 ```
 
-`MAX_WIDGET_LINES = 10` 只作用在 `Array.isArray(content)` 那一支。
-而组件工厂支直接实例化，行数不受限（`chat-viewport.js` 里 widgetsAbove 只是
-`{ component, shrink: 1, minSize: 0 }`）。
+`MAX_WIDGET_LINES = 10` applies only to the `Array.isArray(content)` branch.
+The component-factory branch instantiates directly with no row limit (in
+`chat-viewport.js`, widgetsAbove is just `{ component, shrink: 1, minSize: 0 }`).
 
-本项目用的是**组件工厂**，所以面板高度是自由的。那为什么 `index.ts` 里还有个
-`WIDGET_MAX_ROWS`？那是**自选的屏幕预算**（免得图表把聊天区挤没），不是平台限制。
-footer 模式用更大的 `FOOTER_MAX_ROWS`，因为底部本来就占了那块空间。
+This project uses the **component factory**, so panel height is free. So why does
+`index.ts` still have a `WIDGET_MAX_ROWS`? That's a **self-imposed screen budget** (so the
+charts don't squeeze the chat area away), not a platform limit.
+Footer mode uses the larger `FOOTER_MAX_ROWS`, since the bottom space was occupied anyway.
 
-## Tokens 图（LLM token 吞吐）
+## The Tokens chart (LLM token throughput)
 
-第四张图，默认开（`PI_SYSMON_TOKENS=0` 可关）。它和前三个**数据来源完全不同**：
-CPU/内存/网络来自 `/proc` 轮询，而 TPS 来自 pi 的流式事件。
+The fourth chart, on by default (`PI_SYSMON_TOKENS=0` to disable). Its **data source is
+entirely different** from the first three: CPU/memory/network come from `/proc` polling,
+while TPS comes from pi's streaming events.
 
-### 数据源：只能估算，不能计量
+### Data source: estimation only, never metering
 
-`pi.on("message_update")` 每个 delta 都会发一次，事件里带 `assistantMessageEvent`
-的 `text_delta` / `thinking_delta` / `toolcall_delta` —— 都含 `delta` 文本。
+`pi.on("message_update")` fires once per delta, carrying the `assistantMessageEvent`'s
+`text_delta` / `thinking_delta` / `toolcall_delta` — all of which contain `delta` text.
 
-**但 `partial.usage` 在流式期间不可用**（这是读了 pi-ai 源码确认的，不是猜的）：
+**But `partial.usage` is unavailable during streaming** (confirmed by reading the pi-ai
+source, not guessed):
 
-| provider | usage 何时到达 |
+| provider | When usage arrives |
 | --- | --- |
-| Anthropic | `message_start` 给 input；output 只在**末尾** `message_delta` |
-| OpenAI Completions | 末尾的 usage chunk（`stream_options.include_usage`） |
-| OpenAI Responses | `response.completed` 事件 |
-| Google | 末尾 chunk 的 `usageMetadata` |
+| Anthropic | `message_start` gives input; output only in the **final** `message_delta` |
+| OpenAI Completions | usage chunk at the end (`stream_options.include_usage`) |
+| OpenAI Responses | `response.completed` event |
+| Google | `usageMetadata` in the final chunk |
 
-`text_delta` 事件里 **0 处** usage。所以逐帧只能用 delta 文本估算，
-精确 token 数只能在 `message_end` 拿。
+`text_delta` events contain usage in **0 places**. So per-frame values can only be
+estimated from delta text; exact token counts are only available at `message_end`.
 
-**两条数据路径分工明确**（这是本图最重要的一条设计决定）：
+**The two data paths have clear roles** (this is the chart's single most important design
+decision):
 
-| 显示项 | 数据源 | 精度 |
+| Display item | Data source | Precision |
 | --- | --- | --- |
-| **曲线**（下行速率 t/s） | 逐帧 delta 文本估算 → 每秒出桶 | 估算（带 `~`） |
-| **标题栏读数**（↑ input / ↓ output / R cacheRead） | `message_end` 的 `usage` | **精确**（不带 `~`） |
+| **Curve** (downstream rate, t/s) | per-frame delta-text estimate → 1s buckets | estimate (with `~`) |
+| **Title-bar readout** (↑ input / ↓ output / R cacheRead) | `usage` at `message_end` | **exact** (no `~`) |
 
-所以「速率」与「累计量」不是同一个来源，也不应该假装是：
-曲线必须逐帧有值（否则画不出形状），而它天生只能估算；
-累计量不需要逐帧，可以等到消息结束取一份权威数字。
-`~` 只加在速率上，这个差异本身就是给用户的信息。
+So "rate" and "cumulative totals" do not come from the same source, and we don't pretend
+they do:
+the curve must have a value every frame (otherwise there's no shape to draw), and it can
+inherently only be an estimate;
+the totals don't need per-frame values and can wait for an authoritative number at message
+end.
+`~` is only attached to the rate — that difference itself is information for the user.
 
-估算法：`ceil(asciiish_chars / 4) + cjk_chars`，即英文按 4 字符/token、
-CJK 按 **1 字符/token**。理由：
+Estimator: `ceil(asciiish_chars / 4) + cjk_chars`, i.e. 4 chars/token for English and
+**1 char/token for CJK**. Rationale:
 
-- `chars/4` 是 pi-ai 自己的上下文估算口径（`CHARS_PER_TOKEN = 4`），英文/code 完全一致；
-- 但现代 BPE 里一个汉字约 1 token，`chars/4` 会把中文低估 4 倍。
-  本项目的用户中文输出多，这个误差不可接受。
+- `chars/4` is pi-ai's own context-estimation formula (`CHARS_PER_TOKEN = 4`), exactly
+  matching English/code;
+- but in modern BPE a Chinese character is roughly 1 token, so `chars/4` underestimates
+  Chinese by 4×.
+  This project's users produce a lot of Chinese output; that error is unacceptable.
 
-读数因此带 `~` 前缀（`~635t/s`，紧凑形式，见 `fmtTps` 注释）——
-它是估算值，不标 `~` 会让人当账单数字。
+Readouts therefore carry a `~` prefix (`~635t/s`, compact form — see the `fmtTps`
+comment) — it's an estimate, and without `~` people would treat it as a billing number.
 
-### 为什么只画一条曲线，却在读数里分上下行
+### Why one curve, but up/down split in the readout
 
-用户提的需求是「token 没有区分上行和下行」。但**不能像 Network 那样画两条曲线**：
-两个方向的时间形状根本不同。实测一次真实调用：
+The user's request was "tokens don't distinguish upstream and downstream". But **we can't
+draw two curves like Network does**: the two directions have fundamentally different time
+shapes. Measured on a real call:
 
-| 方向 | 实测值 | 时间形状 |
+| Direction | Measured value | Time shape |
 | --- | --- | --- |
-| ↑ 上行（input，我们发的提示词） | 5671 tokens | **一次性整块**上传 |
-| ↓ 下行（output，模型返回） | 11 tokens | **逐字流式** |
+| ↑ upstream (input, the prompt we send) | 5671 tokens | **uploaded in one block** |
+| ↓ downstream (output, the model's reply) | 11 tokens | **streamed character by character** |
 
-比例约 **516 : 1**。画在同一根 y 轴上，input 会把量程顶到 5671，
-output 被压成 0.2% 高度、**完全看不见** —— 这正是「尖峰钉死量程」的极端版。
+A ratio of about **516 : 1**. On the same y axis, input would pin the scale at 5671 and
+output would be squashed to 0.2% height, **completely invisible** — an extreme version of
+the "spike pins the scale" problem.
 
-所以分工是：**曲线**给唯一有意义的连续量（下行速率），
-**两个方向的累计量**放标题栏 —— 它们本来就不是速率，不该上速率轴。
+So the split is: the **curve** carries the only meaningful continuous quantity (downstream
+rate); **both directions' cumulative totals** go in the title bar — they were never rates
+and don't belong on a rate axis.
 
-### 读数口径逐字对齐 pi footer
+### Readout format matches pi's footer character for character
 
-顺序与字符照抄 pi 自己的 footer（`dist/modes/interactive/components/footer.js`）：
+Order and characters are copied from pi's own footer
+(`dist/modes/interactive/components/footer.js`):
 
 ```
 ↑input  ↓output  RcacheRead  WcacheWrite
 ```
 
-好处是图上的数字与 pi 底部那行可以直接对照（实测两边一致：
-`~58t/s  ↑5.9k ↓60 R2.7k` vs footer 的 `↑5.9k ↓60 R2`）。
-连 `formatTokens` 的**小写 `k`** 也照抄 —— 大写 `K` 既与宿主不一致，
-也会和 `fmtTps` 的 `Kt/s` 混淆。
+The benefit: numbers on the chart can be compared directly against pi's bottom line
+(verified matching in practice: `~58t/s  ↑5.9k ↓60 R2.7k` vs the footer's `↑5.9k ↓60 R2`).
+Even `formatTokens`' **lowercase `k`** is copied — an uppercase `K` would both clash with
+the host and be confusable with `fmtTps`'s `Kt/s`.
 
-`fmtTokensTotal` 与 pi 唯一的差异是**加了上界钳制**：本项目的铁律是
-任何渲染行超宽就让 pi 崩溃退出，所以极端值必须收口（pi 那边没有上限）。
+`fmtTokensTotal` differs from pi in exactly one way: **it adds an upper clamp**. This
+project's iron rule is that any over-wide rendered row crashes pi, so extreme values must
+be reined in (pi's side has no cap).
 
-### 为什么只累加 assistant 消息
+### Why only assistant messages are accumulated
 
-`message_end` 对 user 消息也会触发。只累加 `role === "assistant"`，
-否则提示词会被当成用量重复计数。
-每个字段都过 `Number.isFinite` —— provider 可能给 null，
-而 NaN 一旦进累计值就会污染标题行（宽度算错 → 越界 → pi 退出）。
+`message_end` also fires for user messages. Only `role === "assistant"` is accumulated,
+otherwise the prompt would be double-counted as usage.
+Every field passes through `Number.isFinite` — a provider may return null, and once NaN
+gets into a cumulative value it poisons the title row (bad width math → overflow → pi
+exits).
 
-### 计入哪些 delta
+### Which deltas are counted
 
-正文 + 思考 + 工具调用参数**全部计入** —— 三者都是计费的 output token
-（`Usage.output` 本身就含 thinking 与 tool-call JSON）。
-漏掉 thinking 最糟：长思考阶段只出不进，图却显示 0。
+Body + thinking + tool-call arguments — **all counted** — because all three are billed
+output tokens (`Usage.output` itself includes thinking and tool-call JSON).
+Missing thinking is the worst case: during a long thinking phase there's output without
+input, yet the chart would show 0.
 
-**绝不碰 `*_end.content`** —— 那是整块全文，计入会与已计的 delta 双重计数。
+**Never touch `*_end.content`** — that's the full text in one block; counting it would
+double-count against the deltas already counted.
 
-### 每秒桶：事件与采样解耦
+### Per-second buckets: events decoupled from sampling
 
-事件侧只做 O(1) 整数累加；采样侧复用现有的 1s `setInterval` 出桶算速率：
+The event side only does O(1) integer accumulation; the sampling side reuses the existing
+1s `setInterval` to roll buckets and compute the rate:
 
 ```
-message_update ──► meter.add(delta)   // 只累加，同步，永不抛
-setInterval 1s ──► meter.tick(now)    // 出桶 → tps → hist.tps 环形缓冲
+message_update ──► meter.add(delta)   // accumulate only, synchronous, never throws
+setInterval 1s ──► meter.tick(now)    // roll bucket → tps → hist.tps ring buffer
 ```
 
-这样事件再密集（快模型每秒数百个 delta）也只是一个加法，
-不会拖慢流式渲染 —— `agent-loop` 的 `emit` 是 `await` 的，handler 慢会直接卡住流。
+However dense the events get (fast models emit hundreds of deltas per second), it's just
+one addition and never slows streaming — `agent-loop`'s `emit` is `await`ed, so a slow
+handler directly stalls the stream.
 
-用 `performance.now()` 而非假定间隔正好 1000ms：`setInterval` 繁忙时会被推迟，
-按名义间隔除会系统性高估。
+Use `performance.now()` rather than assuming the interval is exactly 1000ms:
+`setInterval` gets deferred under load, and dividing by the nominal interval would
+systematically overestimate.
 
-⚠️ **踩过的坑（自己写出来的）**：仪表在 widget 关闭期间仍然累加，
-所以「关掉 30 秒再打开」会在重新启用的**第一个 tick** 报出积压的假尖峰
-（实测 6000 tok/s，真实值接近 0）。修法是 `stop()` 里把当前桶排空 ——
-排空的 token **不进入任何显示值**（累计量现在有精确来源，不需要靠估算补）。
+⚠️ **A pitfall we created ourselves**: the meter kept accumulating while the widget was
+closed, so "close for 30 seconds then reopen" reported a backlog-driven fake spike on the
+**first tick** after re-enabling (measured 6000 tok/s against a true value near 0).
+The fix is to drain the current bucket in `stop()` — drained tokens **enter no displayed
+value** (totals now have an exact source and don't need estimate backfill).
 
-### token 图自己的刻度
+### The token chart's own ticks
 
-不能复用 `rateAxis`：它硬编码 1024 进制和 `B/KB/MB` 后缀，
-拿它画 tok/s 会输出 `2.2KB`（实际 1500 tok/s）—— 单位错了比没刻度更糟。
-所以 `blocks.ts` 里有独立的 `tokenAxis`：算法相同（×1.5、只标顶端、定宽右对齐），
-但单位是 `t/s`，进制用 **1000**（token 是十进制量纲，与 API 账单一致）。
+`rateAxis` can't be reused: it hard-codes base-1024 and `B/KB/MB` suffixes; drawing tok/s
+with it would output `2.2KB` (actually 1500 tok/s) — a wrong unit is worse than no tick.
+So `blocks.ts` has a dedicated `tokenAxis`: same algorithm (×1.5, top-only, fixed-width
+right-aligned), but the unit is `t/s` and the base is **1000** (tokens are a decimal
+quantity, consistent with API billing).
 
-刻度列宽 `TPS_GUTTER = 8`，比 `RATE_GUTTER`（5）宽，因为光 `t/s` 单位就 3 列。
-宽度仍然恒定 —— 刻度宽度一变，叠印区就变，绘图区左边界会逐帧跳（见坑 6）。
+Tick column width `TPS_GUTTER = 8`, wider than `RATE_GUTTER` (5), because the `t/s` unit
+alone takes 3 columns.
+Width is still constant — tick width changes shift the overprint area, and the plot area's
+left edge jitters frame to frame (see pitfall #6).
 
-量程下限 `MIN_TPS_SCALE = 10`：否则空闲期一个 1 tok/s 的尾点会把量程钉到 1.5，
-下一句回复 200 tok/s 就顶格。
+Scale floor `MIN_TPS_SCALE = 10`: otherwise during idle time a single 1 tok/s trailing
+point would pin the scale at 1.5, and the next 200 tok/s reply would slam the ceiling.
 
-### 已知盲区
+### Known blind spots
 
-- **compaction / branch-summary** 用独立 LLM 调用，**不走 agent 事件循环**，
-  所以那段吞吐完全测不到（图显示 0）。数据不可得，不是 bug。
-- **redacted thinking** 无 delta，测不到。
-- 多进程（herdr subagent）各自是独立 pi，各自画自己的图 —— 单进程计数器天然正确。
+- **compaction / branch-summary** use independent LLM calls that **don't go through the
+  agent event loop**, so that throughput is completely unmeasurable (the chart shows 0).
+  The data is unavailable — not a bug.
+- **redacted thinking** has no delta and can't be measured.
+- Multiple processes (herdr subagents) are independent pi instances, each drawing its own
+  chart — per-process counters are naturally correct.
 
-## 图表挂在编辑器上方还是下方
+## Chart above or below the editor
 
-pi 的 `setWidget(key, content, options)` 的 `options.placement` 是公开 API：
+`options.placement` of pi's `setWidget(key, content, options)` is public API:
 
 ```ts
 // dist/core/extensions/types.d.ts
@@ -589,34 +701,39 @@ export type WidgetPlacement = "aboveEditor" | "belowEditor";
 export interface ExtensionWidgetOptions { placement?: WidgetPlacement; }
 ```
 
-底层 dock 的拼装顺序（`dist/modes/interactive/chat-viewport.js`）决定了位置：
+The underlying dock's assembly order (`dist/modes/interactive/chat-viewport.js`) determines
+the position:
 
 ```
 pendingMessages → status → [widgetsAbove] → editor → [widgetsBelow] → footer
 ```
 
-所以 `belowEditor` 就是「编辑器与 footer 之间」，不需要任何 hack。
+So `belowEditor` is simply "between the editor and the footer" — no hack needed.
 
-**默认是 `belowEditor`**（图表在输入框下方）—— 用户选的默认：图表贴底，
-不占用聊天区上方那块位置。想放上方用 `PI_SYSMON_PLACEMENT=above` 或 `/sysmon above`
-（会持久化）。`parsePlacement` 因此把**所有未知/空值都回退到下方**，
-只有明确表示“上方”的词（`above`/`aboveEditor`/`top`）才回上方。
+**Default is `belowEditor`** (chart below the input box) — the user-chosen default: charts
+hug the bottom and don't take the slot above the chat area. To place above, use
+`PI_SYSMON_PLACEMENT=above` or `/sysmon above` (persisted).
+`parsePlacement` therefore falls back to **below for every unknown/empty value**, and only
+words that clearly mean "above" (`above`/`aboveEditor`/`top`) go above.
 
-**实测行为**（真实 pi 抓帧，非推测）：
+**Measured behavior** (frames captured from a real pi, not speculation):
 
-| 项 | 结论 |
+| Item | Conclusion |
 | --- | --- |
-| 下方渲染 | ✅ 正常，8 行图完整显示在编辑器与 footer 之间 |
-| 自动补空格 | pi 给 `widgetsAbove` 加了 `leadingSpacer`，`widgetsBelow` 没有 —— 所以下方会**紧贴**编辑器 |
-| 空间不够时 | 两个 widget 的 `shrink` 都是 1、`minSize` 都是 0；按 `shrink × 当前高度` 加权分摊，**先被压的是较高的那个**（实测 18 行终端里上方 8→5 行、下方保住 8 行） |
-| 自动补全弹窗 | 不受影响 —— 它在 `editorContainer` **内部**渲染，与 widget 容器平级无关 |
+| Rendering below | ✅ works; the 8-row chart displays fully between editor and footer |
+| Auto spacer | pi adds a `leadingSpacer` to `widgetsAbove` but not `widgetsBelow` — so below sits **flush** against the editor |
+| When space runs short | both widgets have `shrink` 1 and `minSize` 0; the deficit is split weighted by `shrink × current height`, so **the taller one gets squeezed first** (measured in an 18-row terminal: above 8→5 rows, below kept 8) |
+| Autocomplete popup | unaffected — it renders **inside** `editorContainer`, unrelated to the widget containers |
 
-⚠️ 一个取舍：`belowEditor` 时图表紧贴编辑器（无前导空行），视觉上比上方模式略挤。
-这是 pi 的布局行为，扩展侧无法插空行 —— 除非在组件首行自己输出一个空行，
-但那会多占一行高度。保持与 pi 原生行为一致，不自作主张。
+⚠️ One trade-off: with `belowEditor` the chart sits flush against the editor (no leading
+blank line), visually a bit tighter than above mode.
+That's pi's layout behavior, and the extension can't insert a blank line — short of
+emitting one itself as the component's first row, which would cost a row of height.
+We stay consistent with pi's native behavior rather than getting clever.
 
-## 非 Linux 的行为
+## Behavior on non-Linux
 
-所有 `/proc`、`/sys` 读取都包在 try/catch 里，失败时退化为零值
-（内存总量回退到 `os.totalmem()`）。这样在 macOS/Windows 上扩展能正常加载、
-UI 正常显示，只是曲线贴底 —— 比抛异常导致 pi 起不来好得多。
+All `/proc` and `/sys` reads are wrapped in try/catch, degrading to zero values on failure
+(total memory falls back to `os.totalmem()`). This way the extension loads and the UI
+renders fine on macOS/Windows — the curves just hug the bottom. Far better than throwing
+and taking pi down.

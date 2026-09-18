@@ -1,73 +1,78 @@
-# 贡献指南
+[English](CONTRIBUTING.md) | [简体中文](CONTRIBUTING.zh-CN.md)
 
-## 环境
+# Contributing Guide
 
-- Node.js >= 22.19（需要 `--experimental-strip-types` 直接跑 TS）
-- 要把扩展装进本机 pi 测试交互效果，需要一个可用的 pi
+## Environment
 
-## 开发流程
+- Node.js >= 22.19 (needs `--experimental-strip-types` to run TS directly)
+- To install the extension into your local pi and test interactions, you need a working pi
+
+## Development Workflow
 
 ```bash
 git clone <repo> && cd pi-sysmon
 npm install
 
-# 改 src/ 下的源码
+# edit the source under src/
 
-npm run check        # 类型检查 + 单元测试，必须全绿
-npm run build:single # 改了多文件源码后重新生成 dist/pi-sysmon.ts
+npm run check        # type check + unit tests; must be all green
+npm run build:single # regenerate dist/pi-sysmon.ts after changing multi-file source
 ```
 
-### 在本机 pi 里试跑
+### Trying it in your local pi
 
 ```bash
-# 方式一：临时加载（不改动你的 pi 配置）
+# Option 1: load temporarily (doesn't touch your pi config)
 pi -e ./src/index.ts
 
-# 方式二：装到扩展目录（单文件形态，最接近真实用户）
+# Option 2: install into the extensions directory (single-file form, closest to a real user)
 npm run build:single
 cp dist/pi-sysmon.ts ~/.pi/agent/extensions/pi-sysmon.ts
 ```
 
-装好后重启 pi，底部应出现折线图（默认开启）。`/sysmon off` 关闭，
-`/sysmon chart|line|footer` 切换模式。
+After installing, restart pi and the line charts should appear at the bottom (enabled by default).
+`/sysmon off` turns it off; `/sysmon chart|line|footer` switches modes.
 
-## 代码约定
+## Code Conventions
 
-- **`src/braille.ts` 必须是纯函数**：输入数值数组，输出字符串数组，不碰
-  `process`、不读文件、不持有状态。这样它才能脱离 pi 单独测试。
-- 新增采集指标请放在 `src/metrics.ts`，并保证**非 Linux 平台不抛异常**
-  （所有 `/proc` 读取都要有 try/catch 兜底）。
-- 新增布局/渲染请放在 `src/chart-panel.ts`。
+- **`src/braille.ts` must stay pure functions**: numeric arrays in, string arrays out — no
+  touching `process`, no file reads, no held state. That's what lets it be tested outside pi.
+- New collected metrics go in `src/metrics.ts`, and must **not throw on non-Linux platforms**
+  (every `/proc` read needs a try/catch fallback).
+- New layout/rendering goes in `src/chart-panel.ts`.
 
-## 提交前自查（重要）
+## Pre-submit Self-check (Important)
 
-自定义 TUI 组件有两个会**搞坏用户环境**的坑，改渲染代码时务必检查：
+Custom TUI components have two pitfalls that can **wreck the user's environment**; always check
+them when touching rendering code:
 
-1. **每一行的可见宽度不得超过传入的 `width`。**
-   pi 发现越界会抛 `uncaughtException` 并**直接退出**。
-   - 用 `truncateToWidth(line, width)`，不要用 `String.slice()`（按字节切，会误算 ANSI 转义）。
-   - 宽字符/CJK 要用 `visibleWidth()` 计算。
-   - 改了布局逻辑后，建议跑一遍脚本化的宽度断言（参考历史 PR）。
+1. **Every row's visible width must not exceed the given `width`.**
+   When pi detects an overflow it throws `uncaughtException` and **exits immediately**.
+   - Use `truncateToWidth(line, width)`, not `String.slice()` (it cuts by bytes and miscounts ANSI escapes).
+   - Compute wide-character/CJK widths with `visibleWidth()`.
+   - After changing layout logic, run a scripted width assertion (see historical PRs).
 
-2. **面板高度必须恒定。**
-   若组件在有数据 / 无数据时返回不同行数，编辑器会上下位移，
-   导致用户「选中文字后复制不了」。无数据时也应占满同样行数（填占位内容）。
+2. **Panel height must be constant.**
+   If a component returns different row counts with vs. without data, the editor shifts up and
+   down, causing "selected text can't be copied" for the user. Occupy the same number of rows
+   even when there's no data (fill with placeholder content).
 
-## 测试
+## Testing
 
-测试用 `node:test`，无需额外依赖：
+Tests use `node:test`, no extra dependencies needed:
 
 ```bash
 npm test
 ```
 
-请为以下内容补测试：
-- `braille.ts` 的位映射、坐标映射、边界输入（空/全零/单点/`NaN`/`Infinity`）
-- 渲染输出每行的可见宽度恰好等于请求宽度
-- 面板在有无数据时高度一致
+Please add tests for:
 
-## 提交 PR
+- `braille.ts` bit mapping, coordinate mapping, boundary inputs (empty / all zeros / single point / `NaN` / `Infinity`)
+- Every rendered output row's visible width exactly matching the requested width
+- The panel having the same height with and without data
 
-- 一个 PR 做一件事，附上动机说明
-- 说明你**实际怎么验证的**（命令 + 输出），不要只说「应该没问题」
-- 涉及交互渲染的改动，请附上终端截图或 pty 抓取的帧
+## Submitting a PR
+
+- One PR does one thing, with the motivation explained
+- Describe **how you actually verified it** (command + output), not just "it should be fine"
+- For changes involving interactive rendering, attach a terminal screenshot or a pty-captured frame

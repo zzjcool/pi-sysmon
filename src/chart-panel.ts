@@ -1,13 +1,17 @@
 /**
- * chart-panel —— 把指标画成 **bottom 风格**的带框图，并按终端宽度响应式排成多列。
+ * chart-panel — draws metrics as **bottom-style** framed charts, laid out
+ * responsively in multiple columns based on terminal width.
  *
- * 本文件的排版规则**逐条对齐 bottom 的实际输出**，依据来自 three 处实证：
- *  1. ratatui 的 chart.rs（bottom 用的绘图组件）：轴线/刻度的布局算法；
- *  2. bottom 源码 `src/canvas/components/time_series/base.rs`：Block 边框 + title_top、
- *     x 标签 `["-Ns", "0s"]`、legend 的 hidden_legend_constraints；
- *  3. 把 `btm` 跑在受控宽度下抓帧（50/72/100/150 列）逐字符核对。
+ * The layout rules in this file **align item by item with bottom's actual
+ * output**, based on three kinds of empirical evidence:
+ *  1. ratatui's chart.rs (the plotting component bottom uses): the layout
+ *     algorithm for axis lines/ticks;
+ *  2. bottom source `src/canvas/components/time_series/base.rs`: Block border +
+ *     title_top, x labels `["-Ns", "0s"]`, legend hidden_legend_constraints;
+ *  3. Running `btm` at controlled widths (50/72/100/150 cols) and capturing
+ *     frames for character-by-character verification.
  *
- * bottom 的单张图长这样（150 列、3 列并排时的真实抓帧）：
+ * A single bottom chart looks like this (real frame at 150 cols, 3 side by side):
  * ```
  * ┌ CPU ─ 1.91 1.80 2.17 ────────────────────────┐
  * │100%│                          ┌────────────┐ │
@@ -18,21 +22,30 @@
  * │  60s                                        0s│
  * └──────────────────────────────────────────────┘
  * ```
- * 要点：标题**嵌在上边框里**；y 刻度只有两三个；x 轴线左端是 `└` 且**不延伸到 y 轴那一列**；
- * 时间标签行没有竖线；浮动读数框是**覆盖画在绘图区右上角**的，空间不够就整块消失。
+ * Key points: the title is **embedded in the top border**; there are only two
+ * or three y ticks; the x-axis line starts with `└` on the left and **does not
+ * extend into the y-axis column**; the time-label row has no vertical lines;
+ * the floating readout box is **painted over the top-right corner of the plot
+ * area** and disappears entirely when there isn't enough room.
  *
- * 本项目与 bottom 的两处**有意偏离**（都在下文就近注明理由）：
- *  · 宽度不够时**降级成 4 列 / 2 列 / 1 列**（列数随块数 3/4 自适应），而不是像 bottom 那样把几张图硬挤到 16 列宽；
- *  · 浮动框的显隐阈值用「是否放得下 + 至少留 2 列曲线」判定，而不是 bottom 那套
- *    按比例算的阈值 —— 那套阈值是按 40+ 列宽的图校准的，套到我们 20~30 列的图上会永远不显示。
+ * Two **deliberate deviations** from bottom in this project (each justified
+ * inline near the code):
+ *  · When width is tight, **degrade to 4 / 2 / 1 columns** (column count adapts
+ *    to block count 3/4) instead of squeezing several charts to 16 columns wide
+ *    like bottom does;
+ *  · The floating box show/hide threshold is "does it fit + leave at least 2
+ *    columns of curve" instead of bottom's proportionally computed threshold —
+ *    that threshold was calibrated for 40+ column charts and would never show
+ *    anything on our 20~30 column charts.
  */
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { renderChartGlyphs } from "./braille.ts";
 
 /**
- * 主题色名。取值来自 pi 的 `ThemeColor`（theme.d.ts），这里只声明本文件用到的子集。
- * 注意 `Theme.fg(color, text)` 的签名是 `fg(color: ThemeColor, text: string): string`。
+ * Theme color names. Values come from pi's `ThemeColor` (theme.d.ts); only the
+ * subset this file uses is declared here.
+ * Note `Theme.fg(color, text)` has the signature `fg(color: ThemeColor, text: string): string`.
  */
 export type ThemeColor =
 	| "accent"
@@ -49,143 +62,170 @@ export type ThemeLike = {
 	fg: (color: ThemeColor, text: string) => string;
 };
 
-/** 一段带颜色的文本 */
+/** A piece of colored text */
 export interface Seg {
 	text: string;
 	color?: ThemeColor;
 }
 
-/** 一条由若干带色片段组成的行（浮动框内容用） */
+/** A line made of several colored segments (used for floating box content) */
 export type StyledLine = Seg[];
 
-/** 图里的一条曲线 */
+/** One curve in a chart */
 export interface BlockSeries {
 	values: number[];
-	/** 该曲线独占的格子用这个颜色；缺省用块主色。多曲线同格时取靠前的序列 */
+	/** Cells owned exclusively by this curve use this color; defaults to the
+	 *  block's main color. When multiple curves share a cell, the earlier series wins */
 	color?: ThemeColor;
 }
 
-/** y 轴规格：标签（**索引 0 在底部**，与 ratatui 一致）+ 量程上限 */
+/** Y-axis spec: labels (**index 0 at the bottom**, same as ratatui) + scale upper bound */
 export interface AxisSpec {
 	labels: string[];
 	max: number;
 }
 
 export interface MetricBlock {
-	/** 边框标题里的名字，如 "CPU" / "Memory" / "Network" */
+	/** Name in the border title, e.g. "CPU" / "Memory" / "Network" */
 	name: string;
-	/** 曲线数据（可多条，画在同一张图里） */
+	/** Curve data (may be multiple, drawn in the same chart) */
 	series: BlockSeries[];
-	/** 主色：边框、标题、y 刻度、时间标签、未指定颜色的曲线都用它 */
+	/** Main color: used for the border, title, y ticks, time labels, and curves without their own color */
 	color: ThemeColor;
 	/**
-	 * 标题栏里的读数片段，渲染成 `┌ NAME ─ <片段...> ────┐`。
+	 * Readout segments in the title bar, rendered as `┌ NAME ─ <segments...> ────┐`.
 	 *
-	 * 数组顺序 = **重要度从高到低**：块宽不够时从尾部逐段丢弃，
-	 * 所以最重要的读数（当前值）要放前面，细节（如负载均值、累计流量）放后面。
-	 * 分成片段（而不是一个长字符串）就是为了能这样按段取舍，
-	 * 而不是“整块放不下就啥也不显示”。
+	 * Array order = **descending importance**: when the block is too narrow,
+	 * segments are dropped from the tail, so the most important reading (current
+	 * value) goes first and details (load averages, cumulative traffic) go last.
+	 * Split into segments (rather than one long string) precisely so they can be
+	 * dropped piece by piece, instead of "whole thing doesn't fit → show nothing".
 	 */
 	titleInfo?: StyledLine;
-	/** 浮动读数框的内容行（不含边框）；空数组或放不下则不显示 */
+	/** Content lines of the floating readout box (border not included); hidden when empty or doesn't fit */
 	legend?: StyledLine[];
 	/**
-	 * 量程取样**点数**（>0 时生效）：y 轴量程只看最后这么多的点。
-	 * 缺省 = 整个可见窗口。
+	 * Scale sampling **point count** (active when > 0): the y-axis scale only
+	 * looks at the last this many points. Default = the whole visible window.
 	 *
-	 * **为什么需要它**：量程若取整个窗口的最大值，一个尖峰会把它钉住到该点
-	 * 滚出窗口为止（60s 窗口就是整整 60 秒）—— 期间后面的数据全被压成贴底的线，
-	 * 用户看到的就是「高度降不下来」。让量程只看最近一段，尖峰过去后量程就回落。
+	 * **Why it's needed**: if the scale took the max of the whole window, one
+	 * spike would pin it until that point rolls out of the window (a full 60
+	 * seconds for a 60s window) — meanwhile all later data is squashed into a
+	 * bottom-hugging line, and the user sees "the height won't come down".
+	 * Letting the scale only look at a recent slice makes it fall back once the
+	 * spike passes.
 	 *
-	 * 用**绝对点数**而不是比例：比例得乘「当前数组长度」，而启动初期数组还很短，
-	 * 于是同样的比例会得到越来越长的量程窗，恢复耗时飘忽不定（实测 10s↔18s）。
-	 * 点数由 `buildBlocks` 按**目标窗口**算好（与当前已攒多少无关）。
+	 * **Absolute point count** instead of a fraction: a fraction has to be
+	 * multiplied by the "current array length", and early after startup that
+	 * array is still short, so the same fraction would yield a growing scale
+	 * window and erratic recovery times (measured 10s↔18s).
+	 * The point count is computed by `buildBlocks` from the **target window**
+	 * (independent of how much has been collected).
 	 *
-	 * 段内还会叠一个**三次衰减权**（新点 1 → 段尾 0）。这不只是为了好看 ——
-	 * 硬截断会在尖峰退出段的那一帧让整个量程**瞬间跳变**（实测 143→1.4，100 倍），
-	 * 图会“啪”地弹一下；三次衰减把单帧跳变压到 2.7 倍，10 秒内平滑降下来。
+	 * A **cubic decay weight** is applied within the slice (1 at the newest
+	 * point → 0 at the slice tail). This isn't just cosmetic — a hard cutoff
+	 * makes the whole scale **jump abruptly** on the frame the spike exits the
+	 * slice (measured 143→1.4, 100×), and the chart visibly snaps; cubic decay
+	 * compresses the single-frame jump to 2.7× and settles smoothly within 10s.
 	 *
-	 * 代价：比这段更旧的峰值会被裁顶（画成贴顶平顶）。
-	 * 渲染层已有 clamp（`braille.ts` 的 `Math.min(top, raw)`），不会越界。
-	 * 这是终端图表通用的 off-scale 语义：宁可旧尖峰贴顶，也不要后面的数据看不见。
+	 * Cost: peaks older than the slice get clipped at the top (drawn as a flat
+	 * ceiling). The render layer already clamps (`Math.min(top, raw)` in
+	 * `braille.ts`), so nothing goes out of bounds. This is the universal
+	 * off-scale semantics of terminal charts: better an old spike hugging the
+	 * top than later data being invisible.
 	 *
-	 * 注意它仍然是一个**纯函数**（只依赖本帧数据），不引入跨帧隐藏状态 ——
-	 * 这样渲染 harness 与全宽度扫描断言依然可复现。
+	 * Note it's still a **pure function** (depends only on this frame's data),
+	 * introducing no hidden cross-frame state — so the render harness and
+	 * full-width scan assertions stay reproducible.
 	 */
 	scaleWindowPoints?: number;
-	/** 刻度规格生成器。dataMax = 量程取样段内的最大值，plotRows = 绘图行数（供抽稀判断） */
+	/** Tick spec generator. dataMax = max within the scale sampling slice, plotRows = plot row count (for tick thinning) */
 	axis: (dataMax: number, plotRows: number) => AxisSpec;
 	/**
-	 * 整个 x 轴代表的**目标点数**（窗口秒数 × 1000 / 采样间隔）。
+	 * The **target point count** represented by the entire x axis (window seconds
+	 * × 1000 / sampling interval).
 	 *
-	 * 用来把曲线按**时间比例**定位：一个点占 `plotWidth*2 / windowPoints` 个子像素列。
-	 * 关键是这个比例**不随已攒多少点而变** —— 所以「一秒」的屏幕宽度恒定，
-	 * 左下角的 `60s` 标签才是诚实的（刚启动 3 秒时数据只占右侧 1/20 宽，
-	 * 而不是被拉伸冒充满窗口）。
+	 * Used to position the curve **proportionally in time**: one point occupies
+	 * `plotWidth*2 / windowPoints` sub-pixel columns. The key is that this ratio
+	 * **doesn't change with how many points have been collected** — so one
+	 * second has a constant on-screen width and the `60s` label in the
+	 * bottom-left corner is honest (3 seconds after startup the data only fills
+	 * the rightmost 1/20 of the width instead of being stretched to impersonate
+	 * a full window).
 	 *
-	 * 缺省（undefined）= 旧的拉伸铺满行为。
+	 * Default (undefined) = the old stretch-to-fill behavior.
 	 */
 	windowPoints?: number;
 }
 
 /* ------------------------------------------------------------------ */
-/* 响应式布局                                                          */
+/* Responsive layout                                                   */
 /* ------------------------------------------------------------------ */
 
 /**
- * 单块最小可用宽度。
+ * Minimum usable width of a single block.
  *
- * 刻度画在**绘图区内侧**后不再占用独占列，所以宽度的下限只需盖住
- * 「边框 2 + 一点点绘图区」；数字刻度本身仍需能叠在图上（叠不下就不画）。
+ * Now that ticks are drawn **inside the plot area** they no longer occupy
+ * dedicated columns, so the width floor only needs to cover "2 border columns
+ * + a sliver of plot area"; the numeric ticks themselves must still be able to
+ * overlay the chart (otherwise they're skipped).
  */
 export const MIN_BLOCK_W = 24;
 
-/** 单块的最小绘图区列数（字符列）。低于此值就不画 y 刻度了 */
+/** Minimum plot columns (character columns) of a single block. Below this, y ticks are not drawn */
 const MIN_PLOT_W = 10;
 
 /**
- * 每块固定开销行数：上边框 + 下边框 = 2 行（绘图行数另算）。
+ * Fixed overhead rows per block: top border + bottom border = 2 rows (plot rows
+ * counted separately).
  *
- * 从 4 降到 2：x 轴线与时间标签以前各占一行，现在
- * 时间标签直接**嵌进下边框**（与标题嵌上边框对称），x 轴线由
- * 绘图区最后一行兼作（就是 0 基线本身）。
+ * Reduced from 4 to 2: the x-axis line and time labels used to take one row
+ * each; now the time labels are **embedded in the bottom border** (symmetric
+ * to the title in the top border), and the x-axis line is served by the last
+ * plot row (which is the 0 baseline itself).
  */
 export const BLOCK_CHROME_ROWS = 2;
 
 /**
- * 单块内部宽度分配的结果。
+ * Result of the internal width allocation of a single block.
  *
- * 抽成独立纯函数的原因是：**两处消费方必须用同一份账** ——
- * `renderBlock` 用它决定画多宽，`index.ts` 用它反推切多少个数据点。
- * 以前这两边各写一份近似公式，一旦窄块触发降级，两边的账会差好几列。
+ * Extracted into a standalone pure function because **both consumers must use
+ * the same ledger** — `renderBlock` uses it to decide how wide to draw, and
+ * `index.ts` uses it to derive how many data points to slice. These two sides
+ * used to each keep an approximate formula, and once a narrow block triggered
+ * degradation, the two ledgers diverged by several columns.
  */
 export interface BlockMetrics {
 	/**
-	 * y 刻度文字叠在绘图区左侧时占的列数（仅用于判断“叠不叠得下”，
-	 * **不再从绘图区里扣掉**）。
+	 * Columns occupied by the y tick text overlaid on the left of the plot area
+	 * (only used to decide "does the overlay fit", **not deducted from the plot
+	 * area**).
 	 */
 	gutter: number;
 	/**
-	 * 是否在绘图区左侧叠印 y 刻度。
+	 * Whether to overlay y ticks on the left of the plot area.
 	 *
-	 * 以前叫 `showAxis`（是否画 y 轴竖线）；现在刻度是**叠在图上**的，
-	 * 没有独立竖线，这个标志的含义就是「刻印与否」。
+	 * Previously named `showAxis` (whether to draw the y-axis vertical line);
+	 * now ticks are **overlaid on the chart** and there is no standalone vertical
+	 * line, so the flag just means "print ticks or not".
 	 */
 	showAxis: boolean;
-	/** 曲线可用列数 = 块宽 - 左右边框 */
+	/** Columns available to curves = block width - left/right borders */
 	plotW: number;
 }
 
 /**
- * 给定块宽与刻度规格，算出内部宽度分配。
+ * Given the block width and tick spec, compute the internal width allocation.
  *
- * **刻度不再从绘图区里扣列**：以前是
- * `│` + gutter(刻度列) + `│` + 曲线，刻度独占 5 列（4 列数字 + 1 列竖线）；
- * 现在刻度文字**叠印在曲线的左侧几列上**，绘图区就拿到整个内宽。
- * 这是「图表利用率」提升的主要来源。
+ * **Ticks no longer deduct columns from the plot area**: previously it was
+ * `│` + gutter (tick columns) + `│` + curve, with ticks owning 5 columns
+ * (4 digit columns + 1 vertical line); now the tick text is **overlaid on the
+ * left few columns of the curve**, giving the plot area the full inner width.
+ * This is the main source of the "chart utilization" improvement.
  *
- * 能不能叠由 `MIN_PLOT_W` 把关：绘图区太窄就不叠刻度（宁可没刻度，
- * 也不要为了刻度把曲线挤成一条线）。
+ * Whether the overlay fits is guarded by `MIN_PLOT_W`: when the plot area is
+ * too narrow, skip the ticks (better no ticks than squashing the curve into a
+ * thread for their sake).
  */
 export function blockMetrics(
 	blockWidth: number,
@@ -194,27 +234,32 @@ export function blockMetrics(
 	const w = Math.max(6, Math.floor(blockWidth));
 	const plotW = Math.max(1, w - 2);
 	const gutter = Math.max(0, Math.floor(rawGutter));
-	// 叠印刻度需要足够宽度：刻度本身 + 留点空间让曲线可见
+	// Overlaying ticks needs enough width: the ticks themselves plus some room for the curve to stay visible
 	const showAxis = plotW >= Math.max(MIN_PLOT_W, gutter + 4);
 	return { gutter, showAxis, plotW };
 }
 
 /**
- * 给定块宽算出**保守估计**的绘图区列数，供「该切多少个数据点」使用。
+ * Given the block width, compute a **conservative estimate** of the plot
+ * columns, for "how many data points to slice".
  *
- * 按最宽的刻度（rateAxis 的 5 列）估 —— 这是有意保守：估窄了只是少取几个点，
- * 曲线自然右对齐、不会错位；估宽了则会把窗口标签报得比实际画出来的长。
+ * Estimated with the widest ticks (rateAxis's 5 columns) — deliberately
+ * conservative: underestimating just slices a few points fewer and the curve
+ * naturally right-aligns without misalignment; overestimating would report a
+ * window label longer than what's actually drawn.
  */
 export function plotWidthFor(blockWidth: number): number {
 	return blockMetrics(blockWidth, RATE_GUTTER).plotW;
 }
 
 /**
- * x 轴左端的时间窗标签。
+ * Time-window label at the left end of the x axis.
  *
- * bottom 这一格是固定格式的 `<window>s`（如 `60s`），因为它只提供 60s~10m 的窗口。
- * 本项目的窗口大小由 `PI_SYSMON_POINTS` 决定，可能长到几十分钟甚至几小时，
- * 所以长窗口换算成 m/h —— 否则 `4000s` 这种 5 字符标签会把边框挤掉。
+ * bottom's cell is a fixed-format `<window>s` (e.g. `60s`), because it only
+ * offers 60s~10m windows. This project's window size is set by
+ * `PI_SYSMON_POINTS` and can run to tens of minutes or even hours, so long
+ * windows are converted to m/h — otherwise a 5-character label like `4000s`
+ * would squeeze the border out.
  */
 export function fmtWindowLabel(secs: number): string {
 	const s = Math.max(0, Math.round(secs));
@@ -224,27 +269,33 @@ export function fmtWindowLabel(secs: number): string {
 }
 
 /**
- * rateAxis 的标签宽度（`0KB` / `119.9` 右对齐到 5 列）。
+ * Label width of rateAxis (`0KB` / `119.9` right-aligned to 5 columns).
  *
- * 导出是为了让测试能引用**同一个常量**而不是写死 5 —— 否则改了实现而测试仍对着
- * 旧值断言，就会测试通过但界面抖动。
+ * Exported so tests can reference **the same constant** instead of hardcoding
+ * 5 — otherwise changing the implementation while tests still assert the old
+ * value would give green tests with a jittery UI.
  */
 export const RATE_GUTTER = 5;
 
 /**
- * 绘图行数下限。1 行绘图区把任何曲线都压成一条直线（实测 72 列时就是如此），
- * 还不如占高一点换来能看出趋势的图 —— 这条下限优先于行数预算。
+ * Lower bound for plot rows. 1 plot row squashes any curve into a straight
+ * line (measured at 72 cols), so it's better to spend height on a chart where
+ * trends are visible — this floor takes priority over the row budget.
  */
 export const MIN_PLOT_ROWS = 2;
 
 /**
- * 按宽度与**块数**决定列数。对宽度是**纯函数**（绝不依赖数据）——
- * 否则列数/行数会随数据抖动，触发「行数变化导致编辑器位移」的老问题。
+ * Decide the column count from width and **block count**. A **pure function**
+ * of width (never depends on data) — otherwise the column/row count would
+ * jitter with data, re-triggering the old "row count changes shift the editor"
+ * problem.
  *
- * 为什么需要块数：3 块时老逻辑在 ≥96 列下摆成 3+1（第 4 格整行留白）；
- * 4 块时（showDisks）≥96 列应摆成真正的 4×1（8 行），48..95 摆 2×2，<48 叠放。
- * 原则是**绝不选一个会留下半空组的列数**（能摆满整网格时才用该列数）。
- * 默认 `count = 3`，所以老的单参数调用方行为完全不变。
+ * Why block count matters: with 3 blocks the old logic laid out 3+1 at ≥96
+ * cols (the 4th cell an empty row); with 4 blocks (showDisks), ≥96 cols should
+ * be a true 4×1 (8 rows), 48..95 a 2×2, <48 stacked. The principle is to
+ * **never pick a column count that leaves a half-empty group** (only use it
+ * when the grid fills completely). Default `count = 3`, so old single-argument
+ * callers behave exactly as before.
  */
 export function chooseColumns(width: number, count = 3): number {
 	if (count >= 4 && width >= MIN_BLOCK_W * 4) return 4;
@@ -254,23 +305,24 @@ export function chooseColumns(width: number, count = 3): number {
 }
 
 export interface Layout {
-	/** 列数 */
+	/** Column count */
 	cols: number;
-	/** 分几行摆（3 张图 2 列时 = 2 行） */
+	/** How many bands (rows of blocks) to lay out (3 charts in 2 columns = 2 bands) */
 	bands: number;
-	/** 每块的宽度，长度 = cols；余数分给靠前的块，总和恰好 = width */
+	/** Width of each block, length = cols; the remainder goes to the earlier blocks, sum exactly = width */
 	widths: number[];
-	/** 每块的绘图行数 */
+	/** Plot rows of each block */
 	plotRows: number;
-	/** 整个面板的总行数 */
+	/** Total rows of the whole panel */
 	totalRows: number;
 }
 
 /**
- * 完整布局计算：列数 + 列宽分配 + 绘图行数。
+ * Full layout computation: column count + width allocation + plot rows.
  *
- * 行数在高宽度时只由 `chartH` 决定；在窄终端（1 列、多张图叠放）下会按
- * `maxRows` 预算自动压扁，避免几张图把整个屏幕吃掉。
+ * At generous widths the row count is decided by `chartH` alone; on narrow
+ * terminals (1 column, several charts stacked) it's auto-squeezed to fit the
+ * `maxRows` budget so a few charts don't eat the whole screen.
  */
 export function computeLayout(
 	width: number,
@@ -278,11 +330,12 @@ export function computeLayout(
 	count: number,
 	maxRows: number,
 ): Layout {
-	// 防涛：`renderPanel` 是导出函数，任何调用方都可能传 0/负数/NaN。
-	// 负数宽度会让下面的 `widths` 出现负值，进而在 `" ".repeat(-2)` 抛 RangeError。
+	// Defensive: `renderPanel` is exported, so any caller may pass 0/negative/NaN.
+	// A negative width would put negatives into `widths` below, then
+	// `" ".repeat(-2)` throws RangeError.
 	const safeW = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
 	const safeCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
-	// 零块：显式返回空布局，而不是靠 `Math.max(1, 0)` 的副作用假装有一块
+	// Zero blocks: return an empty layout explicitly instead of faking one via the side effect of `Math.max(1, 0)`
 	if (safeCount === 0) {
 		return { cols: 0, bands: 0, widths: [], plotRows: 0, totalRows: 0 };
 	}
@@ -290,7 +343,8 @@ export function computeLayout(
 	const cols = Math.min(chooseColumns(safeW, safeCount), safeCount);
 	const bands = Math.ceil(safeCount / cols);
 
-	// 宽度分配：先均分，余数给靠前的块。总和严格等于 width（否则拼接会越界或留缝）
+	// Width allocation: equal shares first, remainder to the earlier blocks.
+	// The sum strictly equals width (otherwise joining overflows or leaves gaps)
 	const base = Math.floor(safeW / cols);
 	const rem = safeW - base * cols;
 	const widths = Array.from(
@@ -298,8 +352,10 @@ export function computeLayout(
 		(_, i) => base + (i < rem ? 1 : 0),
 	);
 
-	// 高度预算：每行摆 bands 块，每块 chrome 恒 4 行，剩下的才是绘图行。
-	// 下限 MIN_PLOT_ROWS 优先于预算 —— 预算只用来*防止*多变高，不用来把图压成一条线。
+	// Height budget: each band holds blocks whose chrome is a constant number of
+	// rows; the rest is plot rows. The MIN_PLOT_ROWS floor takes priority over
+	// the budget — the budget only *prevents* getting too tall, it isn't used to
+	// squash charts into a line.
 	const budget = Number.isFinite(maxRows) ? Math.floor(maxRows) : 0;
 	const plotRows = Math.max(
 		MIN_PLOT_ROWS,
@@ -316,16 +372,19 @@ export function computeLayout(
 }
 
 /* ------------------------------------------------------------------ */
-/* 单元格模型                                                          */
+/* Cell model                                                          */
 /* ------------------------------------------------------------------ */
 
 /**
- * 一行被表示成「定宽单元格数组」。
+ * A row is represented as an "array of fixed-width cells".
  *
- * 为什么不直接拼字符串：浮动读数框要**覆盖**画在绘图行上，
- * 而绘图行里混着 ANSI 转义序列 —— 用 `slice`/`padEnd` 做字符串手术会把转义符算进长度，
- * 直接触发 pi 的「Rendered line exceeds terminal width」崩溃（见 ARCHITECTURE.md 的坑 1）。
- * 先铺成单元格、覆盖、再统一染色，宽度账天然精确，只有最后一步才生成 ANSI。
+ * Why not just concatenate strings: the floating readout box has to be
+ * **overlaid** onto plot rows, and plot rows contain ANSI escape sequences —
+ * doing string surgery with `slice`/`padEnd` would count escape bytes into the
+ * length and directly trigger pi's "Rendered line exceeds terminal width"
+ * crash (see ARCHITECTURE.md pitfall 1). Lay out cells first, overlay, then
+ * colorize uniformly at the end: width bookkeeping is exact by construction,
+ * and only the last step emits ANSI.
  */
 interface Cell {
 	ch: string;
@@ -339,26 +398,28 @@ function blank(n: number, color?: ThemeColor): Row {
 }
 
 /**
- * 把带色文本段变成单元格行。
+ * Turn colored text segments into a cell row.
  *
- * 这里负责维护整个单元格模型的**核心不变量**：
+ * This maintains the cell model's **core invariant**:
  *
- * > 每个 cell 恰好占一个显示列：`row.length === visibleWidth(这一行的文本)`
+ * > Each cell occupies exactly one display column: `row.length === visibleWidth(the row's text)`
  *
- * `renderBlock` 内部所有对齐（`putRight` 右对齐刻度/时间标签、边框落在 `w-1`）
- * 都建立在这条不变量上。而 `visibleWidth` 是按 `get-east-asian-width` 算的，
- * 它和「字符数」在三种情况下不等，所以必须逐类处理（实测值）：
+ * All alignment inside `renderBlock` (`putRight` right-aligned ticks/time
+ * labels, border at `w-1`) is built on this invariant. `visibleWidth` is
+ * computed via `get-east-asian-width`, which differs from "character count" in
+ * three cases, so each must be handled (measured values):
  *
- * | 类别 | 例 | visibleWidth | 字符数 | 处理 |
+ * | Category | Example | visibleWidth | char count | Handling |
  * | --- | --- | --- | --- | --- |
- * | 常规（含 box/braille） | `─` `⣿` `‑` | 1 | 1 | 一个 cell |
- * | 宽字符 | `你` `🙂` `\u3000` | 2 | 1 | 字符 + 1 个空占位 cell |
- * | 组合/零宽 | `e\u0301` `\u200b` | 0（整个串）/ 0 | — | 并入前一个 cell |
+ * | Regular (incl. box/braille) | `─` `⣿` `‑` | 1 | 1 | one cell |
+ * | Wide chars | `あ` `🙂` `\u3000` | 2 | 1 | char + 1 empty placeholder cell |
+ * | Combining/zero-width | `e\u0301` `\u200b` | 0 (whole string) / 0 | — | merge into previous cell |
  *
- * 不处理宽字符会让行**变宽**（可见宽度 > 声明宽度）→ pi 抛异常退出；
- * 不处理零宽字符会让行**变窄**（后续内容相对边框左移）→ 边框错位。
- * 本项目自己的文本全是 ASCII，但 `block.name` / `titleInfo` / `legend`
- * 是调用方给的，不能假设。
+ * Not handling wide chars makes rows **wider** (visible width > declared
+ * width) → pi throws and exits; not handling zero-width chars makes rows
+ * **narrower** (subsequent content shifts left relative to the border) →
+ * border misalignment. This project's own text is all ASCII, but
+ * `block.name` / `titleInfo` / `legend` come from callers and can't be assumed.
  */
 function segsToRow(segs: StyledLine): Row {
 	const row: Row = [];
@@ -366,25 +427,27 @@ function segsToRow(segs: StyledLine): Row {
 		for (const ch of s.text) {
 			const vw = visibleWidth(ch);
 			if (vw === 0) {
-				// 组合字符（如 e + 声调）与零宽字符不占列。
-				// 把它们并入前一个 cell：既保留字符本身，又不让列数虚增。
-				// 开头的零宽字符没有可并入的对象，直接丢弃（它本来就不可见）。
+				// Combining chars (e.g. e + accent) and zero-width chars take no column.
+				// Merge them into the previous cell: keeps the char itself without
+				// inflating the column count.
+				// A leading zero-width char has nothing to merge into; drop it (it's invisible anyway).
 				const prev = row.at(-1);
 				if (prev) prev.ch += ch;
 				continue;
 			}
 			const cell: Cell = { ch, color: s.color };
 			row.push(cell);
-			// 宽字符占 vw 个显示列，补 vw-1 个空占位 cell 把列数对齐。
-			// 用循环而不是硬编码 `=== 2`，这样 pi-tui 将来把某个
-			// ambiguous 字符改判成更宽时也不会突然越界。
+			// A wide char occupies vw display columns; append vw-1 empty placeholder
+			// cells to align the column count.
+			// A loop rather than hardcoded `=== 2`, so if pi-tui later reclassifies
+			// some ambiguous char as even wider, we don't suddenly overflow.
 			for (let k = 1; k < vw; k++) row.push({ ...cell, ch: "" });
 		}
 	}
 	return row;
 }
 
-/** 把单元格行染成最终字符串；**纯空格段不加 ANSI**，避免刷屏式转义序列 */
+/** Colorize a cell row into the final string; **pure-space runs get no ANSI**, avoiding floods of escape sequences */
 function paint(theme: ThemeLike, row: Row): string {
 	let out = "";
 	let i = 0;
@@ -395,7 +458,8 @@ function paint(theme: ThemeLike, row: Row): string {
 		while (j < row.length && row[j]?.color === first.color) j++;
 		let text = "";
 		for (let k = i; k < j; k++) text += row[k]?.ch ?? "";
-		// 纯空格（含宽字符的占位 cell）不染色，否则每行都拖一大串转义序列
+		// Pure spaces (including wide-char placeholder cells) get no color,
+		// otherwise every row would drag a long tail of escape sequences
 		const meaningful = text.trim() !== "";
 		out += first.color && meaningful ? theme.fg(first.color, text) : text;
 		i = j;
@@ -403,7 +467,7 @@ function paint(theme: ThemeLike, row: Row): string {
 	return out;
 }
 
-/** 在 row 的 offset 处覆盖写入 cells（越界部分被忽略） */
+/** Overwrite cells into row at offset (out-of-bounds parts are ignored) */
 function overlay(row: Row, offset: number, cells: Row) {
 	for (let i = 0; i < cells.length; i++) {
 		const at = offset + i;
@@ -413,15 +477,18 @@ function overlay(row: Row, offset: number, cells: Row) {
 }
 
 /**
- * 按显示宽度截断一个单元格行，**不会把宽字符从它的占位 cell 上切开**。
+ * Truncate a cell row to a display width **without splitting a wide char from
+ * its placeholder cells**.
  *
- * 为什么不能用 `row.slice(0, n)`：`segsToRow` 把宽字符拆成「字符 cell + 空占位 cell」，
- * 而占位 cell 与字符 cell 是**一体**的（少了占位就会多占一列）。
- * `slice(0, 9)` 这种硬切会把最后一个宽字符的占位留在外面，
- * 于是返回 9 个 cell 但实际渲染 10 列 —— 不变量破了，
- * 后面的 `┐` 就被挤出边界（`w=14` 的 `超级长的名字` 就是这样丢的右边框）。
+ * Why `row.slice(0, n)` doesn't work: `segsToRow` splits a wide char into
+ * "char cell + empty placeholder cells", and the placeholder cells are **one
+ * unit** with the char cell (missing one means occupying an extra column).
+ * A hard cut like `slice(0, 9)` would leave the last wide char's placeholder
+ * outside, returning 9 cells that actually render 10 columns — the invariant
+ * breaks and the following `┐` gets pushed past the edge (that's how `w=14`
+ * with a long CJK block name lost its right border).
  *
- * 所以这里以「字符」为单位累积，放不下整个字符就整体不要。
+ * So accumulate in whole "characters" here; if a full char doesn't fit, drop it entirely.
  */
 function truncateRow(row: Row, maxCells: number): Row {
 	if (row.length <= maxCells) return row;
@@ -431,7 +498,7 @@ function truncateRow(row: Row, maxCells: number): Row {
 	while (i < row.length) {
 		const c = row[i];
 		if (!c) break;
-		// 一个完整「字符」= 1 个非空 cell + 紧随的若干空占位 cell
+		// A complete "character" = 1 non-empty cell + the following empty placeholder cells
 		const span: Row = [c];
 		let j = i + 1;
 		while (j < row.length && row[j]?.ch === "") {
@@ -448,17 +515,20 @@ function truncateRow(row: Row, maxCells: number): Row {
 }
 
 /* ------------------------------------------------------------------ */
-/* 刻度规格                                                            */
+/* Tick specs                                                          */
 /* ------------------------------------------------------------------ */
 
 /**
- * 百分比图：只在**顶端**标 `100%`。
+ * Percent chart: only labels `100%` at the **top**.
  *
- * 以前对齐 bottom `percent.rs` 标两个（`0%` 在底、`100%` 在顶）。
- * 现在刻度是**叠在绘图区上**的，底部那个 `0%` 会紧贴着 0 基线、和曲线打架；
- * 而 0% 这个信息其实由底部基线本身就表达得很清楚。
- * 所以只保留顶端值 —— 它告诉图上沿是多少，这是基线上看不出来的。
- * 量程仍固定 `0..100.5`（不随数据变，不同时间可直接对比）。
+ * Used to match bottom's `percent.rs` with two labels (`0%` at the bottom,
+ * `100%` at the top). Now that ticks are **overlaid on the plot area**, a
+ * bottom `0%` would hug the 0 baseline and fight the curve; and the 0%
+ * information is already conveyed clearly by the bottom baseline itself.
+ * So keep only the top value — it says how much the top edge represents,
+ * which the baseline can't tell you.
+ * The scale stays fixed at `0..100.5` (doesn't change with data, so different
+ * moments are directly comparable).
  */
 export function percentAxis(): AxisSpec {
 	return { labels: ["100%"], max: 100.5 };
@@ -470,19 +540,22 @@ const GIBI = 1024 ** 3;
 const TEBI = 1024 ** 4;
 
 /**
- * 速率图的刻度 —— 逐行复刻 bottom `network_graph.rs: adjust_network_data_point`
- * （Linear 分支）：量程 = max × 1.5，按量程选 K/M/G/T 单位，
- * 标签固定 4 个 `0<unit>` / `0.5×` / `1×` / `1.5×`，每个右对齐到 5 列。
+ * Ticks for rate charts — replicates bottom's `network_graph.rs: adjust_network_data_point`
+ * (Linear branch) line by line: scale = max × 1.5, unit picked from K/M/G/T by
+ * scale, fixed 4 labels `0<unit>` / `0.5×` / `1×` / `1.5×`, each right-aligned
+ * to 5 columns.
  */
 export function rateAxis(dataMax: number): AxisSpec {
-	// 非有限值（NaN/Infinity）必须先落回 0：否则 `NaN <= 0` 为 false，
-	// 会一路算出 `max: NaN` 和 "NaN" 标签，再往下就是 NaN 坐标 → 越界。
-	// 坐标系里的任何 NaN 都是灾难（见 ARCHITECTURE.md 的坑 4）。
+	// Non-finite values (NaN/Infinity) must fall back to 0 first: otherwise
+	// `NaN <= 0` is false and we'd compute `max: NaN` and "NaN" labels all the
+	// way down, then NaN coordinates → out of bounds.
+	// Any NaN in the coordinate system is a disaster (see ARCHITECTURE.md pitfall 4).
 	const dm = Number.isFinite(dataMax) && dataMax > 0 ? dataMax : 0;
-	// 空数据（dm=0）：不能直接让四个标签都塌成 `0.0`。
-	// 刻度现在是**叠印在绘图区上**的，四个 `0.0` 叠在图上比旧版（刻度在独立列）
-	// 更乱。给出一个最小可用量程（1 单位），标签就是 `0.0/0.5/1.0/1.5`，
-	// 图仍是平线但刻度至少读得通。
+	// Empty data (dm=0): can't let all four labels collapse into `0.0`.
+	// Ticks are now **overlaid on the plot area**, and four `0.0`s stacked on
+	// the chart are messier than the old version (ticks in their own column).
+	// Provide a minimal usable scale (1 unit) so labels read `0.0/0.5/1.0/1.5` —
+	// the chart is still a flat line but the ticks at least make sense.
 	const effective = dm === 0 ? 1 : dm;
 	const upper = dm === 0 ? 1.5 : dm * 1.5;
 	let scaled = effective;
@@ -502,48 +575,56 @@ export function rateAxis(dataMax: number): AxisSpec {
 		scaled = effective / TEBI;
 		prefix = "T";
 	}
-	// 定宽归一：所有标签都恰好 `RATE_GUTTER` 列。
+	// Fixed-width normalization: all labels are exactly `RATE_GUTTER` columns.
 	//
-	// 不这么做会同时踩两个坑（都实测过）：
-	//  1. **同一帧内参差**：`scaled*1.5` 跨过 1000 时比其它标签多一位
-	//     （dataMax=670 → `1005.0` 是 6 列而其余是 5 列），
-	//     刻度列右边缘对不齐，看着像渲染错位。
-	//  2. **跨帧抖动**：`renderBlock` 用「最长标签」算叠印宽度，
-	//     所以网络峰值在 670 附近波动时，叠印区域会**逐帧左右跳一格**，
-	//     这种闪烁比刻度难看多了。
+	// Skipping this hits two pitfalls (both measured):
+	//  1. **Raggedness within one frame**: when `scaled*1.5` crosses 1000 it has
+	//     one more digit than the other labels (dataMax=670 → `1005.0` is 6
+	//     columns while the rest are 5), so the tick column's right edge doesn't
+	//     line up and looks like a rendering glitch.
+	//  2. **Cross-frame jitter**: `renderBlock` computes the overlay width from
+	//     the "longest label", so when the network peak wobbles around 670, the
+	//     overlay region **jumps left/right by one column every frame** — that
+	//     flicker is far uglier than the ticks themselves.
 	//
-	// 归一策略是**降精度而不是截断**：先试一位小数，放不下就退回整数。
-	// 截断会得到 `1005.` 这种残缺字符串；降精度只是少一位小数，
-	// 而刻度本来就是粗略量程，读数不受影响。
-	// 只有一个顶端标签，所以把**单位缀在数值后面**（如 `1.2K` / `150B`）。
-	// 这是必须的：否则屏幕上只剩一个光秃秃的 `150.0`，看不出是 B/s 还是 MB/s。
-	// 定宽仍按 `RATE_GUTTER`，这样叠印宽度稳定、不会逐帧抖动。
+	// The normalization strategy is **reduce precision, don't truncate**: try one
+	// decimal first; if it doesn't fit, fall back to an integer.
+	// Truncation yields mangled strings like `1005.`; reducing precision only
+	// drops one decimal, and ticks are coarse scale indicators anyway, so
+	// readability is unaffected.
+	// There's only one top label, so **append the unit to the number**
+	// (e.g. `1.2K` / `150B`). That's mandatory: otherwise the screen shows a
+	// bare `150.0` and you can't tell B/s from MB/s.
+	// Width still follows `RATE_GUTTER`, keeping the overlay width stable across frames.
 	const fitWithUnit = (v: number): string => {
 		const unit = `${prefix}B`;
 		const one = v.toFixed(1);
-		// 先试一位小数，放不下就退回整数；单位始终保留
+		// Try one decimal first; fall back to integer if it doesn't fit; the unit is always kept
 		if (one.length + unit.length <= RATE_GUTTER)
 			return `${one}${unit}`.padStart(RATE_GUTTER);
 		const zero = v.toFixed(0);
 		if (zero.length + unit.length <= RATE_GUTTER)
 			return `${zero}${unit}`.padStart(RATE_GUTTER);
-		// 极端量程：只保留单位，数值截高位
+		// Extreme scale: keep only the unit, truncate the number's high digits
 		return `${zero.slice(0, Math.max(1, RATE_GUTTER - unit.length))}${unit}`;
 	};
-	// 只在**顶端**标一个值（量程上限），不再标 0 / 中点 / 1.5×。
+	// Only label **one value at the top** (the scale upper bound); no more 0 /
+	// midpoint / 1.5×.
 	//
-	// 为什么不标 `0B`：0 的位置就是绘图区底部的基线，本身已经一目了然；
-	// 而刻度现在是叠在曲线上的，底部的 `0B` 反而会和曲线/基线挤在一起。
-	// 顶端值才是图上看不出来的信息（“上沿代表多少”）。
+	// Why no `0B`: the 0 position is the baseline at the bottom of the plot area,
+	// already self-evident; and ticks are now overlaid on the curve, so a bottom
+	// `0B` would crowd the curve/baseline. The top value is the information the
+	// chart can't otherwise convey ("how much the top edge represents").
 	return {
 		labels: [fitWithUnit(scaled * 1.5)],
 		max: upper,
 	};
 }
 
-/** 抽稀后仍保留的标签下标（按原始下标）。首尾两个标签一定保留：它们是量程的语义。
+/** Label indexes kept after thinning (by original index). The first and last
+ *  labels are always kept: they carry the semantics of the scale.
  *
- * 这里用 floor 与 ratatui 的 `i*(h-1)/(n-1)` 保持一致。
+ * floor is used here, consistent with ratatui's `i*(h-1)/(n-1)`.
  */
 function keptIndexes(n: number, plotRows: number): Set<number> {
 	const keep = new Set<number>();
@@ -568,19 +649,20 @@ function keptIndexes(n: number, plotRows: number): Set<number> {
 }
 
 /* ------------------------------------------------------------------ */
-/* 单块渲染                                                            */
+/* Single-block rendering                                              */
 /* ------------------------------------------------------------------ */
 
 /**
- * 画一个 bottom 风格的带框指标块，返回**恰好 `plotRows + 4` 行**。
+ * Draw one bottom-style framed metric block, returning **exactly
+ * `plotRows + 4` rows**.
  *
- * 宽度恒等式（每行都恰好 `width` 个单元格）：
+ * Width identities (every row has exactly `width` cells):
  * ```text
- * 标题行 = "┌ " + name + " ─ " + info + " " + fill + "┐"      = width
- * 绘图行 = "│" + 刻度(gutter) + "│" + 曲线(plotW) + "│"        = width
- * 轴线行 = "│" + 空格(gutter) + "└" + "─"(plotW) + "│"         = width
- * 时间行 = "│" + 左标签(gutter+1) + 右标签(plotW) + "│"         = width
- * 下边行 = "└" + "─"(width-2) + "┘"                            = width
+ * title row = "┌ " + name + " ─ " + info + " " + fill + "┐"      = width
+ * plot row  = "│" + ticks(gutter) + "│" + curve(plotW) + "│"     = width
+ * axis row  = "│" + spaces(gutter) + "└" + "─"(plotW) + "│"      = width
+ * time row  = "│" + left label(gutter+1) + right label(plotW) + "│" = width
+ * bottom    = "└" + "─"(width-2) + "┘"                            = width
  * ```
  */
 export function renderBlock(
@@ -594,9 +676,10 @@ export function renderBlock(
 	const rows = Math.max(1, plotRows);
 
 	let dataMax = 0;
-	// 量程的取样范围：默认整个可见窗口；设了 scaleWindowPoints 就只看最后那段，
-	// 并在段内叠一个二次衰减权（见 scaleRolloff 的注释）。
-	// 至少取 1 个点（否则量程会变成 0，图直接贴顶）。
+	// Scale sampling range: the whole visible window by default; when
+	// scaleWindowPoints is set, only look at that last slice, with a quadratic
+	// decay weight applied inside the slice (see the comment on scaleRolloff).
+	// Take at least 1 point (otherwise the scale becomes 0 and the chart slams the top).
 	const scalePts =
 		Number.isFinite(block.scaleWindowPoints) &&
 		(block.scaleWindowPoints as number) > 0
@@ -607,26 +690,31 @@ export function renderBlock(
 		const n = s.values.length;
 		const span = Math.max(1, scalePts);
 		const from = Math.max(0, n - span);
-		// 只有量程窗**真的是显示窗口的子区间**时才做二次衰减。
-		// `span >= n`（整窗口取 max，或启动初期历史还不够一个窗）时用纯 max：
-		//   ① `PI_SYSMON_SCALE_WINDOW=1` 这个退路必须**精确**等于旧行为；
-		//   ② 整窗口根本没有“内部边界”，点是从左边缘自然滚出去的，无需平滑。
+		// Only apply quadratic decay when the scale window **really is a sub-interval
+		// of the display window**.
+		// With `span >= n` (whole-window max, or history shorter than one window
+		// early after startup) use the plain max:
+		//   ① the `PI_SYSMON_SCALE_WINDOW=1` escape hatch must be **exactly** the old behavior;
+		//   ② the whole window has no "inner boundary" — points roll out naturally
+		//     from the left edge, nothing to smooth.
 		const smooth = rolloff && span < n;
 		for (let i = from; i < n; i++) {
 			const v = s.values[i];
 			if (v === undefined || !Number.isFinite(v) || v <= 0) continue;
-			// ageIdx = 0 是最新的点。权重按**三次幂**衰减到段尾为 0：
-			// 新点权重恒为 1 → 量程永远 >= 当前值，不会欠量程；
-			// 段尾权重为 0 → 尖峰**离开段时量程已经先降完了**，不会出现跳变。
+			// ageIdx = 0 is the newest point. The weight decays by **cubic power** to 0 at the slice tail:
+			// the newest point's weight is always 1 → the scale is always >= the current value, never under-scaled;
+			// the slice tail's weight is 0 → by the time a spike **leaves the slice, the
+			// scale has already come down**, so no jump occurs.
 			//
-			// 幂次是量出来的（10s 窗、100x 尖峰、3 点宽突发）：
-			//   硬截断 → 单帧跳 100x（整图“啪”地弹一下）
-			//   一次方 → 跳 10x（段尾还残留 1/span）
-			//   二次方 → 跳 4x
-			//   三次方 → 跳 2.7x，且 7 帧就回落到位  ← 取它
-			//   四次方 → 跳 2.6x（边际收益很小），但回落更“生硬”
-			// 三次方在「平滑」与「及时回落」之间最好；2.7x 的残余跳变只发生在
-			// 量程已经降到基线附近几帧，视觉上基线己接近顶部，感知不到。
+			// The power was measured (10s window, 100x spike, 3-point-wide burst):
+			//   hard cutoff → 100x single-frame jump (the whole chart snaps)
+			//   linear      → 10x jump (1/span residue at the tail)
+			//   quadratic   → 4x jump
+			//   cubic       → 2.7x jump, settles within 7 frames  ← pick this
+			//   quartic     → 2.6x jump (marginal gain), but the falloff feels "harder"
+			// Cubic is the best trade between "smooth" and "falls back promptly"; the
+			// residual 2.7x jump only happens a few frames after the scale is already
+			// near the baseline, when the baseline is visually near the top, so it's imperceptible.
 			let eff = v;
 			if (smooth) {
 				const ageFrac = (n - 1 - i) / Math.max(1, span - 1);
@@ -644,13 +732,15 @@ export function renderBlock(
 	);
 	const axisMax = Number.isFinite(spec.max) && spec.max > 0 ? spec.max : 1;
 
-	// 溢出检测：可见数据里有点超出量程时，它会被截到顶（braille 里 clamp 到 top）。
+	// Overflow detection: when a visible data point exceeds the scale, it gets
+	// clipped to the top (clamped to `top` in braille).
 	//
-	// 为什么必须检测：量程是「最近 1/6 窗口」算的（用户要求的自动回落），
-	// 所以一根 10MB/s 尖峰发生 ~10s 后，量程已经回落到基线的几百 KB，
-	// 但**这根尖峰还在 60s 的显示窗口里** —— 它会被截到顶。
-	// 此时顶端刻度若不标记，读图的人会以为「最高就到几百 KB」，
-	// 而屏幕上明明有一根顶到天的尖峰：刻度在撒谎。
+	// Why detection is a must: the scale is computed from the "most recent 1/6
+	// window" (the user-requested auto-fallback), so ~10s after a 10MB/s spike,
+	// the scale has fallen back to the few-hundred-KB baseline, but **the spike
+	// is still inside the 60s display window** — it gets clipped to the top.
+	// If the top tick isn't marked then, a reader would think "the max is a few
+	// hundred KB" while a spike clearly reaches the top of the screen: the scale would be lying.
 	let overflow = false;
 	for (const s of block.series) {
 		for (const v of s.values) {
@@ -662,35 +752,39 @@ export function renderBlock(
 		if (overflow) break;
 	}
 
-	// 宽度分配：刻度不再占列，但 `gutter` 仍用来判断叠印是否放得下
+	// Width allocation: ticks no longer occupy columns, but `gutter` still decides whether the overlay fits
 	const { showAxis, plotW } = blockMetrics(w, rawGutter);
 
 	const color = block.color;
 
-	// 边框用中性的 `borderMuted`（darkGray）而不是 `border`（blue）：
-	// 三张图并排时，三个高饱和色的**大方框**会比曲线本身还抢眼，
-	// 而且 bottom 的边框就是中性的。指标色只用在「标题名 + 曲线 + 读数」上，
-	// 既保留「一眼看出哪张图」的能力，又不刷屏。
+	// Borders use the neutral `borderMuted` (darkGray) instead of `border` (blue):
+	// with three charts side by side, three big saturated **boxes** would be more
+	// eye-catching than the curves themselves, and bottom's borders are neutral
+	// anyway. Metric colors only go on "title name + curve + readouts" — keeps
+	// the "tell charts apart at a glance" ability without color spam.
 	const edge: ThemeColor = "borderMuted";
 	const axis: ThemeColor = "muted";
 
-	// ── 上边框 + 标题（bottom 的 title_top 效果）──
-	// 边框本体中性色，名字用指标色 —— 这就是「一眼看出哪张图是什么」的关键。
+	// ── Top border + title (bottom's title_top effect) ──
+	// Border body in neutral color, name in the metric color — this is the key to
+	// "tell at a glance which chart is which".
 	const nameSegs: StyledLine = [{ text: block.name, color }];
 	let head: Row;
 	{
-		// 必须用**显示宽度**而不是 `.length`：`.length` 数的是码点，
-		// 而 CJK/emoji 占 2 列。用 `.length` 会低估标题占宽 → fill 算多 →
-		// 最后把右边框 `┐` 切掉（测试里的 `处理器 CPU` 就是这样暴露的）。
+		// Must use **display width**, not `.length`: `.length` counts code points,
+		// while CJK/emoji take 2 columns. Using `.length` would underestimate the
+		// title width → fill computed too large → the right border `┐` gets cut
+		// off (that's how a test with a CJK block name like "… CPU" exposed the bug).
 		const nameW = visibleWidth(block.name);
-		// 行布局：`┌␣name␣─␣info␣` + fill×`─` + `┐`
-		// 已用固定列 = 1(┌) + 1(␣) + nameW + 1(␣) + 1(─) + 1(␣) + infoW + 1(␣)
-		// 再留 1 列 `┐`，剩下的才是 fill。
-		const FIXED_NO_INFO = 4; // ┌␣ + name 后空格 + ┐
-		const FIXED_WITH_INFO = 7; // ┌␣ + ␣─␣ + info 后空格 + ┐
+		// Row layout: `┌␣name␣─␣info␣` + fill×`─` + `┐`
+		// Fixed columns used = 1(┌) + 1(␣) + nameW + 1(␣) + 1(─) + 1(␣) + infoW + 1(␣)
+		// plus 1 column for `┐`; the rest is fill.
+		const FIXED_NO_INFO = 4; // ┌␣ + space after name + ┐
+		const FIXED_WITH_INFO = 7; // ┌␣ + ␣─␣ + space after info + ┐
 		const roomForInfo = Math.max(0, w - nameW - FIXED_WITH_INFO - 1);
 
-		// 逐段累积，放不下就停 —— 这样窄块下至少能留下最重要的那段读数
+		// Accumulate segment by segment, stop when it doesn't fit — so narrow
+		// blocks at least keep the most important reading
 		const infoCells: Row = [];
 		for (const seg of block.titleInfo ?? []) {
 			const cells = segsToRow([seg]);
@@ -715,7 +809,7 @@ export function renderBlock(
 		} else {
 			head.push({ ch: " ", color: edge });
 		}
-		// 用 `─` 填满到右边框（bottom 的 `title_top` 就是这个观感），而不是留空白
+		// Fill with `─` up to the right border (bottom's `title_top` look), instead of leaving blank
 		const fill = Math.max(
 			1,
 			w - nameW - (useInfo ? infoCells.length + FIXED_WITH_INFO : FIXED_NO_INFO),
@@ -724,22 +818,24 @@ export function renderBlock(
 			ch: "┐",
 			color: edge,
 		});
-		// 标题比块宽还长时（长名字 + 窄块）：
-		// 确保右边的 `┐` 永远存活 —— 边框闭合比显示完整标题重要。
-		// 做法是把标题名本身截短到「块宽 - 已用的装饰列」，而不是直接切整行尾巴
-		// （直接切尾巴会把名字切掉，连“这是哪张图”都看不出来）。
+		// When the title is longer than the block (long name + narrow block):
+		// make sure the right `┐` always survives — a closed border matters more
+		// than a complete title.
+		// Do that by truncating the name itself to "block width - decoration
+		// columns used", not by cutting the row's tail (cutting the tail would
+		// remove the name entirely, leaving no way to tell which chart this is).
 		if (head.length > w) {
 			const prefix = 2; // "┌ "
-			const suffix = 3; // 至少 1 个 fill 加上 "┐"，再加一点缓冲
+			const suffix = 3; // at least 1 fill plus "┐", with a bit of buffer
 			const nameRoom = Math.max(0, w - prefix - suffix);
-			// 用 truncateRow（而不是 slice）保证不把宽字符切一半
+			// Use truncateRow (not slice) to guarantee no wide char gets cut in half
 			const namePart = truncateRow(
 				segsToRow([{ text: block.name, color }]),
 				nameRoom,
 			);
-			// 先算好要填多少个 `─`，让 `┐` **落在最后一列**。
-			// 不能先拼完再靠 `while (head.length < w) push(" ")` 补 ——
-			// 那会把 `┐` 挤在中间、尾巴拖一堆空白（w=6 时就是 `┌ C─┐ `）。
+			// Compute how many `─` to fill up front so `┐` **lands on the last column**.
+			// Can't join everything first and pad with `while (head.length < w) push(" ")` —
+			// that would strand `┐` mid-row with a tail of trailing blanks (at w=6 you'd get `┌ C─┐ `).
 			const fillN = Math.max(1, w - prefix - namePart.length - 1);
 			head = [
 				{ ch: "┌", color: edge },
@@ -754,41 +850,44 @@ export function renderBlock(
 
 	const lines: Row[] = [head];
 
-	// ── 绘图行 ──
+	// ── Plot rows ──
 	const glyphs = renderChartGlyphs(
 		block.series.map((s) => ({ label: block.name, values: s.values })),
 		plotW,
 		rows,
 		axisMax,
-		// 按时间比例定位（windowPoints 设了时）：一秒的屏宽恒定，
-		// 这样左下角 `60s` 标签才诚实；没设则退回拉伸铺满。
+		// Position proportionally in time (when windowPoints is set): one second
+		// of screen width is constant, so the `60s` label in the bottom-left is
+		// honest; otherwise fall back to stretch-to-fill.
 		block.windowPoints && block.windowPoints > 0
 			? { slots: block.windowPoints }
 			: { stretch: true },
 	);
 
-	// y 刻度位置：对齐 ratatui —— dy = i*(plotH-1)/(n-1)，画在 plotBottom - dy。
-	// 必须是 **floor**（整数除法），不能 Math.round：ratatui 的 `render_y_labels` 里是
-	// `i as u16 * (graph_area.height - 1) / (labels_len - 1)`，u16 除法向下取整。
-	// 实测验证（bottom 抓帧 Network 块、plotH=8、4 个刻度）：
-	//   floor → dy={0,2,4,7} 与抓帧完全一致；round → dy={0,2,5,7} 第三个刻度差 1 行。
-	// 我最初写成 round，就是靠这个抓帧对出来的。
+	// y tick positions: aligned with ratatui — dy = i*(plotH-1)/(n-1), drawn at plotBottom - dy.
+	// Must be **floor** (integer division), not Math.round: ratatui's `render_y_labels` has
+	// `i as u16 * (graph_area.height - 1) / (labels_len - 1)`, and u16 division truncates.
+	// Verified empirically (bottom frame capture of the Network block, plotH=8, 4 ticks):
+	//   floor → dy={0,2,4,7} matches the capture exactly; round → dy={0,2,5,7} puts the third tick 1 row off.
+	// I originally wrote round; this frame capture is what caught it.
 	const kept = keptIndexes(spec.labels.length, rows);
 	const tickAt = new Map<number, string>();
 	if (showAxis) {
 		const n = spec.labels.length;
 		for (let i = 0; i < n; i++) {
 			if (!kept.has(i)) continue;
-			// 单个标签时**贴顶**而不是贴底。
-			// 通用公式 `rows-1 - floor(i*(rows-1)/(n-1))` 在 n=1 时退化成 `rows-1`（底部），
-			// 而唯一的那个标签是「量程上限」，语义上就该在顶端。
+			// A single label goes **at the top** instead of the bottom.
+			// The general formula `rows-1 - floor(i*(rows-1)/(n-1))` degenerates to
+			// `rows-1` (bottom) when n=1, while the sole label is the "scale upper
+			// bound" and semantically belongs at the top.
 			const dy = n <= 1 ? 0 : Math.floor((i * (rows - 1)) / (n - 1));
 			const y = n <= 1 ? 0 : rows - 1 - dy;
 			if (y >= 0 && y < rows) {
 				const lab = spec.labels[i] ?? "";
-				// 溢出时给**顶端刻度**加 `+`（如 `293KB` → `293K+`，读作“至少这么多”）。
-				// 必须**保持字符长度不变**：`rawGutter` 是由原标签算的，
-				// 叠印宽度一变，绘图区左边界就跟着跳一格（见 ARCHITECTURE 的坑 6）。
+				// On overflow, append `+` to the **top tick** (e.g. `293KB` → `293K+`, read as "at least this much").
+				// The **character length must stay the same**: `rawGutter` was computed
+				// from the original labels, and if the overlay width changes, the plot
+				// area's left edge jumps by one column (see ARCHITECTURE pitfall 6).
 				tickAt.set(
 					y,
 					overflow && y === 0 && lab.length >= 2 ? `${lab.slice(0, -1)}+` : lab,
@@ -797,13 +896,15 @@ export function renderBlock(
 		}
 	}
 
-	const plotTop = 0; // 绘图行在 lines 里的起始下标
+	const plotTop = 0; // start index of plot rows in `lines`
 	for (let r = 0; r < rows; r++) {
 		const row = blank(w);
 		row[0] = { ch: "│", color: edge };
 		row[w - 1] = { ch: "│", color: edge };
-		// 曲线：逐格取色（网格线是每格独立的，所以按格而不是按行染色）。
-		// 绘图区现在占满内宽（左边界在 col 1），刻度稍后叠在上面。
+		// Curve: per-cell coloring (the grid is per-cell independent, so color by
+		// cell, not by row).
+		// The plot area now spans the full inner width (left edge at col 1); ticks
+		// are overlaid on top of it later.
 		const gl = glyphs[r];
 		for (let c = 0; c < plotW; c++) {
 			const g = gl?.[c];
@@ -811,18 +912,21 @@ export function renderBlock(
 			const series = g.series >= 0 ? block.series[g.series] : undefined;
 			row[1 + c] = { ch: g.char, color: series?.color ?? color };
 		}
-		// 0 基线**不再单独铺一条 `─`**。
+		// The 0 baseline **no longer gets its own `─` run**.
 		//
-		// 以前（刻度/轴线各占独立行时）这里铺横线是为了画出 x 轴；
-		// 但改成「下边框兼任 x 轴」后，下边框本身就是一条 `─`，
-		// 再在绘图区最后一行铺一条 `─` 就变成**上下两条平行横线**，
-		// 观感上像多出一条线（右侧用户反馈“看着下方多了一条线”）。
+		// Previously (when ticks/axis line each owned a row) the horizontal line
+		// here drew the x axis; but after switching to "the bottom border doubles
+		// as the x axis", the bottom border is already a `─`, so another `─` run
+		// in the last plot row makes **two parallel horizontal lines**, looking
+		// like a stray extra line (user feedback: "there's an extra line at the bottom").
 		//
-		// 现在 0 的位置由**下边框**表达（它是绘图区的下沿），无需额外横线。
-		// 曲线的 0 值点落在绘图区最后一行、紧贴下边框，语义仍然清楚。
-		// y 刻度**叠印**在绘图区左侧（不再独占列）。
-		// 叠在曲线之上：刻度是参考信息，偶尔遮住一小段曲线可接受；
-		// 反过来（曲线盖刻度）会让刻度读数不可信。
+		// Now the 0 position is expressed by the **bottom border** (it's the lower
+		// edge of the plot area), no extra line needed. Zero-value curve points
+		// land in the last plot row, hugging the bottom border — semantics stay clear.
+		// y ticks are **overlaid** on the left of the plot area (no dedicated columns).
+		// Overlaid on top of the curve: ticks are reference info, and occasionally
+		// covering a small curve segment is acceptable; the reverse (curve covering
+		// ticks) would make tick readings untrustworthy.
 		if (showAxis) {
 			const label = tickAt.get(r);
 			if (label) {
@@ -833,7 +937,7 @@ export function renderBlock(
 		lines.push(row);
 	}
 
-	// ── 浮动读数框：覆盖画在绘图区右上角（bottom 的 legend TopRight）──
+	// ── Floating readout box: overlaid on the top-right corner of the plot area (bottom's legend TopRight) ──
 	if (block.legend && block.legend.length > 0) {
 		const legendInner = block.legend.reduce(
 			(m, l) =>
@@ -845,22 +949,25 @@ export function renderBlock(
 		);
 		const legendW = legendInner + 2;
 		const legendH = block.legend.length + 2;
-		// 显隐规则：只要「放得下 + 不与 x 轴线/0% 基线相撞」就画。
+		// Show/hide rule: draw whenever "it fits + doesn't collide with the x-axis line / 0% baseline".
 		//
-		// 历史上这里有一条更严的宽度规则「至少留 40% 曲线可见」，
-		// 叠加下面那条高度规则后把 Network 的浮框**永久挡掉**了
-		// （它的读数文字最长、又是两行）。而「覆盖右上角曲线」本来就是浮框的
-		// 设计意图（bottom 的 legend 就是 overlay，不预留空间），
-		// 没有理由要求留白，所以宽度只要放得下即可。
+		// There used to be a stricter width rule here, "leave at least 40% of the
+		// curve visible"; combined with the height rule below it **permanently
+		// blocked** Network's box (it has the longest readout text and two lines).
+		// But "covering the top-right curve" is the floating box's design intent
+		// (bottom's legend is an overlay too, with no reserved space), so there's
+		// no reason to demand blank space — fitting is enough for width.
 		//
-		// 真正不能碰的是**纵向**：0% 基线在绘图区最后一行，
-		// 浮框若铺满所有绘图行，它的下边框会与基线叠成一条双横线，
-		// 看起来像渲染坏了。所以要求浮框下面**至少还留一行** ——
-		// 即 `legendH - 1 < rows - 1`，等价于 `legendH < rows`。
+		// What truly can't be violated is the **vertical** direction: the 0%
+		// baseline is in the last plot row, and if the box spans all plot rows,
+		// its bottom border merges with the baseline into a double line that
+		// looks like a rendering bug. So require **at least one row left below
+		// the box** — i.e. `legendH - 1 < rows - 1`, equivalent to `legendH < rows`.
 		//
-		// 注意这条规则本身没错，当初之所以把 Network 坑死，是因为它的浮框
-		// 是两行（legendH=4）而默认绘图区正好 4 行 —— 解决办法是把它的读数
-		// 压成一行（速率已在标题栏里，浮框只放累计流量），而不是放宽这条规则。
+		// Note the rule itself was never wrong; what killed Network was its
+		// two-line box (legendH=4) against a default plot area of exactly 4 rows —
+		// the fix was compressing its readout to one line (the rate is already in
+		// the title bar; the box only carries cumulative traffic), not loosening this rule.
 		if (legendW <= plotW && legendH < rows) {
 			const plotLeft = 1;
 			const plotRight = plotLeft + plotW;
@@ -898,11 +1005,13 @@ export function renderBlock(
 		}
 	}
 
-	// ── 下边框（时间标签嵌在里面，与标题嵌上边框对称）──
-	// 左端最旧、右端 now。为了不把边框切碎，两端的标注与横线之间各留一个空格：
+	// ── Bottom border (time labels embedded inside, symmetric to the title in the top border) ──
+	// Oldest on the left, now on the right. To keep the border from looking
+	// chopped up, leave one space between each label and the horizontal line:
 	//   `└ 60s ────────────── 0s ┘`
-	// 以前时间标签单独占一行（否则没地方放），现在嵌进边框省下整整一行，
-	// 那一行还给绘图区。
+	// Time labels used to occupy their own row (there was nowhere else to put
+	// them); embedding them in the border saves a whole row, which goes back to
+	// the plot area.
 	{
 		const row: Row = [
 			{ ch: "└", color: edge },
@@ -914,17 +1023,17 @@ export function renderBlock(
 		];
 		const leftLabel = fmtWindowLabel(windowSecs);
 		const rightLabel = "0s";
-		// 嵌下来要的列数：边框 1 + 左空格 1 + 左标签 + 左空格 1
-		//   + 右空格 1 + 右标签 + 右空格 1 + 边框 1（中间至少 0 个 `─`）
-		// 即 L + R + 6；两个标签都有空格包着才不像“贴着边框”。
+		// Columns needed for embedding: border 1 + left space 1 + left label + left space 1
+		//   + right space 1 + right label + right space 1 + border 1 (at least 0 `─` in between)
+		// i.e. L + R + 6; both labels need surrounding spaces so they don't look glued to the border.
 		const need = leftLabel.length + rightLabel.length + 6;
 		if (w >= need) {
-			// 左端：`└ 60s `
+			// Left end: `└ 60s `
 			row[1] = { ch: " ", color: edge };
 			for (let i = 0; i < leftLabel.length; i++)
 				row[2 + i] = { ch: leftLabel[i] ?? " ", color: axis };
 			row[2 + leftLabel.length] = { ch: " ", color: edge };
-			// 右端：` 0s ┘`（标签结束于 w-2，留给 `┘` 前一个空格）
+			// Right end: ` 0s ┘` (label ends at w-2, leaving one space before `┘`)
 			const labStart = Math.max(0, w - 2 - rightLabel.length);
 			row[labStart - 1] = { ch: " ", color: edge };
 			for (let i = 0; i < rightLabel.length; i++)
@@ -938,16 +1047,19 @@ export function renderBlock(
 }
 
 /* ------------------------------------------------------------------ */
-/* 面板拼接                                                            */
+/* Panel assembly                                                      */
 /* ------------------------------------------------------------------ */
 
 /**
- * 把若干块排成多列面板。
+ * Arrange several blocks into a multi-column panel.
  *
- * 拼接纪律：每块内部已经保证**行数恒定**且**每行恰好 blockW 个单元格**，
- * 所以这里可以直接横向拼接（边框相接，与 bottom 的 `┐┌` 一致，不用空隙），
- * 最后再逐行 `truncateToWidth(line, width, "", true)` 兜底
- * —— 兜底必须显式传 `ellipsis=""`，否则 `truncateToWidth` 会追加 `...` 把宽度账算坏。
+ * Assembly discipline: each block internally guarantees a **constant row
+ * count** and **exactly blockW cells per row**, so they can be joined
+ * horizontally here directly (borders touching, same as bottom's `┐┌`, no
+ * gaps), and finally each line is truncated with
+ * `truncateToWidth(line, width, "", true)` as a safety net
+ * — the net must explicitly pass `ellipsis=""`, otherwise `truncateToWidth`
+ * appends `...` and wrecks the width bookkeeping.
  */
 export function renderPanel(
 	theme: ThemeLike,
@@ -956,9 +1068,9 @@ export function renderPanel(
 	layout: Layout,
 	windowSecs: number,
 ): string[] {
-	// 零块 / 零行布局：显式返回空，不靠后续循环的副作用
+	// Zero blocks / zero-row layout: return empty explicitly, don't rely on side effects of later loops
 	if (blocks.length === 0 || layout.bands === 0 || layout.cols === 0) return [];
-	// 防涛：调用方传 0/负数时，下面的 `" ".repeat` 与 `truncateToWidth` 都会炸
+	// Defensive: when a caller passes 0/negative, the `" ".repeat` and `truncateToWidth` below would blow up
 	const safeW = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
 
 	const { cols, widths, plotRows } = layout;
@@ -967,7 +1079,7 @@ export function renderPanel(
 		return renderBlock(theme, b, w, plotRows, windowSecs);
 	});
 
-	// 补齐：块数不足时补空白（保持网格形状与总行数不变）
+	// Padding: when there aren't enough blocks, pad with blanks (keeps the grid shape and total row count unchanged)
 	const cellH = plotRows + BLOCK_CHROME_ROWS;
 	const cells: string[][][] = [];
 	for (let band = 0; band < layout.bands; band++) {
@@ -975,7 +1087,7 @@ export function renderPanel(
 		for (let c = 0; c < cols; c++) {
 			const b = blockLines[band * cols + c];
 			const w = Math.max(0, Math.floor(widths[c] ?? safeW));
-			// 空位画空白，不画空框：空框看起来像一张坏掉的图，比留白更容易让人误判
+			// Blank cells get spaces, not an empty frame: an empty frame looks like a broken chart and is easier to misread than whitespace
 			rowCells.push(b ?? Array.from({ length: cellH }, () => " ".repeat(w)));
 		}
 		cells.push(rowCells);
@@ -988,7 +1100,8 @@ export function renderPanel(
 			out.push(rowCells.map((c) => c[r] ?? "").join(""));
 		}
 	}
-	// 兕底截断：显式传 `ellipsis=""` —— `truncateToWidth` 默认会追加 `...`，
-	// 那会把宽度账算坏（多出 3 列，而 pad=true 又截不回去）。
+	// Safety-net truncation: explicitly pass `ellipsis=""` — `truncateToWidth`
+	// appends `...` by default, which would wreck the width bookkeeping (3 extra
+	// columns, and pad=true can't truncate it back).
 	return out.map((line) => truncateToWidth(line, safeW, "", true));
 }

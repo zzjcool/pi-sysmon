@@ -731,6 +731,40 @@ That's pi's layout behavior, and the extension can't insert a blank line — sho
 emitting one itself as the component's first row, which would cost a row of height.
 We stay consistent with pi's native behavior rather than getting clever.
 
+### `line` mode is a widget too, not `setStatus`
+
+The one-row text mode originally used `ctx.ui.setStatus(key, text)`, and that was wrong
+for two independent reasons:
+
+1. **It ignores `placement`.** `setStatus` text is rendered by pi's *built-in* footer
+   (`footer.js` concatenates `getExtensionStatuses()` into a third footer line), so it is
+   pinned to the very bottom of the screen. `/sysmon below` then moved the chart but left
+   the text line where it was — the reported "position doesn't match the chart" bug.
+   `setWidget(..., { placement })` uses the same dock slot as the chart
+   (`widgetsAbove` / `widgetsBelow`), so both modes now follow `above`/`below`.
+   Verified by frame capture: with `belowEditor` the chart occupies rows 32–39 and line
+   mode occupies row 33; with `aboveEditor` both move to the editor's top side.
+2. **It shares a line with every other extension.** `footer.js` joins *all* extension
+   statuses with a space and truncates — pitfall #5 in the README. A widget is ours alone.
+
+Cost: `line` mode now consumes one dock row per frame rather than living in the footer.
+That is the same row it occupied visually before (it was the footer's third line), and the
+height is constant (exactly 1 row) so it cannot shift the editor.
+
+### `line` content is a ranked segment list, not a chosen string
+
+The old implementation picked one of three hard-coded strings by testing `visibleWidth` —
+all-or-nothing, and it had no token readout at all (the reported gap). Now `plainLineSegs`
+returns a ranked `StyledLine` list (CPU → MEM → NET → TOK) and drops **whole groups** from
+the tail until it fits, so a narrow terminal never shows a half-eaten number like `↑1.0`.
+The CPU group is never dropped: an empty row would look like the extension had died.
+
+Rendering goes through `renderStyledLine` in `chart-panel.ts`, which reuses the same cell
+model as the charts (`segsToRow` → `truncateRow` → `paint`). That is deliberate: hand-rolled
+`padEnd` is precisely how a line ends up one column too wide and takes pi down with it
+(pitfall #1), and the cell model already handles wide characters, ANSI, and zero-width
+combining marks correctly.
+
 ## Behavior on non-Linux
 
 All `/proc` and `/sys` reads are wrapped in try/catch, degrading to zero values on failure

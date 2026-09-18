@@ -27,14 +27,18 @@ import {
 	RATE_GUTTER,
 	rateAxis,
 	renderPanel,
+	renderStyledLine,
+	segsWidth,
 	MIN_BLOCK_W,
 	type MetricBlock,
+	type StyledLine,
 	type ThemeLike,
 } from "../src/chart-panel.ts";
 import {
 	buildBlocks,
 	fmtTokensTotal,
 	parsePlacement,
+	plainLineSegs,
 	resolveWindow,
 	tokenAxis,
 	DEFAULT_SCALE_WINDOW_FRAC,
@@ -1883,4 +1887,203 @@ test("side-by-side join: each block contributes exactly layout.widths[i] columns
 		acc += w;
 	}
 	assert.equal(acc, 150);
+});
+
+/* ------------------------------------------------------------------ */
+/* 4. line mode (/sysmon line): content + width hard constraints        */
+/* ------------------------------------------------------------------ */
+
+/** Join colored segments into plain text (dropping colors), for content assertions */
+const segsText = (segs: StyledLine): string => segs.map((s) => s.text).join("");
+
+test("plainLineSegs: includes token readouts (rate + session cumulative), same convention as the charts", () => {
+	const segs = plainLineSegs(
+		{
+			snap: fakeSnap(),
+			tpsNow: 1234,
+			tokensIn: 5671,
+			tokensOut: 89,
+			tokensCacheRead: 2700,
+		},
+		200,
+	);
+	const text = segsText(segs);
+	assert.match(text, /CPU 37%/);
+	assert.match(text, /MEM 52%/);
+	assert.match(text, /NET/);
+	// The old implementation had no tokens at all — this is the regression guard
+	assert.match(text, /TOK/);
+	assert.match(text, /~1\.2Kt\/s/); // fmtTps(1234)
+	assert.match(text, /↑5\.7k/); // same convention as pi footer's formatTokens (lowercase k)
+	assert.match(text, /↓89/);
+	assert.match(text, /R2\.7k/);
+});
+
+test("plainLineSegs: still emits the token line without a snapshot (the only meaningful metric on non-Linux)", () => {
+	const segs = plainLineSegs({ tpsNow: 42 }, 200);
+	const text = segsText(segs);
+	assert.match(text, /TOK/);
+	assert.match(text, /~42t\/s/);
+	// Without a system snapshot, no CPU/MEM readouts should be fabricated
+	assert.doesNotMatch(text, /CPU/);
+});
+
+test("sweep: line mode renders at exactly the declared width at any width (overflow makes pi exit)", () => {
+	for (const w of Array.from({ length: 220 }, (_, i) => i + 1)) {
+		for (const theme of [ansiTheme, plainTheme]) {
+			const segs = plainLineSegs(
+				{
+					snap: fakeSnap(),
+					tpsNow: 12345,
+					tokensIn: 1234567,
+					tokensOut: 987654,
+					tokensCacheRead: 543210,
+				},
+				w,
+			);
+			const line = renderStyledLine(theme, segs, w);
+			assert.equal(
+				visibleWidth(line),
+				w,
+				`w=${w}: rendered width ${visibleWidth(line)} ≠ ${w}`,
+			);
+		}
+	}
+});
+
+test("sweep: wide/zero-width character segments never overflow end to end and never split a wide char", () => {
+	// This pins the agreement between "plainLineSegs's budget accounting" and
+	// "renderStyledLine's actual render accounting" — they must match
+	// (currently coincidentally so: the data is all ASCII). Feed segments
+	// containing CJK/emoji/combining characters straight into the renderer and
+	// sweep widths, nailing this agreement down.
+	const cases: StyledLine[] = [
+		[{ text: "你好世界你好世界", color: "accent" }],
+		[
+			{ text: "CPU ", color: "muted" },
+			{ text: "你好", color: "success" },
+		],
+		[{ text: "e\u0301\u200bx", color: "muted" }],
+		[{ text: "🙂🙂🙂", color: "warning" }],
+		[
+			{ text: "CPU 12%  ", color: "muted" },
+			{ text: "内存 60%", color: "warning" },
+			{ text: "  🙂", color: "accent" },
+		],
+	];
+	for (const w of Array.from({ length: 60 }, (_, i) => i + 1)) {
+		for (const segs of cases) {
+			for (const theme of [ansiTheme, plainTheme]) {
+				const line = renderStyledLine(theme, segs, w);
+				assert.equal(
+					visibleWidth(line),
+					w,
+					`w=${w} segs=${JSON.stringify(segs.map((s) => s.text))}`,
+				);
+			}
+		}
+	}
+});
+
+test("sweep: line mode never throws and never overflows at extreme/non-finite widths", () => {
+	// `renderStyledLine` has a defensive branch for non-finite widths (clamps to
+	// 1); this pins it down.
+	// 0/negative/NaN/Infinity must all yield a finite-width line.
+	for (const w of [0, -1, -100, Number.NaN, Number.POSITIVE_INFINITY]) {
+		const line = renderStyledLine(
+			ansiTheme,
+			plainLineSegs({ snap: fakeSnap() }, w),
+			w,
+		);
+		const lw = visibleWidth(line);
+		assert.ok(Number.isFinite(lw), `w=${w} produced a non-finite width`);
+		assert.ok(lw >= 1, `w=${w} produced width ${lw} < 1`);
+		assert.doesNotMatch(line, /NaN|undefined/, `w=${w}`);
+	}
+});
+
+test("sweep: line mode never throws and never overflows at extremely narrow widths", () => {
+	// Must stay stable even when the terminal is squeezed to 1 column (pad with
+	// spaces to w columns, no overflow, no NaN characters)
+	for (const w of [1, 2, 3, 5, 8, 12, 20]) {
+		const line = renderStyledLine(
+			ansiTheme,
+			plainLineSegs({ snap: fakeSnap() }, w),
+			w,
+		);
+		assert.equal(visibleWidth(line), w, `w=${w}`);
+	}
+});
+
+test("plainLineSegs: drops whole segments only when short on width; the result is always a concatenation of complete segments (numbers never cut in half)", () => {
+	const opts = {
+		snap: fakeSnap(),
+		tpsNow: 12345,
+		tokensIn: 1234567,
+		tokensOut: 987654,
+		tokensCacheRead: 543210,
+	};
+	const full = segsText(plainLineSegs(opts, 500));
+	// First find the boundaries of the four segments: each segment's starting text
+	const marks = ["CPU ", "MEM ", "NET ", "TOK "];
+	// For every width: the result must be a prefix of full (after trimming trailing
+	// spaces) and must end on a "segment boundary"
+	for (let w = 1; w <= 120; w++) {
+		const text = segsText(plainLineSegs(opts, w)).trimEnd();
+		assert.ok(
+			full.startsWith(text),
+			`w=${w}: not a prefix —— ${JSON.stringify(text)}`,
+		);
+		// The end can never stop in the middle of a token number (e.g. inside `↑1.2M`)
+		assert.doesNotMatch(
+			text,
+			/(?:↑|↓|R)[0-9.]*$/,
+			`w=${w}: ends in a half number —— ${JSON.stringify(text)}`,
+		);
+	}
+	// Critical point: when the TOK segment fits, the NET segment before it must
+	// be complete (TOK must never squeeze NET out)
+	const withTok = segsText(plainLineSegs(opts, 120));
+	assert.match(withTok, /TOK /);
+	assert.match(withTok, /NET /);
+	assert.ok(
+		withTok.indexOf("NET ") < withTok.indexOf("TOK "),
+		"NET must come before TOK (descending importance)",
+	);
+	// The relative order of the four segments is fixed
+	const idx = marks.map((m) => full.indexOf(m));
+	for (let i = 1; i < idx.length; i++)
+		assert.ok(
+			(idx[i] ?? -1) > (idx[i - 1] ?? -1),
+			`segment order wrong: ${marks.join(" → ")}`,
+		);
+});
+
+test("sweep: line mode keeps the first segment at any width (a blank line makes people think the extension died)", () => {
+	// With a snapshot the first segment is CPU, without one it's TOK — neither
+	// may ever be empty.
+	const withSnap = { snap: fakeSnap() };
+	const noSnap = {};
+	for (let w = 1; w <= 220; w++) {
+		assert.match(segsText(plainLineSegs(withSnap, w)), /CPU/, `w=${w}`);
+		assert.match(segsText(plainLineSegs(noSnap, w)), /TOK/, `w=${w} (no snapshot)`);
+	}
+});
+
+test("segsWidth: same accounting as visibleWidth (wide chars count as 2 columns)", () => {
+	assert.equal(segsWidth([{ text: "abc" }]), 3);
+	assert.equal(segsWidth([{ text: "你好" }]), 4);
+	assert.equal(segsWidth([{ text: "a" }, { text: "你" }, { text: "b" }]), 4);
+});
+
+test("plainLineSegs: non-finite widths must not degenerate into 'everything fits'", () => {
+	// Regression: `Math.max(1, Math.floor(NaN))` is still NaN, and
+	// `budget > NaN` is always false, which would return the whole line to the
+	// caller — once the caller trusts that budget it overflows (pi exits).
+	const opts = { snap: fakeSnap(), tpsNow: 12345, tokensIn: 1234567 };
+	for (const w of [Number.NaN, Number.POSITIVE_INFINITY, 0, -5]) {
+		const text = segsText(plainLineSegs(opts, w)).trimEnd();
+		assert.match(text, /CPU/, `w=${w} must still keep the first segment`);
+		assert.doesNotMatch(text, /TOK /, `w=${w} must not degenerate into the full line —— ${text}`);
+	}
 });

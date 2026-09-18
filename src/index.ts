@@ -4,6 +4,9 @@
  * By default the charts are hung **below** the editor via ctx.ui.setWidget
  * (`placement: "belowEditor"`); set `PI_SYSMON_PLACEMENT=above` to put them
  * above; footer mode can also replace the entire bottom bar.
+ * Both `chart` and `line` modes are widgets, so both follow `above`/`below`
+ * (`/sysmon line` used to go through `setStatus`, pinned to the bottom —
+ * that was a bug, now fixed).
  *
  * About the "is there a 10-line cap" question: pi's
  * `InteractiveMode.MAX_WIDGET_LINES = 10` only clips when `setWidget` receives
@@ -18,32 +21,40 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { computeLayout, renderPanel, type ThemeLike } from "./chart-panel.ts";
+import {
+	computeLayout,
+	renderPanel,
+	renderStyledLine,
+	type StyledLine,
+	type ThemeLike,
+} from "./chart-panel.ts";
 import {
 	buildBlocks,
+	parseMode,
 	parsePlacement,
+	plainLineSegs,
 	resolveWindow,
 	type History,
 	type LabelMode,
+	type Mode,
 	type Placement,
 } from "./blocks.ts";
 import { createTpsMeter } from "./tokens.ts";
-import {
-	createCollector,
-	fmtBytes,
-	fmtRate,
-	type Snapshot,
-} from "./metrics.ts";
+import { createCollector, type Snapshot } from "./metrics.ts";
 
-// ThemeLike is imported uniformly from chart-panel.ts, avoiding two diverging definitions
-type Mode = "chart" | "status" | "footer";
+// ThemeLike is imported uniformly from chart-panel.ts, avoiding two diverging definitions.
+// `Mode` and `Placement` live in blocks.ts (which owns the matching
+// `parseMode`/`parsePlacement`) and are re-exported here for legacy call sites.
+/**
+ * A host that can use the UI. The name dates back to the setStatus era (when
+ * it was also needed to clear the status line); now it's only used to mount
+ * widgets/footers.
+ */
 type UiHost = Pick<ExtensionCommandContext, "hasUI" | "ui">;
 
-const STATUS_KEY = "sysmon";
 const WIDGET_KEY = "sysmon-chart";
 
 /**
@@ -76,6 +87,25 @@ interface Cfg {
 	mode?: Mode;
 	placement?: Placement;
 }
+/**
+ * Read the mode name from the config file.
+ *
+ * Why this is separate from `parseMode`: `parseMode` falls back to `chart`
+ * for unknown values, while `undefined` here has its own meaning — "no mode
+ * written in the config" — in which case the initial value from
+ * `PI_SYSMON_MODE` should be kept instead of being overwritten by the
+ * fallback. So this only answers "is it a known mode name"; **the mapping
+ * itself still lives in exactly one place, `parseMode`** (writing the switch
+ * twice is the double-ledger this repo keeps criticizing).
+ */
+function cfgMode(v: unknown): Mode | undefined {
+	if (typeof v !== "string") return undefined;
+	const t = v.trim().toLowerCase();
+	return t === "chart" || t === "line" || t === "status" || t === "footer"
+		? parseMode(t)
+		: undefined;
+}
+
 function readCfg(): Cfg {
 	try {
 		const raw: unknown = JSON.parse(readFileSync(configPath(), "utf8"));
@@ -83,8 +113,8 @@ function readCfg(): Cfg {
 		const o = raw as Record<string, unknown>;
 		const c: Cfg = {};
 		if (typeof o.enabled === "boolean") c.enabled = o.enabled;
-		if (o.mode === "chart" || o.mode === "status" || o.mode === "footer")
-			c.mode = o.mode;
+		const m = cfgMode(o.mode);
+		if (m) c.mode = m;
 		if (o.placement === "aboveEditor" || o.placement === "belowEditor")
 			c.placement = o.placement;
 		return c;
@@ -203,12 +233,9 @@ export default function (pi: ExtensionAPI) {
 			: "title";
 	})();
 
-	let mode: Mode = (() => {
-		const m = process.env.PI_SYSMON_MODE;
-		return m === "status" || m === "footer" || m === "chart" ? m : "chart";
-	})();
+	let mode: Mode = parseMode(process.env.PI_SYSMON_MODE);
 
-	/** Whether the chart hangs below or above the editor (chart mode only; default below, can be restored/overridden by the config file) */
+	/** Whether the charts/text line hang below or above the editor (applies to both chart and line; default below) */
 	let placement: Placement = parsePlacement(process.env.PI_SYSMON_PLACEMENT);
 
 	const hist: History = {
@@ -259,7 +286,6 @@ export default function (pi: ExtensionAPI) {
 	let activeMode: Mode | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let snap: Snapshot | undefined;
-	let lastCtx: UiHost | undefined;
 
 	function sample() {
 		try {
@@ -355,21 +381,46 @@ export default function (pi: ExtensionAPI) {
 		return renderPanel(theme, blocks, width, layout, windowSecs);
 	}
 
-	const plainLine = (s: Snapshot, width: number): string => {
-		const cpu = `CPU ${s.cpuPct.toFixed(0)}%`;
-		const mem = `MEM ${s.memPct.toFixed(0)}% ${fmtBytes(s.memUsed)}`;
-		const net = `NET ↑${fmtRate(s.txBps)} ↓${fmtRate(s.rxBps)}`;
-		const tiers = [[cpu, mem, net], [cpu, mem], [cpu]];
-		for (const parts of tiers) {
-			const line = parts.join("  ");
-			if (visibleWidth(line) <= Math.max(24, Math.floor(width / 2))) return line;
-		}
-		return cpu;
-	};
+	/**
+	 * One line of text for `line` mode (`/sysmon line`) — returns **colored
+	 * segments**, which the caller hands to `renderStyledLine` to render into a
+	 * fixed-width single row.
+	 *
+	 * Why the string is no longer assembled here: that version of the
+	 * implementation mixed "data selection" and "rendering" together, had no
+	 * token readouts, and couldn't reuse the chart's exact wide-char/ANSI width
+	 * accounting. Now data lives in `blocks.ts`'s `plainLineSegs` (unit-testable),
+	 * and rendering lives in chart-panel.
+	 */
+	const plainLine = (width: number): StyledLine =>
+		plainLineSegs(
+			{
+				snap,
+				tpsNow: lastTps,
+				tokensIn: tokIn,
+				tokensOut: tokOut,
+				tokensCacheRead: tokCacheRead,
+			},
+			width,
+		);
 
-	/** Shared implementation of the chart component (widget and footer differ only in row budget) */
-	function makeChart(maxRows: number) {
+	/**
+	 * Shared component skeleton for all modes: installs the timer, samples each
+	 * frame, is disposable.
+	 *
+	 * The three modes (chart / line / footer) differ only in `render(width)`,
+	 * so the skeleton must exist exactly once — `line` used to run its own
+	 * `setInterval(push)` while the charts ran their own `setInterval` inside
+	 * the component factory; two timer-management styles (who calls `stop()`
+	 * when, which timer the `timer` variable points at) would drift sooner or
+	 * later. Now this is the only place that touches `timer`.
+	 */
+	function makeSampled(render: (theme: ThemeLike, width: number) => string[]) {
 		return (tui: { requestRender(): void }, theme: ThemeLike) => {
+			// When rebuilding a component, first stop any old timer that may still
+			// exist: `setWidget` calls the factory every time, while `stop()` clears
+			// the module-level `timer` — without this, two `setInterval`s would run
+			// simultaneously (double sampling + double rendering).
 			stop();
 			const localTimer = setInterval(() => {
 				sample();
@@ -377,30 +428,76 @@ export default function (pi: ExtensionAPI) {
 			}, intervalMs);
 			timer = localTimer;
 			return {
-				dispose: () => clearInterval(localTimer),
+				// dispose must be idempotent and **only clear its own timer**: pi calls
+				// dispose when replacing/removing a widget (by then the module-level
+				// `timer` may already point at the new component's timer, and a blind
+				// `stop()` would kill the new component's timer by mistake). After
+				// clearing, take the module-level alias back so `timer` never points
+				// at an already-cleared handle.
+				//
+				// Leak prevention doesn't rely on "dispose will definitely be
+				// called": pi does call it on session teardown/replacement
+				// (`agent-session-runtime.js`'s `dispose()`/`teardownCurrent()` →
+				// `beforeSessionInvalidate` → `resetExtensionUI` →
+				// `clearExtensionWidgets` → `widget.dispose?.()`), and
+				// `stop()`/`disable()` already clear once first; this also closes the
+				// window where "the old component is disposed later than the new
+				// component's factory runs".
+				// (Measured: after `/new` replaced the session, the charts kept
+				// refreshing — no stale timer leak.)
+				dispose: () => {
+					clearInterval(localTimer);
+					if (timer === localTimer) timer = undefined;
+				},
 				invalidate() {},
-				render: (width: number) => renderPanelFor(theme, width, maxRows),
+				render: (width: number) => render(theme, width),
 			};
 		};
 	}
+
+	/** The chart component (widget and footer differ only in row budget) */
+	const makeChart = (maxRows: number) =>
+		makeSampled((theme, width) => renderPanelFor(theme, width, maxRows));
+
+	/**
+	 * The component for `line` mode: always 1 row, content adapts to width.
+	 *
+	 * `setWidget` instead of `setStatus` is used to **follow placement**:
+	 * `setStatus` content is rendered by pi's built-in footer, pinned at the
+	 * bottom; a widget, on the other hand, can land above or below the editor,
+	 * matching chart mode's `/sysmon above|below`.
+	 * That's what makes the expectation "after `/sysmon below`, line should also
+	 * be at the bottom" hold.
+	 */
+	const makeLine = () =>
+		makeSampled((theme, width) => {
+			// **Must use the `width` given by the layout**: that's the number of
+			// columns actually available this frame; rendering wider is out of
+			// bounds, and out of bounds makes pi exit outright (the iron rule).
+			// Never fall back to `process.stdout.columns` — that's the **full
+			// terminal width**, while a widget's actual usable width can be narrower
+			// (container padding / other widgets in the same row), so hitting that
+			// fallback actually runs toward overflowing. `renderStyledLine` itself
+			// clamps non-finite values to 1, so this only needs to handle the floor.
+			return [renderStyledLine(theme, plainLine(width), width)];
+		});
 
 	function enable(ctx: UiHost): boolean {
 		if (!ctx.hasUI) return false;
 		stop();
 		sample();
 		activeMode = mode;
-		lastCtx = ctx;
 
 		if (mode === "status") {
-			const push = () => {
-				sample();
-				ctx.ui.setStatus(
-					STATUS_KEY,
-					snap ? plainLine(snap, process.stdout.columns || 80) : "sysmon …",
-				);
-			};
-			ctx.ui.setStatus(STATUS_KEY, "sysmon …");
-			timer = setInterval(push, intervalMs);
+			// Use a widget instead of `setStatus`: a widget's `placement` can
+			// follow chart mode (`/sysmon above|below`) above or below the editor,
+			// while `setStatus` content is forever pinned inside pi's built-in
+			// footer — that was the root cause of "the position doesn't match the
+			// charts".
+			//
+			// The row count is also consistent (always 1 row), so the editor
+			// doesn't shift.
+			ctx.ui.setWidget(WIDGET_KEY, makeLine(), { placement });
 			return true;
 		}
 
@@ -421,8 +518,11 @@ export default function (pi: ExtensionAPI) {
 		const was = activeMode;
 		activeMode = undefined;
 		if (!ctx.hasUI || was === undefined) return;
-		if (was === "status") ctx.ui.setStatus(STATUS_KEY, undefined);
-		else if (was === "chart") ctx.ui.setWidget(WIDGET_KEY, undefined);
+		// chart and status(line) share the same widget key (mutually exclusive,
+		// never both present), so cleanup for both is the same statement — don't
+		// write it as two else-ifs that look different but are equivalent.
+		if (was === "status" || was === "chart")
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		else ctx.ui.setFooter(undefined);
 	}
 
@@ -443,7 +543,13 @@ export default function (pi: ExtensionAPI) {
 			if (want === "above" || want === "below") {
 				placement = want === "below" ? "belowEditor" : "aboveEditor";
 				writeCfg({ enabled, mode, placement });
-				if (enabled && activeMode === "chart") {
+				// **Both chart and status(line) use placement** (status is now a widget
+				// too, no longer a setStatus pinned in the footer), so both must be
+				// re-mounted once.
+				// Checking only chart would leave the line in place after
+				// `/sysmon above` — that's the other entry point of "the position
+				// doesn't match the charts".
+				if (enabled && (activeMode === "chart" || activeMode === "status")) {
 					disable(ctx);
 					enabled = enable(ctx);
 				}
@@ -463,6 +569,15 @@ export default function (pi: ExtensionAPI) {
 			let explicit: boolean | undefined;
 			if (want === "on") explicit = true;
 			else if (want === "off") explicit = false;
+
+			// Explicitly naming a mode = **idempotent "switch to this mode and turn
+			// on"**, not a toggle.
+			// The old logic, when "already in this mode", fell into the
+			// `target = !enabled` branch below and turned the monitor **off**
+			// (`/sysmon line` in line mode reported "off (remembered)"),
+			// directly contradicting the README's "line = single-line text mode"
+			// semantics.
+			if (newMode) explicit = true;
 
 			if (enabled && newMode && newMode !== activeMode) {
 				disable(ctx);
@@ -541,8 +656,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		stop();
-		if (activeMode === "status" && lastCtx?.hasUI)
-			lastCtx.ui.setStatus(STATUS_KEY, undefined);
 		activeMode = undefined;
 	});
 }

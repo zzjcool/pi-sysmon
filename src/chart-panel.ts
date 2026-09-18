@@ -514,6 +514,45 @@ function truncateRow(row: Row, maxCells: number): Row {
 	return out;
 }
 
+/**
+ * Render a colored text line into a single-row string of **exactly width columns**
+ * (overflow truncated with `…`, shortfall padded with spaces).
+ *
+ * Why it exists: `line` mode (`/sysmon line`) must share the same width and
+ * color discipline as the charts, and "assemble a string yourself + padEnd"
+ * is exactly the pit this repo has fallen into — multi-byte characters get
+ * their column width miscounted, and once any row exceeds the terminal width
+ * pi throws and exits. This reuses the chart's internal cell model
+ * (`segsToRow` / `truncateRow` / `paint`), so:
+ *  · wide characters (CJK/emoji) are measured by display columns and keep
+ *    their placeholder cell;
+ *  · truncation never cuts a wide character off its placeholder cell;
+ *  · space-only segments aren't painted (avoiding a pile of escape sequences
+ *    every frame).
+ *
+ * The returned string **already contains ANSI** and can be handed directly to
+ * a `setWidget` component for rendering.
+ */
+export function renderStyledLine(
+	theme: ThemeLike,
+	segs: StyledLine,
+	width: number,
+): string {
+	const w = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+	const row = truncateRow(segsToRow(segs), w);
+	// Pad with spaces: constant row count + constant row width, so the editor
+	// doesn't shift up and down (ARCHITECTURE pitfall 2)
+	while (row.length < w) row.push({ ch: " " });
+	return paint(theme, row);
+}
+
+/** Display width of a styled line (uses pi-tui's `visibleWidth`, so wide chars/ANSI are measured the same way as at render time) */
+export function segsWidth(segs: StyledLine): number {
+	let n = 0;
+	for (const s of segs) n += visibleWidth(s.text);
+	return n;
+}
+
 /* ------------------------------------------------------------------ */
 /* Tick specs                                                          */
 /* ------------------------------------------------------------------ */

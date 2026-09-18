@@ -6,7 +6,7 @@
 
 CPU · Memory · Network · Tokens — real-time history curves drawn with braille dot-matrix characters
 
-[![test](https://img.shields.io/badge/tests-92%2F92-brightgreen)](#testing)
+[![test](https://img.shields.io/badge/tests-102%2F102-brightgreen)](#testing)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="Four charts side by side: CPU / Memory / Network / Tokens" width="100%">
@@ -128,14 +128,39 @@ pi install git:github.com/zzjcool/pi-sysmon
 
 ## Usage
 
-```
+```text
 /sysmon                toggle on / off (persisted)
 /sysmon on | off       explicit on / off
 /sysmon chart          chart mode (default)
-/sysmon below|above    place the chart below (default) / above the editor (persisted)
-/sysmon line           single-line text mode
+/sysmon below|above    place the charts / line below (default) / above the editor (persisted)
+/sysmon line           single-line text mode (the `CPU … TOK …` line)
 /sysmon footer         replace the entire footer with the charts (can be taller than widget mode)
 ```
+
+`chart` / `line` are **mutually exclusive display modes** (naming a mode switches to it and turns the monitor on — it never turns the monitor off); `on` / `off` / `above` / `below` are orthogonal to the mode.
+
+### What line mode shows
+
+One line, in descending order of importance; when it doesn't fit, whole segments are dropped **from the tail** (never cutting a number in half, e.g. no `↑1.0` stubs):
+
+```text
+CPU 12%  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
+└─ system metrics ──────────────────────┘ └─ LLM tokens ────────────────┘
+```
+
+- **CPU / MEM / NET** come from the same sources and use the same colors as the corresponding chart-mode blocks;
+- **TOK** is LLM token throughput: `~<rate>` (estimated from streaming deltas, hence the `~`)
+  plus the session-cumulative `↑input ↓output RcacheRead` (from the **exact** `usage` of
+  `message_end`, byte-aligned with pi footer's `↑↓R` convention, so it can be checked directly
+  against the bottom line);
+- Without a snapshot (non-Linux / `/proc` unreadable) the TOK segment is still emitted — it's
+  the only metric that doesn't depend on `/proc`.
+
+`line` is implemented as a **widget** rather than `setStatus`, so it follows `above`/`below`
+just like the charts: after `/sysmon below`, the charts and the line appear at **the same
+position**.
+(`setStatus` content is always rendered by pi's built-in footer, pinned at the bottom — that
+can't be changed.)
 
 The charts lay out **responsively** by terminal width (using the default four charts as an example):
 
@@ -169,8 +194,8 @@ second group has a single block plus a full row of blanks.
 | `PI_SYSMON_LABEL` | `title` | Reading placement: `title` (border title bar) / `box` (top-right floating box) / `both` / `none` |
 | `PI_SYSMON_WINDOW` | `60` | Horizontal time-window length (seconds) |
 | `PI_SYSMON_SCALE_WINDOW` | `1` (= scale window == display window) | **Scale sampling ratio** for rate charts: `1` = top of y-axis is the true window maximum; set `<1` (e.g. `1/6`) to enable "auto-falloff about 10s after a spike passes" (spikes beyond the scale then show as `+` markers) |
-| `PI_SYSMON_MODE` | `chart` | Initial mode |
-| `PI_SYSMON_PLACEMENT` | `belowEditor` | Whether the charts hang **below** (default) or **above** the editor: `belowEditor` / `aboveEditor` (also switchable anytime via `/sysmon below` / `/sysmon above`, persisted) |
+| `PI_SYSMON_MODE` | `chart` | Initial mode (`chart` / `line` / `footer`) |
+| `PI_SYSMON_PLACEMENT` | `belowEditor` | Whether `chart` / `line` hang **below** (default) or **above** the editor: `belowEditor` / `aboveEditor` (also switchable anytime via `/sysmon below` / `/sysmon above`, persisted; `footer` mode is unaffected) |
 | `PI_SYSMON_TOKENS` | on | LLM token throughput chart. Set `0` to return to the old three-chart form |
 | `PI_SYSMON_DISKS` | — | Set `1` to add a disk I/O chart (the 5th block) |
 
@@ -269,7 +294,7 @@ widths (the `┌ CPU ─ 1.91 1.80 2.17 ───┐` kind). For example:
 ## Testing
 
 ```bash
-npm test          # 92 unit tests (braille 13 + layout 56 + tokens 23)
+npm test          # 102 unit tests (braille 13 + layout 66 + tokens 23)
 ```
 
 ```bash
@@ -286,6 +311,11 @@ summing exactly to the total, constant row count) plus **two hard constraints th
 or misalign pi**: across the full width range 8..220 columns × multiple heights and block counts,
 it asserts no row's visible width overflows and the row count matches the layout's claim — these
 sweep the whole width range rather than spot-checking a few widths.
+
+`line` mode is swept across the full width range here too: `plainLineSegs` +
+`renderStyledLine` must render at **exactly** the declared width across 8..220 columns (one
+column over and pi exits), must not throw even when squeezed to 1 column, and the CPU segment
+is always kept.
 
 `test/tokens.test.ts` covers token estimation (English `chars/4`, per-character CJK, emoji count
 as one, non-string defenses), the drain semantics of per-second buckets (backlog during an off

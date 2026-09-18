@@ -617,6 +617,37 @@ pendingMessages → status → [widgetsAbove] → editor → [widgetsBelow] → 
 这是 pi 的布局行为，扩展侧无法插空行 —— 除非在组件首行自己输出一个空行，
 但那会多占一行高度。保持与 pi 原生行为一致，不自作主张。
 
+### `line` 模式也是 widget，不是 `setStatus`
+
+一行文字模式最早用 `ctx.ui.setStatus(key, text)`，这是错的，两个独立原因：
+
+1. **它不认 `placement`。** `setStatus` 的内容由 pi **内建** footer 渲染
+   （`footer.js` 把所有扩展状态拼成第三行 footer），所以它被钉在屏幕最底部。
+   `/sysmon below` 只会挪图表、文字行留在原地 —— 这就是被报的「位置和图表对不上」。
+   `setWidget(..., { placement })` 用的是与图表同一个 dock 槽位
+   （`widgetsAbove` / `widgetsBelow`），所以两种模式现在都跟随 `above`/`below`。
+   真机抓帧验证：`belowEditor` 时图表占 32–39 行、line 占 33 行；`aboveEditor`
+   时两者都移到编辑器上侧。
+2. **它要和其他扩展共享一行。** `footer.js` 把**所有**扩展状态用空格拼起来再截断
+   —— 就是 README 里的坑 5。widget 是我们自己的。
+
+代价：`line` 模式现在每帧占一个 dock 行，而不是住在 footer 里。
+但这本来就是它之前占的那一行（footer 第三行），而且高度恒定（恰 1 行），
+所以不会造成编辑器位移。
+
+### `line` 的内容是分级片段，不是选定的字符串
+
+旧实现按 `visibleWidth` 在三段硬编码文案里选一段 —— 要么全有要么全无，
+而且完全没有 token 读数（被报的缺失）。现在 `plainLineSegs` 返回按重要度排序的
+`StyledLine`（CPU → MEM → NET → TOK），从**尾部整段丢弃**直到放得下，
+所以窄终端绝不会显示 `↑1.0` 这种被咬掉一半的数字。第一个段永不丢：
+空行会让人以为扩展挂了。
+
+渲染走 `chart-panel.ts` 的 `renderStyledLine`，它复用与图表相同的单元格模型
+（`segsToRow` → `truncateRow` → `paint`）。这是故意的：手写 `padEnd` 正是让一行
+多出一列并把 pi 一起拖下水的典型方式（坑 1），而单元格模型已经正确处理了
+宽字符、ANSI、零宽组合字符。
+
 ## 非 Linux 的行为
 
 所有 `/proc`、`/sys` 读取都包在 try/catch 里，失败时退化为零值

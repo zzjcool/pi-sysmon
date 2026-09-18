@@ -10,9 +10,12 @@
 import {
 	percentAxis,
 	rateAxis,
+	segsWidth,
 	type AxisSpec,
 	type MetricBlock,
+	type Seg,
 	type StyledLine,
+	type ThemeColor,
 } from "./chart-panel.ts";
 import { fmtBytes, fmtRate, type Snapshot } from "./metrics.ts";
 // The TPS formatter lives in the tokens module (the rightful home of anything
@@ -122,9 +125,11 @@ export type LabelMode = "title" | "box" | "both" | "none";
  * Whether the chart widget hangs above or below the editor.
  *
  * Maps to pi's official `setWidget(key, content, { placement })`
- * (`WidgetPlacement` has been public API since 0.8x). Only `chart` mode uses it —
- * `footer` mode replaces the whole bottom (which is below the editor anyway),
- * and `status` mode is just a status line.
+ * (`WidgetPlacement` has been public API since 0.8x). Both `chart` and
+ * `status` (i.e. `/sysmon line`) modes use it: both are widgets, so both can
+ * land above or below the editor.
+ * `footer` mode is not affected — it replaces the whole bottom, which is
+ * below the editor anyway.
  */
 export type Placement = "aboveEditor" | "belowEditor";
 
@@ -150,14 +155,36 @@ export function parsePlacement(v: string | undefined): Placement {
 		: "belowEditor";
 }
 
+/** The three display modes. `status` is the internal name of `line` (historical reasons, see `parseMode`). */
+export type Mode = "chart" | "status" | "footer";
+
 /**
- * Short format for session-cumulative output tokens (`1.2M` / `345K` / `1200`).
+ * Parse a mode name (shared by `PI_SYSMON_MODE` and the config file).
  *
- * It doesn't feed chart scales, so no fixed width needed; but it must have an
- * upper bound, otherwise a very long session's cumulative value would blow up
- * the title row (exceeding width = pi crashes). Base 1000 (tokens are a
- * decimal quantity).
+ * **Both `line` and `status` are accepted**, returning the internal `status`.
+ * This leniency matters: in the external docs (README) this mode is called
+ * `line` (matching `/sysmon line`), while the internal `Mode` is `status` —
+ * if only the internal name were recognized, a user writing
+ * `PI_SYSMON_MODE=line` per the docs would be **silently ignored** (falling
+ * back to chart), and likewise for `line` in the config file.
+ * Consistent with the error tolerance of `parsePlacement` / `PI_SYSMON_LABEL`:
+ * a misconfigured value shouldn't break the extension, but a value that is
+ * *documented* must work.
+ *
+ * Unknown/empty values fall back to the default `chart`.
  */
+export function parseMode(v: string | undefined): Mode {
+	switch ((v ?? "").trim().toLowerCase()) {
+		case "line":
+		case "status":
+			return "status";
+		case "footer":
+			return "footer";
+		default:
+			return "chart";
+	}
+}
+
 /**
  * Format a token count.
  *
@@ -188,22 +215,127 @@ export function tail(arr: number[], n: number): number[] {
 }
 
 /**
- * Y axis for the TPS chart — same algorithm as `rateAxis` (scale = max × 1.5,
- * only the top value labeled, fixed width `RATE_GUTTER` columns), but the
- * **unit is tokens, not bytes**.
+ * Input for `line` mode (`/sysmon line`).
  *
- * Why not just use `rateAxis`: it hardcodes the 1024 base and the `B/KB/MB`
- * suffixes; using it for tok/s would print scales like `2.2KB` (1500 tok/s) —
- * wrong units. A chart saying KB when it's really tokens is worse than no scale.
- *
- * 1K = 1000 (not 1024): token counts are a decimal quantity, and token counts
- * in API billing are decimal too (`total_tokens`), so no binary conversion.
- *
- * Scale floor: `MIN_TPS_SCALE`. Without it, a 1 tok/s tail point during idle
- * would pin the scale at 1.5, and the next reply at 200 tok/s would slam the
- * ceiling. With the floor the scale starts at 10 tok/s; the curve still hugs
- * the bottom, but one noise point can't compress the entire scale.
+ * Shares the same data sources as chart mode, so the field names match
+ * `buildBlocks`'s `BlockOptions` / `History`
+ * (`tpsNow` / `tokensIn` / `tokensOut` / `tokensCacheRead`) — the same
+ * quantity under two names in two modes would drift sooner or later.
  */
+export interface LineOptions {
+	/** System snapshot; `undefined` means collection failed (non-Linux / /proc unreadable) */
+	snap?: Snapshot;
+	/** Current TPS (tok/s), fed by the meter in `src/tokens.ts` */
+	tpsNow?: number;
+	/** Session-cumulative uplink tokens (exact `usage.input`) */
+	tokensIn?: number;
+	/** Session-cumulative downlink tokens (exact `usage.output`) */
+	tokensOut?: number;
+	/** Session-cumulative cache-read tokens (exact `usage.cacheRead`) */
+	tokensCacheRead?: number;
+}
+
+/** Segment construction helper: saves every readout from writing `{ text, color }` in full */
+const seg = (text: string, color?: ThemeColor): Seg => ({ text, color });
+
+/**
+ * The text line of `line` mode — returns **tiered segments**; when width runs
+ * out, whole segments are dropped from the tail.
+ *
+ * ## Why not just return a string
+ *
+ * The old implementation assembled a string itself + checked length with
+ * `visibleWidth`, and had two real problems:
+ *  1. No tokens (a gap the user explicitly called out);
+ *  2. Once a wording tier was chosen the line was fixed — **a widening
+ *     terminal would not add information back** — and what got dropped was a
+ *     whole tier (all or nothing), not "degrade by importance".
+ *
+ * Now it's "a segment sequence sorted by importance + dropping whole segments
+ * from the tail":
+ *  · Descending importance: CPU → MEM → NET → Tokens (rate and cumulative);
+ *  · Each segment carries its own color, **same name, same color** as chart
+ *    mode, so the two modes can be cross-checked against each other;
+ *  · Truncation only happens when the whole line doesn't fit, and **never cuts
+ *    a segment's text in half** (whole segments are dropped), avoiding
+ *    half-numbers like `CPU 12`.
+ *
+ * **Never returns empty**: the first group (CPU when there's a snapshot, TOK
+ * when there isn't) is kept no matter how narrow; over-width is left to
+ * `renderStyledLine` to truncate — a CPU readout with its tail cut off is
+ * better than a blank line (a blank line makes people think the extension
+ * died).
+ * So this function only produces "data + colors" and never touches ANSI.
+ */
+export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
+	// Non-finite widths must fall back to 1 first: `Math.max(1, Math.floor(NaN))`
+	// is still NaN, and the comparison below uses `joinedWidth(...) > w` — any
+	// comparison with NaN is false, so "everything fits" would return the
+	// **whole line** (instead of keeping only the first segment), and a caller
+	// trusting that width budget would overflow. Better conservative all the way.
+	const w = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+	const s = opts.snap;
+
+	// Descending importance, in whole "groups": never split inside a group.
+	// Two-space gap between groups (other footer extensions lay out the same
+	// way; it visually separates adjacent statuses).
+	const groups: StyledLine[] = [];
+
+	if (s) {
+		groups.push([
+			seg("CPU ", "muted"),
+			seg(`${s.cpuPct.toFixed(0)}%`, "success"),
+		]);
+		groups.push([
+			seg("MEM ", "muted"),
+			seg(`${s.memPct.toFixed(0)}%`, "warning"),
+			seg(` ${fmtBytes(s.memUsed)}`, "muted"),
+		]);
+		groups.push([
+			seg("NET ", "muted"),
+			seg(`↑${fmtRate(s.txBps)}`, "warning"),
+			seg(` ↓${fmtRate(s.rxBps)}`, "accent"),
+		]);
+	}
+
+	// Token group: same convention as chart mode's `Tokens` block (current rate + session cumulative).
+	// Emitted **even without a snapshot** — TPS doesn't depend on /proc; it's the
+	// only metric that still means anything on non-Linux.
+	const tps = opts.tpsNow ?? 0;
+	const tokIn = opts.tokensIn ?? 0;
+	const tokOut = opts.tokensOut ?? 0;
+	const tokR = opts.tokensCacheRead ?? 0;
+	const tokSegs: StyledLine = [
+		seg("TOK ", "muted"),
+		seg(`~${fmtTps(tps)}`, "accent"),
+	];
+	// Cumulative initials `↑`/`↓`/`R` match pi's built-in footer in character and order, directly comparable
+	if (tokIn > 0) tokSegs.push(seg(` ↑${fmtTokensTotal(tokIn)}`, "muted"));
+	if (tokOut > 0) tokSegs.push(seg(` ↓${fmtTokensTotal(tokOut)}`, "muted"));
+	if (tokR > 0) tokSegs.push(seg(` R${fmtTokensTotal(tokR)}`, "muted"));
+	groups.push(tokSegs);
+
+	const joinedWidth = (gs: StyledLine[]): number =>
+		gs.reduce((acc, g) => acc + segsWidth(g), 0) + Math.max(0, gs.length - 1) * 2;
+
+	// Drop whole groups from the tail until it fits. **The first group is always
+	// kept**: with a snapshot it's CPU (the shortest and most important),
+	// without one it's TOK.
+	// It's not dropped even if it alone overflows — what the caller renders then
+	// is a truncated readout line rather than a blank one (a blank line makes
+	// people think the extension died).
+	let keep = groups.length;
+	while (keep > 1 && joinedWidth(groups.slice(0, keep)) > w) keep--;
+	const kept = groups.slice(0, keep);
+
+	const out: StyledLine = [];
+	kept.forEach((g, i) => {
+		if (i > 0) out.push(seg("  "));
+		out.push(...g);
+	});
+	return out;
+}
+
 /**
  * Scale floor for the TPS chart (tok/s). Without it, a 1 tok/s tail point
  * during idle would pin the scale at 1.5 and the next 200 tok/s reply would

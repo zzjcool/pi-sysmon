@@ -34,9 +34,9 @@ test("estimate: pure Chinese == character count (1 token per char)", () => {
 test("estimate: every CJK range (kana/hangul/punctuation/ideographic space) counts as 1 token", () => {
 	assert.equal(estimateDeltaTokens("こんにちは"), 5); // U+3040-30FF
 	assert.equal(estimateDeltaTokens("안녕하세요"), 5); // U+AC00-D7AF
-	assert.equal(estimateDeltaTokens("　"), 1); // U+3000 表意空格
-	assert.equal(estimateDeltaTokens("。"), 1); // U+3002 CJK 句号
-	assert.equal(estimateDeltaTokens("豈"), 1); // U+F900 兼容表意文字
+	assert.equal(estimateDeltaTokens("　"), 1); // U+3000 ideographic space
+	assert.equal(estimateDeltaTokens("。"), 1); // U+3002 CJK full stop
+	assert.equal(estimateDeltaTokens("豈"), 1); // U+F900 CJK compatibility ideograph
 });
 
 test("estimate: mixed CJK/ASCII = ceil(others/4) + CJK", () => {

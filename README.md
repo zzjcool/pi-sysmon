@@ -117,14 +117,36 @@ pi install git:github.com/zzjcool/pi-sysmon
 
 ## 使用
 
-```
+```text
 /sysmon                开 / 关（会持久化）
 /sysmon on | off       显式开 / 关
 /sysmon chart          图表模式（默认）
-/sysmon below|above    图表放编辑器下方（默认）/ 上方（持久化）
-/sysmon line           一行文字模式
+/sysmon below|above    图表 / line 放编辑器下方（默认）/ 上方（持久化）
+/sysmon line           一行文字模式（下方那条 `CPU … TOK …`）
 /sysmon footer         用图表替换整个底部（可以比 widget 模式更高）
 ```
+
+`chart` / `line` 是**互斥的显示模式**（点某个模式名 = 切过去并打开，不会把监控关掉）；
+`on` / `off` / `above` / `below` 与模式正交。
+
+### line 模式显示什么
+
+一行、按重要度降序、放不下时从**尾部整段**丢弃（不会切出 `↑1.0` 这种半截数字）：
+
+```text
+CPU 12%  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
+└─ 系统指标 ─────────────────────────┘ └─ LLM token ──────────────────┘
+```
+
+- **CPU / MEM / NET** 与图表模式的对应块同源、同配色；
+- **TOK** 是 LLM token 吞吐：`~<速率>`（由流式 delta 估算，所以带 `~`）
+  加会话累计的 `↑input ↓output RcacheRead`（来自 `message_end` 的**精确** usage，
+  逐字对齐 pi footer 的 `↑↓R` 口径，可以直接和底部那行对照）；
+- 无快照（非 Linux / `/proc` 不可读）时仍会输出 TOK 段 —— 它是唯一不依赖 `/proc` 的指标。
+
+`line` 用 **widget** 实现而不是 `setStatus`，所以它和图表一样遵循 `above`/`below`：
+`/sysmon below` 后图表与 line 会出现在**同一个位置**。
+（`setStatus` 的内容永远被 pi 内建 footer 渲染，位置钉死在底部，改不了。）
 
 图表按终端宽度**响应式**排版（以默认四图为例）：
 
@@ -156,8 +178,8 @@ pi install git:github.com/zzjcool/pi-sysmon
 | `PI_SYSMON_LABEL` | `title` | 读数位置：`title`（边框标题栏）/ `box`（右上角浮框）/ `both` / `none` |
 | `PI_SYSMON_WINDOW` | `60` | 横轴时间窗长度（秒） |
 | `PI_SYSMON_SCALE_WINDOW` | `1`（= 量程窗 == 显示窗） | 速率图**量程取样比例**：`1` = y 轴顶端为整窗真实最高值；设 `<1`（如 `1/6`）开启「尖峰过去约 10s 后自动回落」（此时超出量程的尖峰会显示为 `+` 标记） |
-| `PI_SYSMON_MODE` | `chart` | 初始模式 |
-| `PI_SYSMON_PLACEMENT` | `belowEditor` | 图表挂在编辑器**下方**（默认）还是**上方**：`belowEditor` / `aboveEditor`（也可用 `/sysmon below` / `/sysmon above` 随时切换，会持久化） |
+| `PI_SYSMON_MODE` | `chart` | 初始模式（`chart` / `line` / `footer`） |
+| `PI_SYSMON_PLACEMENT` | `belowEditor` | `chart` / `line` 挂在编辑器**下方**（默认）还是**上方**：`belowEditor` / `aboveEditor`（也可用 `/sysmon below` / `/sysmon above` 随时切换，会持久化；`footer` 模式不受影响） |
 | `PI_SYSMON_TOKENS` | 开 | LLM token 吞吐图。设 `0` 回到旧的三图形态 |
 | `PI_SYSMON_DISKS` | — | 设 `1` 再加一块磁盘 I/O 图（第 5 块） |
 
@@ -249,7 +271,7 @@ pi 单独测试与复用；`metrics.ts` 只负责读数，不关心怎么显示�
 ## 测试
 
 ```bash
-npm test          # 92 项单元测试（braille 13 + layout 56 + tokens 23）
+npm test          # 102 项单元测试（braille 13 + layout 66 + tokens 23）
 ```
 
 ```bash
@@ -263,6 +285,10 @@ npm run check     # 两者都跑
 `test/layout.test.ts` 覆盖响应式布局（列数断点、列宽之和恒等于总宽、行数恒定）
 以及**两条会让 pi 崩掉/错位的硬约束**：对 8..220 列全宽度 × 多个高度与块数组合，
 断言每行可见宽度不越界、行数与布局声明一致 —— 这两条是扫全宽度而不是抽查几个宽度。
+
+`line` 模式也在这里扫全宽度：`plainLineSegs` + `renderStyledLine` 在 8..220 列下
+渲染宽度必须**恰好等于**声明宽度（多一列就 pi 退出），且窄到 1 列也不抛异常、
+CPU 段永远保留。
 
 `test/tokens.test.ts` 覆盖 token 估算（英文 `chars/4`、CJK 逐字、emoji 算一个、
 非字符串防御）、每秒桶的排空语义（关闭期积压不得变成假尖峰），

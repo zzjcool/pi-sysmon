@@ -23,14 +23,18 @@ import {
 	RATE_GUTTER,
 	rateAxis,
 	renderPanel,
+	renderStyledLine,
+	segsWidth,
 	MIN_BLOCK_W,
 	type MetricBlock,
+	type StyledLine,
 	type ThemeLike,
 } from "../src/chart-panel.ts";
 import {
 	buildBlocks,
 	fmtTokensTotal,
 	parsePlacement,
+	plainLineSegs,
 	resolveWindow,
 	tokenAxis,
 	DEFAULT_SCALE_WINDOW_FRAC,
@@ -1755,4 +1759,195 @@ test("并排拼接：每块贡献的宽度恰好等于 layout.widths[i]", () => 
 		acc += w;
 	}
 	assert.equal(acc, 150);
+});
+
+/* ------------------------------------------------------------------ */
+/* 4. line 模式（/sysmon line）：内容 + 宽度硬约束                     */
+/* ------------------------------------------------------------------ */
+
+/** 把带色片段拼成纯文本（丢掉颜色），便于断言内容 */
+const segsText = (segs: StyledLine): string => segs.map((s) => s.text).join("");
+
+test("plainLineSegs: 含 token 读数（速率 + 会话累计），且与图表同口径", () => {
+	const segs = plainLineSegs(
+		{
+			snap: fakeSnap(),
+			tpsNow: 1234,
+			tokensIn: 5671,
+			tokensOut: 89,
+			tokensCacheRead: 2700,
+		},
+		200,
+	);
+	const text = segsText(segs);
+	assert.match(text, /CPU 37%/);
+	assert.match(text, /MEM 52%/);
+	assert.match(text, /NET/);
+	// 旧实现完全没有 token —— 这条就是回归防线
+	assert.match(text, /TOK/);
+	assert.match(text, /~1\.2Kt\/s/); // fmtTps(1234)
+	assert.match(text, /↑5\.7k/); // 与 pi footer 的 formatTokens 同口径（小写 k）
+	assert.match(text, /↓89/);
+	assert.match(text, /R2\.7k/);
+});
+
+test("plainLineSegs: 无快照时仍输出 token 行（非 Linux 上唯一有意义的指标）", () => {
+	const segs = plainLineSegs({ tpsNow: 42 }, 200);
+	const text = segsText(segs);
+	assert.match(text, /TOK/);
+	assert.match(text, /~42t\/s/);
+	// 没有系统快照就不该编造 CPU/MEM 读数
+	assert.doesNotMatch(text, /CPU/);
+});
+
+test("扫描: line 模式任意宽度下渲染宽度恰好等于声明宽度（越界会让 pi 退出）", () => {
+	for (const w of Array.from({ length: 220 }, (_, i) => i + 1)) {
+		for (const theme of [ansiTheme, plainTheme]) {
+			const segs = plainLineSegs(
+				{
+					snap: fakeSnap(),
+					tpsNow: 12345,
+					tokensIn: 1234567,
+					tokensOut: 987654,
+					tokensCacheRead: 543210,
+				},
+				w,
+			);
+			const line = renderStyledLine(theme, segs, w);
+			assert.equal(
+				visibleWidth(line),
+				w,
+				`w=${w}: 渲染宽度 ${visibleWidth(line)} ≠ ${w}`,
+			);
+		}
+	}
+});
+
+test("扫描: 宽字符/零宽字符片段端到端不越界、不把宽字符切半", () => {
+	// 这条盯的是「plainLineSegs 的预算口径」与「renderStyledLine 的实际渲染口径」
+	// 目前必须一致（目前是巧合级的：数据全 ASCII）。直接把含 CJK/emoji/组合字符
+	// 的片段喂进渲染器扫宽度，把这条口径钉死。
+	const cases: StyledLine[] = [
+		[{ text: "你好世界你好世界", color: "accent" }],
+		[
+			{ text: "CPU ", color: "muted" },
+			{ text: "你好", color: "success" },
+		],
+		[{ text: "e\u0301\u200bx", color: "muted" }],
+		[{ text: "🙂🙂🙂", color: "warning" }],
+		[
+			{ text: "CPU 12%  ", color: "muted" },
+			{ text: "内存 60%", color: "warning" },
+			{ text: "  🙂", color: "accent" },
+		],
+	];
+	for (const w of Array.from({ length: 60 }, (_, i) => i + 1)) {
+		for (const segs of cases) {
+			for (const theme of [ansiTheme, plainTheme]) {
+				const line = renderStyledLine(theme, segs, w);
+				assert.equal(
+					visibleWidth(line),
+					w,
+					`w=${w} segs=${JSON.stringify(segs.map((s) => s.text))}`,
+				);
+			}
+		}
+	}
+});
+
+test("扫描: line 模式极端/非有限宽度不抛异常且不越界", () => {
+	// `renderStyledLine` 对非有限宽度有防御分支（钳到 1），这条把它钉住。
+	// 0/负数/NaN/Infinity 都必须得到一个有限宽度的行。
+	for (const w of [0, -1, -100, Number.NaN, Number.POSITIVE_INFINITY]) {
+		const line = renderStyledLine(
+			ansiTheme,
+			plainLineSegs({ snap: fakeSnap() }, w),
+			w,
+		);
+		const lw = visibleWidth(line);
+		assert.ok(Number.isFinite(lw), `w=${w} 产出宽度非有限`);
+		assert.ok(lw >= 1, `w=${w} 产出宽度 ${lw} < 1`);
+		assert.doesNotMatch(line, /NaN|undefined/, `w=${w}`);
+	}
+});
+
+test("扫描: line 模式极窄宽度不抛异常且不越界", () => {
+	// 终端被压到 1 列时也必须稳定（补空格到 w 列、不越界、不产生 NaN 字符）
+	for (const w of [1, 2, 3, 5, 8, 12, 20]) {
+		const line = renderStyledLine(
+			ansiTheme,
+			plainLineSegs({ snap: fakeSnap() }, w),
+			w,
+		);
+		assert.equal(visibleWidth(line), w, `w=${w}`);
+	}
+});
+
+test("plainLineSegs: 宽度不够时只丢整段，结果永远是完整段的拼接（不切碎数字）", () => {
+	const opts = {
+		snap: fakeSnap(),
+		tpsNow: 12345,
+		tokensIn: 1234567,
+		tokensOut: 987654,
+		tokensCacheRead: 543210,
+	};
+	const full = segsText(plainLineSegs(opts, 500));
+	// 先找到四个段的边界：每段的起点文本
+	const marks = ["CPU ", "MEM ", "NET ", "TOK "];
+	// 对每个宽度：结果必须是 full 的前缀（去尾空格），且在某个「段边界」上结束
+	for (let w = 1; w <= 120; w++) {
+		const text = segsText(plainLineSegs(opts, w)).trimEnd();
+		assert.ok(
+			full.startsWith(text),
+			`w=${w}: 不是前缀 —— ${JSON.stringify(text)}`,
+		);
+		// 结尾不可能停在一个不完整的 token 数字上（如 `↑1.2M` 中间）
+		assert.doesNotMatch(
+			text,
+			/(?:↑|↓|R)[0-9.]*$/,
+			`w=${w}: 结尾是半截数字 —— ${JSON.stringify(text)}`,
+		);
+	}
+	// 临界点：TOK 段能放下时，它前面的 NET 段必须完整（不会出现 TOK 挤掉 NET）
+	const withTok = segsText(plainLineSegs(opts, 120));
+	assert.match(withTok, /TOK /);
+	assert.match(withTok, /NET /);
+	assert.ok(
+		withTok.indexOf("NET ") < withTok.indexOf("TOK "),
+		"NET 必须排在 TOK 之前（重要度降序）",
+	);
+	// 四个段的相对顺序固定
+	const idx = marks.map((m) => full.indexOf(m));
+	for (let i = 1; i < idx.length; i++)
+		assert.ok(
+			(idx[i] ?? -1) > (idx[i - 1] ?? -1),
+			`段顺序错：${marks.join(" → ")}`,
+		);
+});
+
+test("扫描: line 模式任意宽度都保留第一个段（空行会让人以为扩展挂了）", () => {
+	// 有快照时第一个段是 CPU、没快照时是 TOK —— 两者都不能空。
+	const withSnap = { snap: fakeSnap() };
+	const noSnap = {};
+	for (let w = 1; w <= 220; w++) {
+		assert.match(segsText(plainLineSegs(withSnap, w)), /CPU/, `w=${w}`);
+		assert.match(segsText(plainLineSegs(noSnap, w)), /TOK/, `w=${w} (无快照)`);
+	}
+});
+
+test("segsWidth: 与 visibleWidth 口径一致（宽字符按 2 列）", () => {
+	assert.equal(segsWidth([{ text: "abc" }]), 3);
+	assert.equal(segsWidth([{ text: "你好" }]), 4);
+	assert.equal(segsWidth([{ text: "a" }, { text: "你" }, { text: "b" }]), 4);
+});
+
+test("plainLineSegs: 非有限宽度不得退化成「全部放得下」", () => {
+	// 回归：`Math.max(1, Math.floor(NaN))` 仍是 NaN，而 `预算 > NaN` 恒为 false，
+	// 会让整个行被返回给调用方 —— 一旦调用方信任这个预算就会越界（pi 退出）。
+	const opts = { snap: fakeSnap(), tpsNow: 12345, tokensIn: 1234567 };
+	for (const w of [Number.NaN, Number.POSITIVE_INFINITY, 0, -5]) {
+		const text = segsText(plainLineSegs(opts, w)).trimEnd();
+		assert.match(text, /CPU/, `w=${w} 必须仍保留第一段`);
+		assert.doesNotMatch(text, /TOK /, `w=${w} 不得退化成完整行 —— ${text}`);
+	}
 });

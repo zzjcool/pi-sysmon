@@ -40,9 +40,15 @@ export interface Snapshot {
 	memUsed: number;
 	memTotal: number;
 	memPct: number;
+	/** 1/5/15 分钟平均负载（bottom 的 CPU 标题栏展示这三个值） */
 	load1: number;
+	load5: number;
+	load15: number;
 	rxBps: number;
 	txBps: number;
+	/** 累计流量（bottom 的 "All:" 列） */
+	rxTotal: number;
+	txTotal: number;
 	readBps: number;
 	writeBps: number;
 }
@@ -181,14 +187,21 @@ export function createCollector(): Collector {
 		lastDisk = disk;
 		lastTime = now;
 
+		const [l1 = 0, l5 = 0, l15 = 0] = os.loadavg();
+
 		return {
 			cpuPct,
 			memUsed: used,
 			memTotal: total,
 			memPct: total > 0 ? (100 * used) / total : 0,
-			load1: os.loadavg()[0] ?? 0,
+			load1: l1,
+			load5: l5,
+			load15: l15,
 			rxBps,
 			txBps,
+			// 累计值是计数器原始读数（不是速率），不受 dt 影响，可直接取用
+			rxTotal: net.rx,
+			txTotal: net.tx,
 			readBps,
 			writeBps,
 		};
@@ -206,6 +219,10 @@ export function fmtBytes(n: number): string {
 		v /= 1024;
 		i++;
 	}
+	// 超过 T 就夹住：计数器异常/溢出时会得到 `1e308` 这种值，
+	// 走 toFixed 会吐出 20+ 个字符（如 `9.094947017729282e+295T`），
+	// 而这段文本会直接进浮动读数框 —— 宽度暴涨会把框整块挤坏。
+	if (i === u.length - 1 && v >= 1000) return ">999T";
 	return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)}${u[i]}`;
 }
 

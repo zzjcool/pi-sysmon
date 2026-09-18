@@ -6,3 +6,4 @@ pi-sysmon.json
 *.local
 .idea/
 .vscode/
+.pi-subagents/

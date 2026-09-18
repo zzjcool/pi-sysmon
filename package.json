@@ -1,7 +1,7 @@
 {
 	"name": "pi-sysmon",
 	"version": "0.2.0",
-	"description": "bottom-style braille system monitor charts (CPU / memory / network) for the pi coding agent",
+	"description": "bottom-style braille system monitor charts (CPU / memory / network / LLM token throughput) for the pi coding agent",
 	"type": "module",
 	"license": "MIT",
 	"private": false,
@@ -14,12 +14,25 @@
 		"braille",
 		"charts",
 		"bottom",
+		"btm",
 		"cpu",
 		"memory",
+		"network",
+		"token",
+		"tps",
 		"terminal"
 	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/zzjcool/pi-sysmon.git"
+	},
+	"homepage": "https://github.com/zzjcool/pi-sysmon#readme",
+	"bugs": {
+		"url": "https://github.com/zzjcool/pi-sysmon/issues"
+	},
 	"files": [
 		"src",
+		"docs",
 		"README.md",
 		"LICENSE"
 	],
@@ -27,7 +40,7 @@
 		"extensions": ["./src/index.ts"]
 	},
 	"scripts": {
-		"test": "node --experimental-strip-types test/braille.test.ts",
+		"test": "node --experimental-strip-types --test 'test/*.test.ts'",
 		"typecheck": "tsc --noEmit",
 		"build:single": "node scripts/bundle-single-file.mjs",
 		"check": "npm run typecheck && npm test"

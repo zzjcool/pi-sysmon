@@ -49,7 +49,7 @@ CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史
   绘图面积比「刻度独占列 + 轴线独占行」的旧排版大 **~71%**
   （50 列宽、8 行高：168 格 → 288 格）
 - **读数写在边框标题栏里**（默认）—— 复用那行本来就有的 `─` 填充，零成本、不遮曲线；也可用 `PI_SYSMON_LABEL=box` 换回 bottom 的右上角浮框
-- **状态持久化** —— 开关和模式记在配置文件里，重启保留
+- **状态持久化** —— 显示偏好（模式 / 位置）与全局开关默认值记在配置文件里、重启保留；会话级的开关记在会话自身里
 - **多种显示模式** —— 图表（默认）/ 一行文字 / 整块底部
 - **纯 Linux 友好，其他平台不崩** —— 非 Linux 上采集自动退化为零值
 
@@ -120,16 +120,30 @@ pi install git:github.com/zzjcool/pi-sysmon
 ## 使用
 
 ```text
-/sysmon                开 / 关（会持久化）
-/sysmon on | off       显式开 / 关
-/sysmon chart          图表模式（默认）
-/sysmon below|above    图表 / line 放编辑器下方（默认）/ 上方（持久化）
-/sysmon line           一行文字模式（下方那条 `CPU … TOK …`）
-/sysmon footer         用图表替换整个底部（可以比 widget 模式更高）
+/sysmon                    开 / 关（**只影响当前会话**）
+/sysmon on | off           显式开 / 关（只影响当前会话）
+/sysmon global on | off    设置**新会话**的默认开关（同时立即作用于当前会话）
+/sysmon chart              图表模式（默认）
+/sysmon below|above        图表 / line 放编辑器下方（默认）/ 上方（持久化）
+/sysmon line               一行文字模式（显示 `CPU … TOK …` 的那一行；别名 `status`）
+/sysmon footer             用图表替换整个底部（可以比 widget 模式更高）
 ```
 
 `chart` / `line` 是**互斥的显示模式**（点某个模式名 = 切过去并打开，不会把监控关掉）；
 `on` / `off` / `above` / `below` 与模式正交。
+
+### 会话级 vs 全局级
+
+`/sysmon on|off` 是**会话级**的：写在当前会话自己的 entry 里，所以 `/resume` 回到这个会话时
+开关和离开时一模一样，而**其它会话、以后新开的会话都不受影响** —— 在某个项目里关掉，
+只在这个会话里关掉。
+
+`/sysmon global on|off` 把**新会话的默认值**写进 `<configDir>/pi-sysmon.json`，
+并立即作用于当前会话（否则「以后默认关」却眼睁睁看着图表还在跑，会让人以为命令坏了）。
+
+启动时的优先级：**会话选择 → `--sysmon` → 全局默认 → 内置默认（开）**。
+模式（`chart`/`line`/`footer`）与位置（`above`/`below`）仍是**全局显示偏好**，
+继续写在配置文件里 —— 否则每开一个会话都要重新选一遍图表。
 
 ### line 模式显示什么
 
@@ -185,7 +199,19 @@ CPU 12%  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
 | `PI_SYSMON_TOKENS` | 开 | LLM token 吞吐图。设 `0` 回到旧的三图形态 |
 | `PI_SYSMON_DISKS` | — | 设 `1` 再加一块磁盘 I/O 图（第 5 块） |
 
-开关状态写在 `<configDir>/pi-sysmon.json`（`configDir` 默认 `~/.pi/agent`）。
+开关有**两个作用域**，所以存两处：
+
+- `<configDir>/pi-sysmon.json`（`configDir` 默认 `~/.pi/agent`）存 `mode`、`placement`
+  以及**全局默认值** `enabled` —— 由 `/sysmon global on|off` 写入；
+- **当前会话**的开关是会话 entry，由 `/sysmon on|off` 写入，
+  因此 `/resume` 这个会话时能恢复，而又不会影响其它任何会话。
+
+`--sysmon` 命令行开关是「**本次启动强制打开**」—— 它盖过全局默认，但不盖过会话里
+手动输入的 `/sysmon off`（那是更具体的表达）。
+
+> **从 0.2.0 升级：** 已有的 `pi-sysmon.json` 若写着 `enabled: false`，现在会被读作
+> 「全局默认关」，即从未动过开关的会话会默认关 —— 正好等价于旧版这个字段表达的行为。
+> 想要回到「默认开」，执行 `/sysmon global on`。
 
 ## 实现说明
 
@@ -229,6 +255,7 @@ CPU 12%  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
 ```
 src/
 ├── metrics.ts      # 采集层：读 /proc/{stat,meminfo,net/dev,diskstats} + os.loadavg
+├── state.ts        # 决策层：会话级 vs 全局开关的优先级 + `/sysmon` 参数解析（纯函数）
 ├── braille.ts      # 渲染层：数据 → braille 点阵 → 字符行（纯函数，无副作用）
 ├── tokens.ts       # 估算层：LLM 流式增量 → token 数（纯函数 + 闭包 meter）
 ├── blocks.ts       # 组装层：历史 + 快照 → MetricBlock[]（纯数据 → 纯数据）
@@ -273,7 +300,7 @@ pi 单独测试与复用；`metrics.ts` 只负责读数，不关心怎么显示�
 ## 测试
 
 ```bash
-npm test          # 102 项单元测试（braille 13 + layout 66 + tokens 23）
+npm test          # 143 项单元测试（braille 13 + layout 66 + tokens 23 + state 26 + extension 15）
 ```
 
 ```bash
@@ -295,6 +322,15 @@ CPU 段永远保留。
 `test/tokens.test.ts` 覆盖 token 估算（英文 `chars/4`、CJK 逐字、emoji 算一个、
 非字符串防御）、每秒桶的排空语义（关闭期积压不得变成假尖峰），
 以及 `fmtTps` / `tokenAxis` 的**宽度上界**（标题栏读数越界会让 pi 退出）。
+
+`test/state.test.ts` 覆盖开关优先级链（会话选择 → `--sysmon` → 全局默认 → 内置默认开）、
+会话 entry 的倒序扫描，以及 `/sysmon` 参数解析（`globally` 不能被当成 `global` 子命令；
+未知输入必须被拒绝，而不是默默 toggle）。
+
+`test/extension.test.ts` 用桩化的 pi API + 临时配置目录驱动真实的 `index.ts`，
+把这次设计的核心作用域规则钉死：`/sysmon off` **不得**碰配置文件；
+`/sysmon global off` 既写默认值、又立即作用于当前会话；新会话继承默认值、
+而 `/resume` 恢复会话自己的选择；headless 下 `/sysmon global off` 仍然两者都落盘。
 
 ### 验证方法：真机抓帧才是唯一可信的
 

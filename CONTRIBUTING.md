@@ -31,7 +31,8 @@ cp dist/pi-sysmon.ts ~/.pi/agent/extensions/pi-sysmon.ts
 ```
 
 After installing, restart pi and the line charts should appear at the bottom (enabled by default).
-`/sysmon off` turns it off; `/sysmon chart|line|footer` switches modes.
+`/sysmon off` turns it off **for the current session only**; `/sysmon chart|line|footer` switches
+modes, and `/sysmon global off` changes the default for new sessions.
 
 ## Code Conventions
 

@@ -54,7 +54,7 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
   a column and the axis owned a row (50 columns wide, 8 rows tall: 168 cells → 288 cells)
 - **Readings live in the border title bar** (default) — reusing the `─` fill that line already has:
   zero cost, no curve occlusion; or set `PI_SYSMON_LABEL=box` to bring back bottom's top-right floating box
-- **Persistent state** — on/off and mode are remembered in a config file across restarts
+- **Persistent state** — display preferences (mode / placement) and the global on/off default are remembered in a config file across restarts; the per-session on/off lives in the session itself
 - **Multiple display modes** — chart (default) / single text line / full footer
 - **Linux-friendly, doesn't crash elsewhere** — collection degrades to zero values on non-Linux platforms
 
@@ -129,15 +129,31 @@ pi install git:github.com/zzjcool/pi-sysmon
 ## Usage
 
 ```text
-/sysmon                toggle on / off (persisted)
-/sysmon on | off       explicit on / off
-/sysmon chart          chart mode (default)
-/sysmon below|above    place the charts / line below (default) / above the editor (persisted)
-/sysmon line           single-line text mode (the `CPU … TOK …` line)
-/sysmon footer         replace the entire footer with the charts (can be taller than widget mode)
+/sysmon                     toggle on / off (**this session only**)
+/sysmon on | off            explicit on / off (this session only)
+/sysmon global on | off     default on/off for **future** sessions (also applies to this one)
+/sysmon chart               chart mode (default)
+/sysmon below|above         place the charts / line below (default) / above the editor (persisted)
+/sysmon line                single-line text mode (the `CPU … TOK …` line; alias: `status`)
+/sysmon footer              replace the entire footer with the charts (can be taller than widget mode)
 ```
 
 `chart` / `line` are **mutually exclusive display modes** (naming a mode switches to it and turns the monitor on — it never turns the monitor off); `on` / `off` / `above` / `below` are orthogonal to the mode.
+
+### Session scope vs global scope
+
+`/sysmon on|off` is **session-scoped**: it is stored in that session's own entry list, so
+`/resume` brings the switch back exactly as you left it, while **other sessions and future
+runs are unaffected**. Off in one project stays off in that session only.
+
+`/sysmon global on|off` writes the **default for every new session** to
+`<configDir>/pi-sysmon.json`, and applies it to the current session immediately (an "off by
+default from now on" that left the charts running would read as a broken command).
+
+Precedence on startup: **session choice → `--sysmon` → global default → built-in default (on)**.
+Mode (`chart`/`line`/`footer`) and placement (`above`/`below`) are **global display
+preferences** — they keep persisting in the config file, so you don't re-select your charts
+every session.
 
 ### What line mode shows
 
@@ -199,7 +215,20 @@ second group has a single block plus a full row of blanks.
 | `PI_SYSMON_TOKENS` | on | LLM token throughput chart. Set `0` to return to the old three-chart form |
 | `PI_SYSMON_DISKS` | — | Set `1` to add a disk I/O chart (the 5th block) |
 
-On/off state is written to `<configDir>/pi-sysmon.json` (`configDir` defaults to `~/.pi/agent`).
+On/off has **two scopes**, so it is stored twice:
+
+- `<configDir>/pi-sysmon.json` (`configDir` defaults to `~/.pi/agent`) holds `mode`,
+  `placement` and the **global default** `enabled` — written by `/sysmon global on|off`;
+- the **current session's** on/off choice is a session entry, written by `/sysmon on|off`,
+  so it survives `/resume` of that session without touching any other session.
+
+The `--sysmon` CLI flag forces the monitor **on for that run only** — it overrides the global
+default but not an in-session `/sysmon off`, since an explicit "off" typed inside the session is
+the more specific statement.
+
+> **Upgrading from 0.2.0:** an existing `pi-sysmon.json` with `enabled: false` is now read as
+> "the global default is off", so sessions that never touched the switch start off — exactly the
+> behavior the old flag expressed. `/sysmon global on` restores the old on-by-default feel.
 
 ## Implementation Notes
 
@@ -245,6 +274,7 @@ This matches what [bottom](https://github.com/ClementTsang/bottom) does (ratatui
 ```
 src/
 ├── metrics.ts      # collection layer: reads /proc/{stat,meminfo,net/dev,diskstats} + os.loadavg
+├── state.ts        # decision layer: session-vs-global on/off precedence + `/sysmon` argument parsing (pure functions)
 ├── braille.ts      # rendering layer: data → braille dot matrix → character rows (pure functions, no side effects)
 ├── tokens.ts       # estimation layer: LLM streaming deltas → token counts (pure functions + closure meter)
 ├── blocks.ts       # assembly layer: history + snapshot → MetricBlock[] (pure data → pure data)
@@ -294,7 +324,7 @@ widths (the `┌ CPU ─ 1.91 1.80 2.17 ───┐` kind). For example:
 ## Testing
 
 ```bash
-npm test          # 102 unit tests (braille 13 + layout 66 + tokens 23)
+npm test          # 143 unit tests (braille 13 + layout 66 + tokens 23 + state 26 + extension 15)
 ```
 
 ```bash
@@ -321,6 +351,17 @@ is always kept.
 as one, non-string defenses), the drain semantics of per-second buckets (backlog during an off
 period must not turn into a fake spike), and the **width upper bounds** of `fmtTps` / `tokenAxis`
 (title-bar readings that overflow would make pi exit).
+
+`test/state.test.ts` covers the on/off precedence chain (session choice → `--sysmon` → global
+default → built-in on), the backwards session-entry scan, and `/sysmon` argument parsing
+(`globally` must not be read as the `global` subcommand; unknown input must be rejected rather
+than silently toggling).
+
+`test/extension.test.ts` drives the real `index.ts` against a stubbed pi API and a throwaway
+config dir. It locks down the scope rules that motivated this design: `/sysmon off` must **not**
+touch the config file, `/sysmon global off` must write the default *and* apply it to the current
+session, a new session must inherit the default while `/resume` restores the session's own
+choice, and headless `/sysmon global off` must still persist both.
 
 ### Verification method: real-machine frame capture is the only truth
 

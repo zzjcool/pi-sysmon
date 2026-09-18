@@ -44,6 +44,13 @@ import {
 } from "./blocks.ts";
 import { createTpsMeter } from "./tokens.ts";
 import { createCollector, type Snapshot } from "./metrics.ts";
+import {
+	lastSessionEnabled,
+	mergeCfg,
+	parseSysmonCommand,
+	resolveEnabled,
+	SESSION_STATE_KEY,
+} from "./state.ts";
 
 // ThemeLike is imported uniformly from chart-panel.ts, avoiding two diverging definitions.
 // `Mode` and `Placement` live in blocks.ts (which owns the matching
@@ -77,15 +84,55 @@ const FOOTER_MAX_ROWS = 40;
 /** History buffer cap (in points). The window actually displayed is decided by the current layout's plot width. */
 const STORE_CAP = 4000;
 
-// ── Persistence: on/off state and mode survive restarts (written to <configDir>/pi-sysmon.json) ──
+// ── Persistence: **display preferences** and the **global on/off default** live in
+// <configDir>/pi-sysmon.json; the per-session on/off choice lives in the session file ──
+//
+// Why the split (this used to be a single global `enabled`): a global `on/off`
+// answers "what should every new session start with?", while `/sysmon off` is
+// almost always a statement about *this* session. Conflating them meant one
+// `/sysmon off` here silently turned the monitor off in every other session and
+// in every future run. So:
+//   · `enabled` in the file  = global default, written **only** by `/sysmon global on|off`
+//   · `mode` / `placement`   = display preferences, keep writing the file
+//     (otherwise every new session would need its charts re-selected)
+//   · `/sysmon on|off`       = session choice, written as a session entry
 function configPath(): string {
 	const dir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 	return join(dir, "pi-sysmon.json");
 }
 interface Cfg {
+	/** Global **default** for sessions that never touched the switch (not "the current state") */
 	enabled?: boolean;
 	mode?: Mode;
 	placement?: Placement;
+}
+
+type WritePatch = Partial<Cfg>;
+
+/**
+ * Merge a patch into the config file.
+ *
+ * `mergeCfg` (pure, tested) owns the merge rule; this only does the I/O. The
+ * read-modify-write is deliberate: a plain overwrite with a partial object
+ * would drop whichever of `enabled`/`mode`/`placement` this caller didn't set
+ * (e.g. `/sysmon chart` clearing the global default).
+ */
+function writeCfg(patch: WritePatch) {
+	try {
+		let prev: Record<string, unknown> = {};
+		try {
+			const raw: unknown = JSON.parse(readFileSync(configPath(), "utf8"));
+			if (typeof raw === "object" && raw !== null)
+				prev = raw as Record<string, unknown>;
+		} catch {
+			/* no file yet (or unreadable): start from scratch */
+		}
+		const next = mergeCfg(prev, patch);
+		mkdirSync(dirname(configPath()), { recursive: true });
+		writeFileSync(configPath(), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+	} catch {
+		/* read-only filesystem etc.: ignore */
+	}
 }
 /**
  * Read the mode name from the config file.
@@ -120,14 +167,6 @@ function readCfg(): Cfg {
 		return c;
 	} catch {
 		return {};
-	}
-}
-function writeCfg(c: Cfg) {
-	try {
-		mkdirSync(dirname(configPath()), { recursive: true });
-		writeFileSync(configPath(), `${JSON.stringify(c, null, 2)}\n`, "utf8");
-	} catch {
-		/* read-only filesystem etc.: ignore */
 	}
 }
 
@@ -282,6 +321,11 @@ export default function (pi: ExtensionAPI) {
 		tokCacheRead += n(o.cacheRead);
 	};
 
+	// Whether the monitor is *currently* mounted. Session-scoped: decided in
+	// `session_start` (session entry → `--sysmon` → global default) and rewritten
+	// by `/sysmon on|off`. The config file's `enabled` is a **default for new
+	// sessions**, never the current state — reading it back here would make one
+	// session's choice leak into the next.
 	let enabled = false;
 	let activeMode: Mode | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
@@ -526,49 +570,125 @@ export default function (pi: ExtensionAPI) {
 		else ctx.ui.setFooter(undefined);
 	}
 
+	// `--sysmon` (registered below) means "this run, force the monitor on".
+	// Default `false` so an unset flag never *disables* the monitor — off-ness is
+	// expressed by the global default / `/sysmon off`, never by flag absence.
 	pi.registerFlag("sysmon", {
-		description: "Enable the system monitor",
+		description: "Force the system monitor on for this run (overrides the global default)",
 		type: "boolean",
 		default: false,
 	});
 
+	/**
+	 * Adopt `want` as this session's choice and reconcile the UI with it.
+	 *
+	 * The single place `/sysmon on|off`, `/sysmon global on|off`, placement and
+	 * mode switches all funnel through, so "which scope gets written" can't drift
+	 * between them. Returns whether the UI was actually reconciled (false on a
+	 * headless host), which callers use to keep their notification honest.
+	 *
+	 * The session entry is written **before** the UI step and **regardless of
+	 * `hasUI`**: the entry is what `/resume` reads back, so a headless
+	 * `pi -p "/sysmon global off"` must still pin this session's state rather than
+	 * leaving it to be re-resolved from a global default that may change later.
+	 */
+	const applyEnabled = (want: boolean, ctx: UiHost) => {
+		// Session entry, **not** the config file: `/resume` of this session
+		// restores this choice, while other/new sessions keep the global default.
+		pi.appendEntry(SESSION_STATE_KEY, { enabled: want });
+		// No host to reconcile: report that honestly so callers don't notify "this
+		// session" when nothing was (or could be) mounted/unmounted.
+		if (!ctx.hasUI) {
+			enabled = false;
+			return false;
+		}
+		if (want) {
+			enabled = enable(ctx);
+			return enabled;
+		}
+		disable(ctx);
+		enabled = false;
+		return true;
+	};
+
 	pi.registerCommand("sysmon", {
-		description: "System monitor: /sysmon [chart|line|footer|on|off|above|below]",
+		description:
+			"System monitor: /sysmon [chart|line|footer|on|off|above|below|global on|off]",
 		handler: async (args, ctx) => {
-			if (!ctx.hasUI) return;
-			const want = String(args ?? "").trim();
-			// Placement switching: no need to restart the session to switch.
-			// It gets its own branch because it's orthogonal to mode/on/off,
-			// and a re-render is required after switching (setWidget must be called again).
-			if (want === "above" || want === "below") {
-				placement = want === "below" ? "belowEditor" : "aboveEditor";
-				writeCfg({ enabled, mode, placement });
-				// **Both chart and status(line) use placement** (status is now a widget
-				// too, no longer a setStatus pinned in the footer), so both must be
-				// re-mounted once.
-				// Checking only chart would leave the line in place after
-				// `/sysmon above` — that's the other entry point of "the position
-				// doesn't match the charts".
-				if (enabled && (activeMode === "chart" || activeMode === "status")) {
-					disable(ctx);
-					enabled = enable(ctx);
+			const cmd = parseSysmonCommand(String(args ?? ""));
+
+			// ── `/sysmon global on|off` — the **persistent default for new sessions** ──
+			// A subcommand rather than a second top-level command: same object as
+			// `/sysmon on|off`, only aimed at a different scope; a separate name would
+			// invite "which one is the real switch?".
+			// Deliberately **before** the hasUI guard: it writes a file and a session
+			// entry, so it must also work headless (`pi -p "/sysmon global off"`).
+			if (cmd.kind === "global") {
+				if (cmd.value === "query") {
+					const cur = readCfg().enabled ?? true;
+					ctx.ui.notify(
+						`System monitor: default for new sessions is ${cur ? "on" : "off"}`,
+						"info",
+					);
+					return;
 				}
+				if (cmd.value === "usage") {
+					ctx.ui.notify("Usage: /sysmon global on|off", "warning");
+					return;
+				}
+				const on = cmd.value;
+				writeCfg({ enabled: on }); // 1. default for every future session
+				// 2. and this one, immediately: "off by default from now on" that left
+				//    the charts running would read as a broken command. This also
+				//    records the session entry, so the choice survives `/resume`.
+				//    `applyEnabled` writes that entry even when there is no UI to
+				//    reconcile, so `pi -p "/sysmon global off"` pins this session too.
+				const applied = applyEnabled(on, ctx);
+				const state = on ? "on" : "off";
 				ctx.ui.notify(
-					`System monitor: ${want === "below" ? "below editor" : "above editor"}`,
+					applied
+						? `System monitor: global default ${state} (this session and new ones)`
+						: `System monitor: global default ${state} for new sessions (no UI to update here)`,
 					"info",
 				);
 				return;
 			}
-			const map: Record<string, Mode> = {
-				chart: "chart",
-				line: "status",
-				status: "status",
-				footer: "footer",
-			};
-			const newMode = map[want];
-			let explicit: boolean | undefined;
-			if (want === "on") explicit = true;
-			else if (want === "off") explicit = false;
+
+			// Everything below here drives the UI (mount / unmount / re-layout), so it
+			// is meaningless without one. Only `/sysmon global` above is expected to
+			// do useful work headless (`pi -p "/sysmon global off"`).
+			if (!ctx.hasUI) return;
+
+			// Placement switching: no need to restart the session to switch.
+			// It gets its own branch because it's orthogonal to mode/on/off, and a
+			// re-render is required (setWidget must be called again).
+			if (cmd.kind === "placement") {
+				placement = cmd.value;
+				// Display preference → global. Note `enabled` is deliberately absent
+				// from every patch: this handler never writes the global on/off.
+				writeCfg({ mode, placement });
+				// **Both chart and status(line) use placement** (status is a widget too
+				// now, no longer a setStatus pinned in the footer), so a mounted panel
+				// must be rebuilt once. `enable()` already stops the old timer and
+				// replaces the widget under the same key, so there is no separate
+				// `disable()` to call first. Going through `applyEnabled` also keeps the
+				// invariant "mounted state is recorded in the session entry".
+				if (enabled && (activeMode === "chart" || activeMode === "status"))
+					applyEnabled(true, ctx);
+				ctx.ui.notify(
+					`System monitor: ${cmd.value === "belowEditor" ? "below editor" : "above editor"}`,
+					"info",
+				);
+				return;
+			}
+
+			if (cmd.kind === "invalid") {
+				ctx.ui.notify(
+					"Usage: /sysmon [chart|line|footer|on|off|above|below|global on|off]",
+					"warning",
+				);
+				return;
+			}
 
 			// Explicitly naming a mode = **idempotent "switch to this mode and turn
 			// on"**, not a toggle.
@@ -577,30 +697,29 @@ export default function (pi: ExtensionAPI) {
 			// (`/sysmon line` in line mode reported "off (remembered)"),
 			// directly contradicting the README's "line = single-line text mode"
 			// semantics.
-			if (newMode) explicit = true;
-
-			if (enabled && newMode && newMode !== activeMode) {
-				disable(ctx);
-				mode = newMode;
-				enabled = enable(ctx);
-				writeCfg({ enabled, mode, placement });
+			if (cmd.kind === "mode") {
+				mode = cmd.value;
+				// Display preference → global.
+				writeCfg({ mode, placement });
+				// Re-mount unconditionally: `enable()` swaps the widget (and its
+				// renderer) under the same key, which is exactly what a mode change
+				// needs; a leading `disable()` would only add a blank frame.
+				applyEnabled(true, ctx);
 				ctx.ui.notify(`System monitor: ${mode}`, "info");
 				return;
 			}
-			if (newMode) mode = newMode;
 
-			const target = explicit ?? !enabled;
+			const target = cmd.kind === "enabled" ? cmd.value : !enabled;
 			if (target) {
-				enabled = enable(ctx);
-				if (enabled) {
-					writeCfg({ enabled: true, mode, placement });
+				if (applyEnabled(true, ctx)) {
+					// Report **after** the mount: `applyEnabled` may have failed
+					// (headless host) and announcing an interval that isn't sampling
+					// would be a lie.
 					ctx.ui.notify(`System monitor: ${mode} (${intervalMs}ms)`, "info");
 				}
 			} else {
-				disable(ctx);
-				enabled = false;
-				writeCfg({ enabled: false, mode, placement });
-				ctx.ui.notify("System monitor off (remembered)", "info");
+				applyEnabled(false, ctx);
+				ctx.ui.notify("System monitor off (this session)", "info");
 			}
 		},
 	});
@@ -646,12 +765,30 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_e, ctx) => {
-		if (enabled || !ctx.hasUI) return;
+		// Display preferences and the global on/off default come from the file.
 		const cfg = readCfg();
 		if (cfg.mode) mode = cfg.mode; // remember last mode
 		if (cfg.placement) placement = cfg.placement; // remember last placement
-		if (cfg.enabled === false) return; // don't auto-enable if it was turned off last time
-		enabled = enable(ctx);
+		if (!ctx.hasUI) return;
+
+		// The on/off decision is session-scoped: a choice recorded in **this**
+		// session's entries beats the global default, so `/resume` restores what
+		// the user set back then — while a brand-new session (no entries) starts
+		// from the global default. `--sysmon` forces it on for this run only.
+		const want = resolveEnabled({
+			sessionEnabled: lastSessionEnabled(ctx.sessionManager.getEntries()),
+			forcedOn: pi.getFlag("sysmon") === true,
+			globalEnabled: cfg.enabled,
+		});
+		// Reconcile the UI with `want` **idempotently**: tear down first, then mount
+		// if wanted. Written this way rather than as
+		// `if (want && !enabled) / else if (!want && enabled)` because it doesn't
+		// depend on `enabled` matching reality — the host may already have disposed
+		// the widget (`/reload` / `/new` call `resetExtensionUI`), and `disable()`
+		// is a no-op when nothing is mounted (`activeMode === undefined`).
+		disable(ctx);
+		enabled = false;
+		if (want) enabled = enable(ctx);
 	});
 
 	pi.on("session_shutdown", () => {

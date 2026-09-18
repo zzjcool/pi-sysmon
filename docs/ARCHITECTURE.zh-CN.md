@@ -7,6 +7,7 @@
 ```
 src/
 ├── metrics.ts      # 采集层  —— 读 /proc，产出 Snapshot
+├── state.ts        # 决策层  —— 会话级 vs 全局开关的优先级 + `/sysmon` 参数解析（纯函数）
 ├── braille.ts      # 渲染层  —— Snapshot 数值 → braille 字符行（纯函数）
 ├── blocks.ts       # 组装层  —— 历史 + 快照 → MetricBlock[]（纯数据 → 纯数据）
 ├── chart-panel.ts  # 布局层  —— 响应式列数 / 边框 / 刻度 / 浮动读数框 / 并排拼接
@@ -53,11 +54,29 @@ bottom 用右对齐是因为它始终有完整的 10 分钟历史。而扩展刚
 - **速率类（网络）**：动态量程 = 窗口内最大值 × 1.5。乘 1.5 是 bottom 的做法，
   让峰值落在轴高约 2/3 处，曲线上下留白，不贴顶。
 
-### 4. 配置持久化用文件而不是 `pi.appendEntry()`
+### 4. 开关分两层：显示偏好用文件，会话开关用 `pi.appendEntry()`
 
-pi 提供 `pi.appendEntry()` 做持久化，但它写进的是**会话文件**，
-换一个新会话（或重启）就读不到了。用户要的是「我关掉了，下次打开还是关的」，
-这是跨会话的偏好，所以写独立配置文件 `<configDir>/pi-sysmon.json`。
+`pi.appendEntry()` 写进的是**会话文件**。一开始它被否掉，因为「我关掉了，下次打开还是关的」
+看着像跨会话偏好 —— 但把两个作用域压成一层，恰恰是 bug 的来源：一个 `/sysmon off`
+会顺手把**其它会话和以后所有新会话**都关掉。
+
+所以现在是两层：
+
+| 作用域 | 载体 | 谁写 | 回答的问题 |
+| --- | --- | --- | --- |
+| 全局默认 | `<configDir>/pi-sysmon.json` 的 `enabled` | `/sysmon global on\|off` | 「新会话该默认开还是关」 |
+| 会话选择 | 会话 entry（`customType: "sysmon-state"`） | `/sysmon on\|off` | 「这个会话在用户离开时是什么状态」 |
+
+启动优先级 **会话选择 → `--sysmon` → 全局默认 → 内置默认（开）**，
+这条规则本身是纯函数，放在 `src/state.ts` 里单测（`resolveEnabled` / `lastSessionEnabled` / `parseSysmonCommand`），
+因为 `index.ts` 的命令处理逻辑离不开真实 pi 进程，测不了。
+
+`mode` / `placement` 仍留在文件里：它们是**显示偏好**而非开关，
+若也会话化，每开一个新会话都得重新选一次 `chart` / `below`。
+写文件时用的是 **merge patch**（先读再合并），否则一次 `/sysmon chart`
+会把同一次没提到的 `enabled` 一起抹掉。
+
+内置默认是**开**：一个全新的 config dir 从来就是默认开的，监控的意义就是被看见。
 
 ### 5. 响应式列数必须只依赖宽度
 

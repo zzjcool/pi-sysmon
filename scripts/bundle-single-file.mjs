@@ -35,6 +35,9 @@ const MODULES = [
 	//  better and avoids a TDZ trap if anyone adds a top-level `const` here later.)
 	{ file: "tokens.ts", banner: "LLM token throughput (TPS) estimation and per-second bucket metering" },
 	{ file: "blocks.ts", banner: "Metric block construction: history + snapshot → MetricBlock[]" },
+	// state.ts before index.ts: the enablement precedence rules it owns are
+	// consumed by index.ts's session_start / command handling.
+	{ file: "state.ts", banner: "Enablement precedence: session choice vs global default" },
 	{ file: "index.ts", banner: "pi extension main body" },
 ];
 
@@ -60,11 +63,18 @@ const HEADER = `/**
  *   i.e. ~/.pi/agent/extensions/pi-sysmon.ts (default configDir)
  *
  * Commands:
- *   /sysmon            toggle on / off (on by default; state persisted to <configDir>/pi-sysmon.json)
- *   /sysmon chart      chart mode (default)
- *   /sysmon line       one-line text mode
- *   /sysmon footer     replace the entire bottom bar with charts
- *   /sysmon on|off     explicitly enable / disable
+ *   /sysmon                  toggle on / off (this session only)
+ *   /sysmon global on|off    default on/off for new sessions (applies to this one too)
+ *   /sysmon chart            chart mode (default)
+ *   /sysmon line             one-line text mode
+ *   /sysmon footer           replace the entire bottom bar with charts
+ *   /sysmon on|off           explicitly enable / disable (this session only)
+ *
+ * State:
+ *   <configDir>/pi-sysmon.json holds the display preferences (mode / placement) and the
+ *   global on/off default (\`/sysmon global on|off\`); the per-session on/off choice is a
+ *   session entry written by \`/sysmon on|off\`, so it survives \`/resume\` of that session
+ *   without affecting any other.
  *
  * Environment variables:
  *   PI_SYSMON_INTERVAL=1000      sampling interval in ms (floor 500)

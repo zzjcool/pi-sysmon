@@ -30,8 +30,8 @@ npm run build:single
 cp dist/pi-sysmon.ts ~/.pi/agent/extensions/pi-sysmon.ts
 ```
 
-装好后重启 pi，底部应出现折线图（默认开启）。`/sysmon off` 关闭，
-`/sysmon chart|line|footer` 切换模式。
+装好后重启 pi，底部应出现折线图（默认开启）。`/sysmon off` 只关闭**当前会话**；
+`/sysmon chart|line|footer` 切换模式，`/sysmon global off` 改的是新会话的默认值。
 
 ## 代码约定
 

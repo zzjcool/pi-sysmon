@@ -7,6 +7,7 @@
 ```
 src/
 ├── metrics.ts      # collection  — reads /proc, produces a Snapshot
+├── state.ts        # decisions   — session-vs-global on/off precedence + `/sysmon` parsing (pure functions)
 ├── braille.ts      # rendering   — Snapshot numbers → braille character rows (pure functions)
 ├── blocks.ts       # assembly    — history + snapshot → MetricBlock[] (pure data → pure data)
 ├── chart-panel.ts  # layout      — responsive columns / borders / ticks / floating readout box / side-by-side splicing
@@ -60,12 +61,32 @@ history accumulates it visually converges to right-aligned anyway.
   bottom: it places peaks at about 2/3 of the axis height, leaving breathing room above and
   below the curve instead of touching the top.
 
-### 4. Config persistence uses a file, not `pi.appendEntry()`
+### 4. Enablement is two layers: display prefs in a file, the session switch in `pi.appendEntry()`
 
-pi offers `pi.appendEntry()` for persistence, but it writes into the **session file** —
-a new session (or a restart) can't read it. What the user wants is "I turned it off, and it
-stays off next time" — that's a cross-session preference, so it goes into a standalone config
-file at `<configDir>/pi-sysmon.json`.
+`pi.appendEntry()` writes into the **session file**. It was originally rejected because
+"I turned it off, and it should stay off next time" looks like a cross-session preference —
+but collapsing both scopes into one is exactly where the bug came from: a single
+`/sysmon off` also turned the monitor off in **every other session and every future run**.
+
+So there are two layers now:
+
+| Scope | Carrier | Written by | Answers |
+| --- | --- | --- | --- |
+| Global default | `enabled` in `<configDir>/pi-sysmon.json` | `/sysmon global on\|off` | "should new sessions start on or off?" |
+| Session choice | session entry (`customType: "sysmon-state"`) | `/sysmon on\|off` | "what state was this session left in?" |
+
+Startup precedence is **session choice → `--sysmon` → global default → built-in default (on)**.
+That rule is a pure function in `src/state.ts` (`resolveEnabled` / `lastSessionEnabled` /
+`parseSysmonCommand`) so it
+can be unit-tested: `index.ts`'s command handler needs a live pi instance and can't be.
+
+`mode` / `placement` stay in the file: they're **display preferences**, not switches, and
+session-scoping them would mean re-selecting `chart` / `below` in every new session.
+File writes are **merge patches** (read, then merge), otherwise one `/sysmon chart` would wipe
+the `enabled` key it didn't mention.
+
+The built-in default is **on**: a fresh config dir has always started enabled — the whole point
+of a monitor is to be visible.
 
 ### 5. Responsive column count must depend on width only
 

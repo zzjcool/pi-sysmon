@@ -8,9 +8,12 @@
 import {
 	percentAxis,
 	rateAxis,
+	segsWidth,
 	type AxisSpec,
 	type MetricBlock,
+	type Seg,
 	type StyledLine,
+	type ThemeColor,
 } from "./chart-panel.ts";
 import { fmtBytes, fmtRate, type Snapshot } from "./metrics.ts";
 // TPS 的格式化函数住在 token 模块里（那里才是「token 相关」的归属地），
@@ -109,8 +112,9 @@ export type LabelMode = "title" | "box" | "both" | "none";
  * 图表作为 widget 时挂在编辑器的上方还是下方。
  *
  * 对应 pi 官方的 `setWidget(key, content, { placement })`（`WidgetPlacement`
- * 自 0.8x 起就是公开 API）。只有 `chart` 模式用得上 ——
- * `footer` 模式是替换整个底部（footer 本来就在编辑器下方），`status` 模式只是一个状态行。
+ * 自 0.8x 起就是公开 API）。`chart` 与 `status`（即 `/sysmon line`）都用它：
+ * 两者都是 widget，所以都能落到编辑器上方或下方。
+ * `footer` 模式不涉及 —— 它替换整个底部，本来就在编辑器下方。
  */
 export type Placement = "aboveEditor" | "belowEditor";
 
@@ -135,12 +139,33 @@ export function parsePlacement(v: string | undefined): Placement {
 		: "belowEditor";
 }
 
+/** 三种显示模式。`status` 是 `line` 的内部名（历史原因，见 `parseMode`）。 */
+export type Mode = "chart" | "status" | "footer";
+
 /**
- * 会话累计输出 token 的短格式（`1.2M` / `345K` / `1200`）。
+ * 解析模式名（`PI_SYSMON_MODE` 与配置文件共用）。
  *
- * 不进图表刻度，所以不用定宽；但必须有上界，否则一场极长会话的累计值
- * 会把标题行撑破（宽度越界 = pi 崩溃退出）。进制用 1000（token 是十进制量纲）。
+ * **`line` 与 `status` 都接受**，返回内部的 `status`。
+ * 这条宽容很重要：对外文档（README）里这一档叫 `line`（与 `/sysmon line` 一致），
+ * 而内部的 `Mode` 是 `status` —— 如果只认内部名，用户照着文档写
+ * `PI_SYSMON_MODE=line` 会被**静默忽略**（退回 chart），配置里写 `line` 同理。
+ * 与 `parsePlacement` / `PI_SYSMON_LABEL` 的容错保持一致：配错不该让扩展不工作，
+ * 但“文档里写了的值”必须能用。
+ *
+ * 未知/空值回退到默认的 `chart`。
  */
+export function parseMode(v: string | undefined): Mode {
+	switch ((v ?? "").trim().toLowerCase()) {
+		case "line":
+		case "status":
+			return "status";
+		case "footer":
+			return "footer";
+		default:
+			return "chart";
+	}
+}
+
 /**
  * 格式化一个 token 计数。
  *
@@ -167,20 +192,113 @@ export function tail(arr: number[], n: number): number[] {
 }
 
 /**
- * TPS 图的 y 轴 —— 与 `rateAxis` 算法相同（量程 = 最大值 × 1.5、只标顶端一个值、
- * 定宽 `RATE_GUTTER` 列），但**单位是 token 而不是字节**。
+ * `line` 模式（`/sysmon line`）的输入。
  *
- * 为什么不直接用 `rateAxis`：它硬编码了 1024 进制和 `B/KB/MB` 后缀，
- * 拿它画 tok/s 会输出 `2.2KB`（1500 tok/s）这种错单位的刻度 ——
- * 图上写着 KB，实际是 token，比没刻度还糟。
- *
- * 1K = 1000（不是 1024）：token 计数是十进制量纲，
- * 而且 API 账单里的 token 数也是十进制（`total_tokens`），不应用二进制换算。
- *
- * 刻度下限：`MIN_TPS_SCALE`。没有它的话，空闲期一个 1 tok/s 的尾点会把量程钉到 1.5，
- * 下一句回复 200 tok/s 就直接顶格。有下限则从 10 tok/s 起步，曲线仍然接近贴底，
- * 但不会因为一个噪声点就压缩整个量程。
+ * 与图表模式共用同一批数据源，所以字段名与 `buildBlocks` 的 `BlockOptions` /
+ * `History` 保持一致（`tpsNow` / `tokensIn` / `tokensOut` / `tokensCacheRead`）——
+ * 同一个量在两个模式里叫两个名字，迟早会漂移。
  */
+export interface LineOptions {
+	/** 系统快照；`undefined` 表示采集失败（非 Linux / /proc 不可读） */
+	snap?: Snapshot;
+	/** 当前 TPS（tok/s），由 `src/tokens.ts` 的 meter 供给 */
+	tpsNow?: number;
+	/** 会话累计上行 token（精确 `usage.input`） */
+	tokensIn?: number;
+	/** 会话累计下行 token（精确 `usage.output`） */
+	tokensOut?: number;
+	/** 会话累计缓存读取 token（精确 `usage.cacheRead`） */
+	tokensCacheRead?: number;
+}
+
+/** 片段构造小工具：省掉每个读数都写一遍 `{ text, color }` 的噪声 */
+const seg = (text: string, color?: ThemeColor): Seg => ({ text, color });
+
+/**
+ * `line` 模式的文字行 —— 返回**分级片段**，宽度不够时从尾部整段丢弃。
+ *
+ * ## 为什么不能只返回一个字符串
+ *
+ * 旧实现是自己拼字符串 + `visibleWidth` 判长度，有两个真问题：
+ *  1. 没有 token（用户点名的缺失）；
+ *  2. 一旦选定某一档文案就整行固定，**终端变宽也不会加回信息**，
+ *     而且丢掉的是整段（要么全有要么全无），不是「按重要度降级」。
+ *
+ * 现在改成「按重要度排好的片段序列 + 从尾部整段丢弃」：
+ *  · 重要度降序：CPU → MEM → NET → Tokens（速率与累计）；
+ *  · 每个片段带自己的配色，与图表模式**同名同色**，所以两种模式可以互相对照；
+ *  · 截断只发生在全行放不下时，且**不会切碎某段文本**（整段丢弃），
+ *    免得出现 `CPU 12` 这种半截数字。
+ *
+ * **永远不会返回空**：第一个组（有快照时是 CPU，没快照时是 TOK）
+ * 无论多窄都会保留，超宽交给 `renderStyledLine` 截断 —— 一行被切掉尾巴的
+ * CPU 读数也比一行空白好（空白会让人以为扩展挂了）。
+ * 所以这里只需要产出「数据 + 颜色」，不碰 ANSI。
+ */
+export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
+	// 非有限宽度必须先落回 1：`Math.max(1, Math.floor(NaN))` 还是 NaN，
+	// 而下面对比用的是 `joinedWidth(...) > w` —— 与 NaN 的任何比较都是 false，
+	// 于是「全部放得下」会把**整行**返回（而不是只保留第一段），
+	// 调用方若信了这个宽度预算就会越界。宁可保守到底。
+	const w = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+	const s = opts.snap;
+
+	// 按重要度降序、以「段」为单位：段内不拆开。
+	// 间距用两空格（footer 别的扩展也是这么排的，视觉上能与相邻状态分开）。
+	const groups: StyledLine[] = [];
+
+	if (s) {
+		groups.push([
+			seg("CPU ", "muted"),
+			seg(`${s.cpuPct.toFixed(0)}%`, "success"),
+		]);
+		groups.push([
+			seg("MEM ", "muted"),
+			seg(`${s.memPct.toFixed(0)}%`, "warning"),
+			seg(` ${fmtBytes(s.memUsed)}`, "muted"),
+		]);
+		groups.push([
+			seg("NET ", "muted"),
+			seg(`↑${fmtRate(s.txBps)}`, "warning"),
+			seg(` ↓${fmtRate(s.rxBps)}`, "accent"),
+		]);
+	}
+
+	// Token 段：与图表模式的 `Tokens` 块同口径（当前速率 + 会话累计）。
+	// 无快照时也**照常输出** —— TPS 不依赖 /proc，非 Linux 上唯一还有意义的指标。
+	const tps = opts.tpsNow ?? 0;
+	const tokIn = opts.tokensIn ?? 0;
+	const tokOut = opts.tokensOut ?? 0;
+	const tokR = opts.tokensCacheRead ?? 0;
+	const tokSegs: StyledLine = [
+		seg("TOK ", "muted"),
+		seg(`~${fmtTps(tps)}`, "accent"),
+	];
+	// 累计值首字母 `↑`/`↓`/`R` 与 pi 内建 footer 同字同序，可直接对照
+	if (tokIn > 0) tokSegs.push(seg(` ↑${fmtTokensTotal(tokIn)}`, "muted"));
+	if (tokOut > 0) tokSegs.push(seg(` ↓${fmtTokensTotal(tokOut)}`, "muted"));
+	if (tokR > 0) tokSegs.push(seg(` R${fmtTokensTotal(tokR)}`, "muted"));
+	groups.push(tokSegs);
+
+	const joinedWidth = (gs: StyledLine[]): number =>
+		gs.reduce((acc, g) => acc + segsWidth(g), 0) + Math.max(0, gs.length - 1) * 2;
+
+	// 从后往前丢整段，直到放得下。**第一个组永远保留**：
+	// 有快照时它是 CPU（最短也最重要），没快照时是 TOK。
+	// 即使它自己就超宽也不丢 —— 此时调用方渲染出来的是一行被截断的读数，
+	// 而不是空白（空行会让人以为扩展挂了）。
+	let keep = groups.length;
+	while (keep > 1 && joinedWidth(groups.slice(0, keep)) > w) keep--;
+	const kept = groups.slice(0, keep);
+
+	const out: StyledLine = [];
+	kept.forEach((g, i) => {
+		if (i > 0) out.push(seg("  "));
+		out.push(...g);
+	});
+	return out;
+}
+
 /**
  * TPS 图量程下限（tok/s）。没有它的话，空闲期一个 1 tok/s 的尾点会把量程钉到 1.5，
  * 下一句回复 200 tok/s 就直接顶格；有下限则从 10 tok/s 起步。

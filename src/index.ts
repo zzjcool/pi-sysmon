@@ -3,6 +3,8 @@
  *
  * 默认用 ctx.ui.setWidget 把图表挂在编辑器**下方**（`placement: "belowEditor"`），
  * 想放上方就设 `PI_SYSMON_PLACEMENT=above`；也可以用 footer 模式替换整个底部。
+ * `chart` 与 `line` 两种模式都是 widget，所以两者都跟随 `above`/`below`
+ * （`/sysmon line` 以前走 `setStatus`，被钉死在底部，那是 bug，已改）。
  *
  * 关于「有没有 10 行上限」：pi 的 `InteractiveMode.MAX_WIDGET_LINES = 10` 只在
  * `setWidget` 收到 **字符串数组** 时才裁剪（interactive-mode.js 的 Array.isArray 分支）。
@@ -14,32 +16,39 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { computeLayout, renderPanel, type ThemeLike } from "./chart-panel.ts";
+import {
+	computeLayout,
+	renderPanel,
+	renderStyledLine,
+	type StyledLine,
+	type ThemeLike,
+} from "./chart-panel.ts";
 import {
 	buildBlocks,
+	parseMode,
 	parsePlacement,
+	plainLineSegs,
 	resolveWindow,
 	type History,
 	type LabelMode,
+	type Mode,
 	type Placement,
 } from "./blocks.ts";
 import { createTpsMeter } from "./tokens.ts";
-import {
-	createCollector,
-	fmtBytes,
-	fmtRate,
-	type Snapshot,
-} from "./metrics.ts";
+import { createCollector, type Snapshot } from "./metrics.ts";
 
-// ThemeLike 统一从 chart-panel.ts 导入，避免两处定义不一致
-type Mode = "chart" | "status" | "footer";
+// ThemeLike 统一从 chart-panel.ts 导入，避免两处定义不一致。
+// `Mode` 与 `Placement` 归 blocks.ts（那里有对应的 `parseMode`/`parsePlacement`），
+// 这里 re-export 给旧调用点用。
+/**
+ * 能用 UI 的宿主。名字沿用 setStatus 时代（当时还要拿它清状态行），
+ * 现在它只用来挂 widget/footer。
+ */
 type UiHost = Pick<ExtensionCommandContext, "hasUI" | "ui">;
 
-const STATUS_KEY = "sysmon";
 const WIDGET_KEY = "sysmon-chart";
 
 /**
@@ -71,6 +80,23 @@ interface Cfg {
 	mode?: Mode;
 	placement?: Placement;
 }
+/**
+ * 从配置文件里取模式名。
+ *
+ * 与 `parseMode` 分开的原因：`parseMode` 会把未知值回退成 `chart`，
+ * 而这里的 `undefined` 有独立含义 —— 「配置里没写 mode」，
+ * 此时应该保留 `PI_SYSMON_MODE` 设的初始值，而不是被“回退值”覆盖成 chart。
+ * 所以这里只做「是不是已知模式名」的判定，**映射仍然只有 `parseMode` 一份**
+ * （写两遍 switch 就是本仓库反复批判的双账本）。
+ */
+function cfgMode(v: unknown): Mode | undefined {
+	if (typeof v !== "string") return undefined;
+	const t = v.trim().toLowerCase();
+	return t === "chart" || t === "line" || t === "status" || t === "footer"
+		? parseMode(t)
+		: undefined;
+}
+
 function readCfg(): Cfg {
 	try {
 		const raw: unknown = JSON.parse(readFileSync(configPath(), "utf8"));
@@ -78,8 +104,8 @@ function readCfg(): Cfg {
 		const o = raw as Record<string, unknown>;
 		const c: Cfg = {};
 		if (typeof o.enabled === "boolean") c.enabled = o.enabled;
-		if (o.mode === "chart" || o.mode === "status" || o.mode === "footer")
-			c.mode = o.mode;
+		const m = cfgMode(o.mode);
+		if (m) c.mode = m;
 		if (o.placement === "aboveEditor" || o.placement === "belowEditor")
 			c.placement = o.placement;
 		return c;
@@ -183,12 +209,9 @@ export default function (pi: ExtensionAPI) {
 			: "title";
 	})();
 
-	let mode: Mode = (() => {
-		const m = process.env.PI_SYSMON_MODE;
-		return m === "status" || m === "footer" || m === "chart" ? m : "chart";
-	})();
+	let mode: Mode = parseMode(process.env.PI_SYSMON_MODE);
 
-	/** 图表挂编辑器下方还是上方（仅 chart 模式生效；默认下方，可由配置文件恢复/覆盖） */
+	/** 图表/文字行挂编辑器下方还是上方（chart 与 line 都生效；默认下方） */
 	let placement: Placement = parsePlacement(process.env.PI_SYSMON_PLACEMENT);
 
 	const hist: History = {
@@ -233,7 +256,6 @@ export default function (pi: ExtensionAPI) {
 	let activeMode: Mode | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let snap: Snapshot | undefined;
-	let lastCtx: UiHost | undefined;
 
 	function sample() {
 		try {
@@ -317,21 +339,40 @@ export default function (pi: ExtensionAPI) {
 		return renderPanel(theme, blocks, width, layout, windowSecs);
 	}
 
-	const plainLine = (s: Snapshot, width: number): string => {
-		const cpu = `CPU ${s.cpuPct.toFixed(0)}%`;
-		const mem = `MEM ${s.memPct.toFixed(0)}% ${fmtBytes(s.memUsed)}`;
-		const net = `NET ↑${fmtRate(s.txBps)} ↓${fmtRate(s.rxBps)}`;
-		const tiers = [[cpu, mem, net], [cpu, mem], [cpu]];
-		for (const parts of tiers) {
-			const line = parts.join("  ");
-			if (visibleWidth(line) <= Math.max(24, Math.floor(width / 2))) return line;
-		}
-		return cpu;
-	};
+	/**
+	 * `line` 模式（`/sysmon line`）的一行文字 —— 返回**带色片段**，
+	 * 由调用方交给 `renderStyledLine` 渲染成定宽单行。
+	 *
+	 * 为什么不再在这里拼字符串：那版实现把「数据选择」和「渲染」揉在一起，
+	 * 既没有 token 读数，也没法复用图表那套宽字符/ANSI 精确算宽。
+	 * 现在数据在 `blocks.ts` 的 `plainLineSegs`（可单测），渲染在 chart-panel。
+	 */
+	const plainLine = (width: number): StyledLine =>
+		plainLineSegs(
+			{
+				snap,
+				tpsNow: lastTps,
+				tokensIn: tokIn,
+				tokensOut: tokOut,
+				tokensCacheRead: tokCacheRead,
+			},
+			width,
+		);
 
-	/** 图表组件的公共实现（widget 与 footer 只差行数预算） */
-	function makeChart(maxRows: number) {
+	/**
+	 * 所有模式的公共组件骨架：装定时器、逐帧采样、可 dispose。
+	 *
+	 * 三种模式（chart / line / footer）只差一个 `render(width)`，
+	 * 所以骨架必须只有一份 —— 以前 `line` 用的是 `setInterval(push)`、
+	 * 图表用的是组件工厂里自己的 `setInterval`，两套 timer 的管理方式
+	 * （谁在什么时候 `stop()`、`timer` 变量指向谁）迟早会漂移。
+	 * 现在只有这一处碰 `timer`。
+	 */
+	function makeSampled(render: (theme: ThemeLike, width: number) => string[]) {
 		return (tui: { requestRender(): void }, theme: ThemeLike) => {
+			// 重建组件时先停掉可能存在的旧 timer：
+			// `setWidget` 每次都会调工厂，而 `stop()` 清理的是模块级的 `timer`，
+			// 不先停就会出现两个 `setInterval` 同时跑（双倍采样 + 双倍渲染）。
 			stop();
 			const localTimer = setInterval(() => {
 				sample();
@@ -339,30 +380,63 @@ export default function (pi: ExtensionAPI) {
 			}, intervalMs);
 			timer = localTimer;
 			return {
-				dispose: () => clearInterval(localTimer),
+				// dispose 必须幂等且**只能清自己的那个 timer**：pi 替换/移除 widget
+				// 时会叫 dispose（那时模块级 `timer` 可能已经指向新组件的 timer 了，
+				// 直接 `stop()` 会把新组件的 timer 误杀）。清完再把模块级别名收回，
+				// 使 `timer` 永远不会指向一个已被清掉的句柄。
+				//
+				// 不靠“dispose 一定会被调”来防泄漏：pi 在会话销毁/替换时确实会调
+				// （`agent-session-runtime.js` 的 `dispose()`/`teardownCurrent()` →
+				// `beforeSessionInvalidate` → `resetExtensionUI` → `clearExtensionWidgets`
+				// → `widget.dispose?.()`），而且 `stop()`/`disable()` 已经先清一次；
+				// 这里只是把“旧组件晚于新组件工厂被 dispose”的窗口也封住。
+				// （实测：`/new` 替换会话后图表仍在刷新，无陈旧 timer 泄漏。）
+				dispose: () => {
+					clearInterval(localTimer);
+					if (timer === localTimer) timer = undefined;
+				},
 				invalidate() {},
-				render: (width: number) => renderPanelFor(theme, width, maxRows),
+				render: (width: number) => render(theme, width),
 			};
 		};
 	}
+
+	/** 图表组件（widget 与 footer 只差行数预算） */
+	const makeChart = (maxRows: number) =>
+		makeSampled((theme, width) => renderPanelFor(theme, width, maxRows));
+
+	/**
+	 * `line` 模式的组件：恒 1 行，内容随宽度自适应。
+	 *
+	 * 用 `setWidget` 而不是 `setStatus` 是为了**跟随 placement**：
+	 * `setStatus` 的内容由 pi 内建 footer 渲染，位置固定在底部；
+	 * 而 widget 能落到编辑器上方或下方，与图表模式的 `/sysmon above|below` 一致。
+	 * 这样「`/sysmon below` 之后 line 也应该在下面」这条期望才成立。
+	 */
+	const makeLine = () =>
+		makeSampled((theme, width) => {
+			// **必须以布局给的 `width` 为准**：它才是这一帧可用的列数，
+			// 渲染得比它宽就是越界，而越界会让 pi 直接退出（铁律）。
+			// 不能用 `process.stdout.columns` 兜底 —— 那是**终端全宽**，
+			// 而 widget 的实际可用宽度可以更窄（容器留白/同排其他 widget），
+			// 真走到那个回退反而是往越界方向跑。`renderStyledLine` 自己
+			// 会把非有限值钳成 1，所以这里只需处理 floor。
+			return [renderStyledLine(theme, plainLine(width), width)];
+		});
 
 	function enable(ctx: UiHost): boolean {
 		if (!ctx.hasUI) return false;
 		stop();
 		sample();
 		activeMode = mode;
-		lastCtx = ctx;
 
 		if (mode === "status") {
-			const push = () => {
-				sample();
-				ctx.ui.setStatus(
-					STATUS_KEY,
-					snap ? plainLine(snap, process.stdout.columns || 80) : "sysmon …",
-				);
-			};
-			ctx.ui.setStatus(STATUS_KEY, "sysmon …");
-			timer = setInterval(push, intervalMs);
+			// 用 widget 而非 `setStatus`：widget 的 `placement` 能跟随图表模式
+			// （`/sysmon above|below`）落到编辑器上方或下方，而 `setStatus` 的内容
+			// 永远被钉在 pi 内建 footer 里 —— 那就是「位置和图表对不上」的根因。
+			//
+			// 行数也一致（恒 1 行），所以不会造成编辑器位移。
+			ctx.ui.setWidget(WIDGET_KEY, makeLine(), { placement });
 			return true;
 		}
 
@@ -383,8 +457,10 @@ export default function (pi: ExtensionAPI) {
 		const was = activeMode;
 		activeMode = undefined;
 		if (!ctx.hasUI || was === undefined) return;
-		if (was === "status") ctx.ui.setStatus(STATUS_KEY, undefined);
-		else if (was === "chart") ctx.ui.setWidget(WIDGET_KEY, undefined);
+		// chart 与 status(line) 都用同一个 widget key（互斥，不会同时存在），
+		// 所以两者的清理是同一条语句 —— 不要写成两个看起来不同却等价的 else-if。
+		if (was === "status" || was === "chart")
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		else ctx.ui.setFooter(undefined);
 	}
 
@@ -405,7 +481,11 @@ export default function (pi: ExtensionAPI) {
 			if (want === "above" || want === "below") {
 				placement = want === "below" ? "belowEditor" : "aboveEditor";
 				writeCfg({ enabled, mode, placement });
-				if (enabled && activeMode === "chart") {
+				// **chart 与 status(line) 都用 placement**（status 现在也是 widget，
+				// 不再是钉在 footer 里的 setStatus），所以两者都要重挂一次。
+				// 只判 chart 会让「/sysmon above」后 line 仍然留在原位 ——
+				// 那正是「位置和图表对不上」的另一个入口。
+				if (enabled && (activeMode === "chart" || activeMode === "status")) {
 					disable(ctx);
 					enabled = enable(ctx);
 				}
@@ -425,6 +505,12 @@ export default function (pi: ExtensionAPI) {
 			let explicit: boolean | undefined;
 			if (want === "on") explicit = true;
 			else if (want === "off") explicit = false;
+
+			// 显式点模式名 = **幂等的「切到这个模式并打开」**，不是切换开关。
+			// 旧逻辑在「已经是这个模式」时会落到下面的 `target = !enabled` 分支
+			// 而把监控**关掉**（`/sysmon line` 在 line 模式下报 “off (remembered)”），
+			// 与 README 里「line = 一行文字模式」的语义直接矛盾。
+			if (newMode) explicit = true;
 
 			if (enabled && newMode && newMode !== activeMode) {
 				disable(ctx);
@@ -495,8 +581,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		stop();
-		if (activeMode === "status" && lastCtx?.hasUI)
-			lastCtx.ui.setStatus(STATUS_KEY, undefined);
 		activeMode = undefined;
 	});
 }

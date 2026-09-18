@@ -447,6 +447,38 @@ function truncateRow(row: Row, maxCells: number): Row {
 	return out;
 }
 
+/**
+ * 把一条带色文本渲染成**恰好 width 列**的单行字符串（超出用 `…` 截断，不足补空格）。
+ *
+ * 存在的理由：`line` 模式（`/sysmon line`）要跟图表共用同一套宽度与配色纪律，
+ * 而「自己拼字符串 + padEnd」正是本仓库踩过的坑 —— 多字节字符会被算错列宽，
+ * 一旦某行超过终端宽度 pi 就抛异常退出。这里复用图表内部的单元格模型
+ * （`segsToRow` / `truncateRow` / `paint`），于是：
+ *  · 宽字符（CJK/emoji）按显示列计宽并保留占位 cell；
+ *  · 截断不会把宽字符从它的占位 cell 上切开；
+ *  · 纯空格段不染色（避免每帧刷一大堆转义序列）。
+ *
+ * 返回的是**已经含 ANSI** 的字符串，可直接交给 `setWidget` 的组件渲染。
+ */
+export function renderStyledLine(
+	theme: ThemeLike,
+	segs: StyledLine,
+	width: number,
+): string {
+	const w = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+	const row = truncateRow(segsToRow(segs), w);
+	// 补空格：行数恒定 + 行宽恒定，编辑器才不会上下位移（ARCHITECTURE 坑 2）
+	while (row.length < w) row.push({ ch: " " });
+	return paint(theme, row);
+}
+
+/** 一条带色行的显示宽度（用 pi-tui 的 `visibleWidth`，宽字符/ANSI 口径与渲染一致） */
+export function segsWidth(segs: StyledLine): number {
+	let n = 0;
+	for (const s of segs) n += visibleWidth(s.text);
+	return n;
+}
+
 /* ------------------------------------------------------------------ */
 /* 刻度规格                                                            */
 /* ------------------------------------------------------------------ */

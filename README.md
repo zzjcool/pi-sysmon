@@ -6,7 +6,7 @@
 
 CPU · Memory · Network · Tokens — real-time history curves drawn with braille dot-matrix characters
 
-[![test](https://img.shields.io/badge/tests-102%2F102-brightgreen)](#testing)
+[![test](https://img.shields.io/badge/tests-143%2F143-brightgreen)](#testing)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="Four charts side by side: CPU / Memory / Network / Tokens" width="100%">
@@ -17,17 +17,6 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
 </div>
 
 [English](README.md) | [简体中文](README.zh-CN.md)
-
-```
-┌ CPU ─ 8%  3.45 3.61 2.85 ──────────┐┌ Memory ─ 53%  33G/62G ─────────────┐┌ Network ─ ↓23K/s ↑3.4K/s  Σ↓79G ──┐┌ Tokens ─ ~58t/s  ↑5.9k ↓60 R2.7k ─┐
-│100%                                ││100%                                ││1.0MB                              ││ 1.6Kt/s                           │
-│                                    ││                                    ││                                   ││                                   │
-│                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀││                                  ⢸││  ⡇     ⢰     ⢠      ⡆     ⢸      ⡆│
-│                                    ││                                    ││                                  ⢸││ ⢠⢇     ⣿     ⢸⡄    ⢀⡇     ⡼⡀    ⢀⡇│
-│ ⢀⡀ ⢀         ⡀    ⢀ ⡀  ⡀     ⢀  ⡀ ⡀││                                    ││                                  ⡇││ ⢸⢸    ⢠⠃⡇    ⡇⡇    ⢸⢸     ⡇⡇    ⢸⢸│
-│⠒⠁⠑⢦⠋⠒⠊⠑⢦⠒⠲⡔⠒⠚⠑⠒⠒⠲⡔⠙⡜⢣⠔⢶⢣⠴⡔⠒⠒⠒⠃⠑⠊⢣⠜⠑││                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣇││⠉⠉⠈⠉⠉⠑⠒⠚ ⠣⠤⠤⠤⠤⠇⠸⠤⠤⠤⠤⠜⠘⠒⠒⠊⠉⠉⠁⠉⠉⠉⠒⠒⠚⠘│
-└ 60s ─────────────────────────── 0s ┘└ 60s ─────────────────────────── 0s ┘└ 60s ────────────────────────── 0s ┘└ 60s ────────────────────────── 0s ┘
-```
 
 ## Features
 
@@ -55,7 +44,8 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
 - **Readings live in the border title bar** (default) — reusing the `─` fill that line already has:
   zero cost, no curve occlusion; or set `PI_SYSMON_LABEL=box` to bring back bottom's top-right floating box
 - **Persistent state** — display preferences (mode / placement) and the global on/off default are remembered in a config file across restarts; the per-session on/off lives in the session itself
-- **Multiple display modes** — chart (default) / single text line / full footer
+- **Multiple display modes** — chart (default) / single text line / full footer; in fullscreen TUI mode a
+  clickable chip switches chart ⇄ line with one click
 - **Linux-friendly, doesn't crash elsewhere** — collection degrades to zero values on non-Linux platforms
 
 ## Screenshots
@@ -101,29 +91,45 @@ output / `R` cache reads), so the two can be compared directly. A few details:
 
 ## Installation
 
-### Single file (recommended, simplest)
+### Install with pi (recommended)
 
 ```bash
+# latest release from npm
+pi install npm:pi-sysmon
+
+# or pin an exact version
+pi install npm:pi-sysmon@0.2.0
+
+# or straight from git
+pi install git:github.com/zzjcool/pi-sysmon
+```
+
+Restart pi and the curves appear — **enabled by default**. Update later with
+`pi update npm:pi-sysmon`, remove with `pi remove npm:pi-sysmon`.
+
+### From a git clone: single file (simplest manual install)
+
+```bash
+git clone https://github.com/zzjcool/pi-sysmon && cd pi-sysmon && npm install
 npm run build:single    # produces dist/pi-sysmon.ts
 cp dist/pi-sysmon.ts ~/.pi/agent/extensions/pi-sysmon.ts
 ```
 
-Restart pi and the curves appear — **enabled by default**.
-
-### Directory form (multiple files)
+### From a git clone: directory form (multiple files)
 
 ```bash
-cp -r . ~/.pi/agent/extensions/pi-sysmon
+git clone https://github.com/zzjcool/pi-sysmon
+cp -r pi-sysmon ~/.pi/agent/extensions/pi-sysmon
 ```
 
 > ⚠️ The directory form **must live in a subdirectory**. pi's auto-discovery treats every `.ts`
 > directly under `extensions/` as an extension; laying out multiple files flat would make
 > `braille.ts` get loaded as an extension and break the whole load.
 
-### Install from npm / git
+### Try it without installing
 
 ```bash
-pi install git:github.com/zzjcool/pi-sysmon
+pi -e npm:pi-sysmon
 ```
 
 ## Usage
@@ -139,6 +145,37 @@ pi install git:github.com/zzjcool/pi-sysmon
 ```
 
 `chart` / `line` are **mutually exclusive display modes** (naming a mode switches to it and turns the monitor on — it never turns the monitor off); `on` / `off` / `above` / `below` are orthogonal to the mode.
+
+### Click to switch modes (fullscreen TUI only)
+
+In pi's **fullscreen** TUI mode (`--tui-mode fullscreen`, or **TUI mode** in `/settings`),
+the panel shows a small clickable `[line]` / `[chart]` chip at its bottom-right —
+one click switches between chart and line mode, no command needed:
+
+```text
+┌ CPU ─ 12% ───────────────────────┐
+│ ⡿⢸⣿⡇ ...                       │
+└ 60s ──────────────────────── 0s ┘
+                              [line]
+```
+
+- The click runs the **same path** as `/sysmon chart` / `/sysmon line` — the
+  mode switch is persisted as a global display preference, and the session's
+  on/off state is never touched.
+- In `line` mode the chip shares the text row (the row stays exactly 1 line
+  tall — the chip borrows its columns from the metrics, which drop whole
+  groups from the tail as usual).
+- In fullscreen the chart pays for the chip row **out of its row budget**, so
+  the panel never grows past `WIDGET_MAX_ROWS`.
+- Clicks outside the chip are not consumed: drag-to-select text over the panel
+  keeps working exactly as before.
+- `regular` TUI mode (the default) never captures mouse input — the terminal
+  owns the scrollback there — so no chip is rendered and the panel behaves
+  exactly as before. Use `/sysmon chart | line` instead.
+
+Why no hover highlight on the chip: under tmux/zellij/screen pi only enables
+button-motion mouse reporting (no `move` events), so the chip must read as
+clickable without any hover feedback.
 
 ### Session scope vs global scope
 
@@ -226,9 +263,18 @@ The `--sysmon` CLI flag forces the monitor **on for that run only** — it overr
 default but not an in-session `/sysmon off`, since an explicit "off" typed inside the session is
 the more specific statement.
 
-> **Upgrading from 0.2.0:** an existing `pi-sysmon.json` with `enabled: false` is now read as
-> "the global default is off", so sessions that never touched the switch start off — exactly the
-> behavior the old flag expressed. `/sysmon global on` restores the old on-by-default feel.
+> **Config compatibility:** an older `pi-sysmon.json` that only carries `enabled: false` (the
+> pre-session-scope form) is read as "the global default is off", so sessions that never touched
+> the switch start off — the behavior the old flag expressed. `/sysmon global on` restores the
+> on-by-default feel.
+
+### What gets published
+
+`pi-sysmon` is a **pi package**: it declares its extension in `package.json` under the `pi` key,
+needs nothing but the pi runtime at run time, and has no third-party `dependencies` (the pi
+packages are optional `peerDependencies` that pi itself provides). The npm tarball ships `src/`,
+`docs/`, both READMEs, the changelog and the license — it is what `pi install npm:pi-sysmon`
+fetches.
 
 ## Implementation Notes
 

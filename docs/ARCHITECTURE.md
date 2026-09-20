@@ -556,6 +556,11 @@ This project uses the **component factory**, so panel height is free. So why doe
 charts don't squeeze the chat area away), not a platform limit.
 Footer mode uses the larger `FOOTER_MAX_ROWS`, since the bottom space was occupied anyway.
 
+In fullscreen TUI mode one of those budget rows is spent on the clickable `[line]`/`[chart]`
+chip (`maxRows - (fs ? 1 : 0)` in `makeChart`): the panel **never grows past the budget** when
+the chip appears, and regular mode — which never receives mouse events at all, the terminal
+owns the scrollback there — renders byte-identical output.
+
 ## The Tokens chart (LLM token throughput)
 
 The fourth chart, on by default (`PI_SYSMON_TOKENS=0` to disable). Its **data source is
@@ -714,7 +719,32 @@ point would pin the scale at 1.5, and the next 200 tok/s reply would slam the ce
 
 ## Chart above or below the editor
 
-`options.placement` of pi's `setWidget(key, content, options)` is public API:
+### The fullscreen click chip (mouse input reaches the widget — but only in fullscreen)
+
+pi routes mouse events to components **only in fullscreen TUI mode** (`tui-mode.js`:
+`TuiAltScreen` enables `?1000h/?1002h/?1006h` on start; `TuiMainScreen`, the regular mode,
+has no mouse code at all — the terminal owns the scrollback there). Two facts make the chip work:
+
+1. **Delivery**: the widget is added as a bare child of pi's widget container, and
+   `dispatchMouseToLayout` skips only components that *have a layout node* and use the default
+   `Container.handleMouse` — the plain container doesn't qualify, so it forwards events to our
+   component with **component-local y** (childY already subtracted).
+2. **Click synthesis**: pi synthesizes `click` only for the component that returned
+   `{handled:true}` on the matching `press` (same cell, no movement). So the handler claims
+   **press and click inside the chip rectangle only** — everything outside returns `undefined`
+   and falls through to pi's text-selection handling, untouched.
+
+Two traps that are easy to miss (both hit during development):
+
+- `tui` handed to the factory is a **Proxy** forwarding to the *current* renderer, and
+  `switchTuiMode` reuses the same component object **without re-running the factory** — so the
+  fullscreen check must live inside `render()` **and** inside the mouse handler (per event),
+  never at factory time; otherwise a stale chip rectangle stays hit-testable for one frame
+  after a fullscreen→regular switch.
+- Under tmux/zellij/screen pi enables button-motion reporting only (no `move` events), so
+  hover feedback is unavailable — the chip must read as clickable without it.
+
+`setWidget(key, content, options)` of pi's public API is used for the panel:
 
 ```ts
 // dist/core/extensions/types.d.ts

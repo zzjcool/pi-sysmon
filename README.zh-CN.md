@@ -6,7 +6,7 @@
 
 CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史曲线
 
-[![test](https://img.shields.io/badge/tests-102%2F102-brightgreen)](#测试)
+[![test](https://img.shields.io/badge/tests-143%2F143-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="四图并排：CPU / Memory / Network / Tokens" width="100%">
@@ -17,17 +17,6 @@ CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史
 </div>
 
 [English](README.md) | [简体中文](README.zh-CN.md)
-
-```
-┌ CPU ─ 8%  3.45 3.61 2.85 ──────────┐┌ Memory ─ 53%  33G/62G ─────────────┐┌ Network ─ ↓23K/s ↑3.4K/s  Σ↓79G ──┐┌ Tokens ─ ~58t/s  ↑5.9k ↓60 R2.7k ─┐
-│100%                                ││100%                                ││1.0MB                              ││ 1.6Kt/s                           │
-│                                    ││                                    ││                                   ││                                   │
-│                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀││                                  ⢸││  ⡇     ⢰     ⢠      ⡆     ⢸      ⡆│
-│                                    ││                                    ││                                  ⢸││ ⢠⢇     ⣿     ⢸⡄    ⢀⡇     ⡼⡀    ⢀⡇│
-│ ⢀⡀ ⢀         ⡀    ⢀ ⡀  ⡀     ⢀  ⡀ ⡀││                                    ││                                  ⡇││ ⢸⢸    ⢠⠃⡇    ⡇⡇    ⢸⢸     ⡇⡇    ⢸⢸│
-│⠒⠁⠑⢦⠋⠒⠊⠑⢦⠒⠲⡔⠒⠚⠑⠒⠒⠲⡔⠙⡜⢣⠔⢶⢣⠴⡔⠒⠒⠒⠃⠑⠊⢣⠜⠑││                                    ││⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣇││⠉⠉⠈⠉⠉⠑⠒⠚ ⠣⠤⠤⠤⠤⠇⠸⠤⠤⠤⠤⠜⠘⠒⠒⠊⠉⠉⠁⠉⠉⠉⠒⠒⠚⠘│
-└ 60s ─────────────────────────── 0s ┘└ 60s ─────────────────────────── 0s ┘└ 60s ────────────────────────── 0s ┘└ 60s ────────────────────────── 0s ┘
-```
 
 ## 特性
 
@@ -50,7 +39,8 @@ CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史
   （50 列宽、8 行高：168 格 → 288 格）
 - **读数写在边框标题栏里**（默认）—— 复用那行本来就有的 `─` 填充，零成本、不遮曲线；也可用 `PI_SYSMON_LABEL=box` 换回 bottom 的右上角浮框
 - **状态持久化** —— 显示偏好（模式 / 位置）与全局开关默认值记在配置文件里、重启保留；会话级的开关记在会话自身里
-- **多种显示模式** —— 图表（默认）/ 一行文字 / 整块底部
+- **多种显示模式** —— 图表（默认）/ 一行文字 / 整块底部；fullscreen TUI 下右下角有可点击标签，
+  一次点击即可在 chart ⇄ line 间切换
 - **纯 Linux 友好，其他平台不崩** —— 非 Linux 上采集自动退化为零值
 
 ## 截图
@@ -93,28 +83,44 @@ bottom 在同样宽度下会把四张图硬挤成一行（每张 16 列左右）
 
 ## 安装
 
-### 单文件（推荐，最简单）
+### 用 pi 安装（推荐）
 
 ```bash
+# 从 npm 装最新版
+pi install npm:pi-sysmon
+
+# 或锁定具体版本
+pi install npm:pi-sysmon@0.2.0
+
+# 或直接装 git 源
+pi install git:github.com/zzjcool/pi-sysmon
+```
+
+重启 pi 即可看到曲线，**默认就是开启的**。升级用 `pi update npm:pi-sysmon`，
+卸载用 `pi remove npm:pi-sysmon`。
+
+### 从 git clone 装：单文件（手动安装里最简单）
+
+```bash
+git clone https://github.com/zzjcool/pi-sysmon && cd pi-sysmon && npm install
 npm run build:single    # 生成 dist/pi-sysmon.ts
 cp dist/pi-sysmon.ts ~/.pi/agent/extensions/pi-sysmon.ts
 ```
 
-重启 pi 即可看到曲线，**默认就是开启的**。
-
-### 目录形式（多文件）
+### 从 git clone 装：目录形式（多文件）
 
 ```bash
-cp -r . ~/.pi/agent/extensions/pi-sysmon
+git clone https://github.com/zzjcool/pi-sysmon
+cp -r pi-sysmon ~/.pi/agent/extensions/pi-sysmon
 ```
 
 > ⚠️ 目录形式**必须放在子目录里**。pi 的自动发现会把 `extensions/` 下的每个 `.ts`
 > 都当成扩展加载，平铺多个文件会导致 `braille.ts` 被当作扩展而整个加载失败。
 
-### 从 npm / git 安装
+### 不安装先试用
 
 ```bash
-pi install git:github.com/zzjcool/pi-sysmon
+pi -e npm:pi-sysmon
 ```
 
 ## 使用
@@ -131,6 +137,31 @@ pi install git:github.com/zzjcool/pi-sysmon
 
 `chart` / `line` 是**互斥的显示模式**（点某个模式名 = 切过去并打开，不会把监控关掉）；
 `on` / `off` / `above` / `below` 与模式正交。
+
+### 点击切换模式（仅 fullscreen TUI）
+
+在 pi 的 **fullscreen** TUI 模式下（`--tui-mode fullscreen`，或在 `/settings` 里切 **TUI mode**），
+面板右下角会出现一个可点击的 `[line]` / `[chart]` 小标签 —— 点一下就在 chart 和 line
+之间切换，不用敲命令：
+
+```text
+┌ CPU ─ 12% ───────────────────────┐
+│ ⡿⢸⣿⡇ ...                       │
+└ 60s ──────────────────────── 0s ┘
+                              [line]
+```
+
+- 点击走的是和 `/sysmon chart` / `/sysmon line` **同一条路径** —— 模式切换作为全局显示偏好持久化，
+  会话级开关状态完全不受影响。
+- `line` 模式下标签和文字同行（行高仍严格为 1 行 —— 标签的列从指标文字里借，指标照旧
+  从尾部整段丢弃）。
+- fullscreen 下图表用**自己的行预算**支付 chip 那一行，面板总行数不会超过 `WIDGET_MAX_ROWS`。
+- 标签以外的点击不会被吞：在面板上拖拽选中文字的行为和以前完全一样。
+- `regular` 模式（默认）完全不接管鼠标 —— 那时终端拥有回滚区 —— 所以不渲染标签，
+  面板行为和以前一模一样。请用 `/sysmon chart | line` 切换。
+
+为什么标签没有悬停高亮：tmux/zellij/screen 下 pi 只开启 button-motion 鼠标上报（没有
+`move` 事件），所以标签必须在没有任何悬停反馈的情况下也看起来能点。
 
 ### 会话级 vs 全局级
 
@@ -209,9 +240,16 @@ CPU 12%  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
 `--sysmon` 命令行开关是「**本次启动强制打开**」—— 它盖过全局默认，但不盖过会话里
 手动输入的 `/sysmon off`（那是更具体的表达）。
 
-> **从 0.2.0 升级：** 已有的 `pi-sysmon.json` 若写着 `enabled: false`，现在会被读作
-> 「全局默认关」，即从未动过开关的会话会默认关 —— 正好等价于旧版这个字段表达的行为。
+> **配置兼容：** 早期只带 `enabled: false` 的 `pi-sysmon.json`（会话级开关之前的形态）
+> 会被读作「全局默认关」，即从未动过开关的会话默认关 —— 正好等价于旧版该字段表达的行为。
 > 想要回到「默认开」，执行 `/sysmon global on`。
+
+### 发布内容包括什么
+
+`pi-sysmon` 是一个 **pi package**：扩展入口写在 `package.json` 的 `pi` 字段里，
+运行时除 pi 本身外不需要任何第三方 `dependencies`（两个 pi 包是**可选** peerDependencies，
+由 pi 自己提供）。npm tarball 里包含 `src/`、`docs/`、两份 README、changelog 与 license ——
+也就是 `pi install npm:pi-sysmon` 拉取的内容。
 
 ## 实现说明
 

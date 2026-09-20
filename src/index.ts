@@ -65,6 +65,48 @@ type UiHost = Pick<ExtensionCommandContext, "hasUI" | "ui">;
 const WIDGET_KEY = "sysmon-chart";
 
 /**
+ * Structural stand-in for the tui object pi hands to component factories.
+ *
+ * Deliberately **not** imported from pi-tui: the factory only ever calls
+ * `requestRender()` and reads `mode`, and a structural type keeps this
+ * extension decoupled from pi-tui's exact TUI interface (and from its
+ * version). `mode` is optional because the factory may be invoked with any
+ * object that merely *quacks* like a tui (tests, older hosts).
+ */
+type TuiLike = { requestRender(): void; mode?: string };
+
+/**
+ * Structural stand-in for pi-tui's `TuiMouseEvent` (same reasoning as
+ * TuiLike: only the fields needed for hit-testing are declared; all optional
+ * so a partial event from a stubbed host can't crash the handler).
+ */
+type MouseEv = {
+	type?: string;
+	button?: string;
+	x?: number;
+	y?: number;
+	width?: number;
+	height?: number;
+};
+
+/**
+ * The clickable chip that toggles chart ↔ line in fullscreen mode.
+ *
+ * Pure ASCII on purpose: wide glyphs (★/⇄/emoji) would break the cell-width
+ * bookkeeping this renderer is built on, and hover highlighting is out —
+ * tmux/zellij only enable ?1002h (press/release), never move events, so the
+ * chip must read as clickable without any hover feedback.
+ */
+const CHIP_CHART_TO_LINE = "[line]";
+const CHIP_LINE_TO_CHART = "[chart]";
+// Hit rectangles are sized from the **actual text length** of the chip being
+// shown (`[line]`=6, `[chart]`=7), so the clickable area matches the rendered
+// glyphs exactly — a shared max() would make the rect one column wider than
+// the shorter chip.
+const CHIP_CHART_W = CHIP_CHART_TO_LINE.length;
+const CHIP_LINE_W = CHIP_LINE_TO_CHART.length;
+
+/**
  * Total row budget for the panel (widget mode only).
  *
  * First, clear up a common misconception: pi's
@@ -76,6 +118,10 @@ const WIDGET_KEY = "sysmon-chart";
  * 1 row of charts (3 cols) → 6 plot rows per block, 8 rows total;
  * 2 rows of charts (2 cols) → 6 plot rows per block, 16 rows total;
  * 3 rows of charts (1 col) → 2 plot rows per block, 12 rows total.
+ *
+ * Fullscreen mode adds exactly 1 chip row **on top of this budget** — the
+ * chart body subtracts it (`maxRows - 1` when `fs`) so the total stays ≤ 18,
+ * and regular mode (`fs=false`) renders byte-identical rows to before.
  */
 const WIDGET_MAX_ROWS = 18;
 /** footer mode owns the whole bottom bar and can spread out a bit more */
@@ -330,6 +376,14 @@ export default function (pi: ExtensionAPI) {
 	let activeMode: Mode | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let snap: Snapshot | undefined;
+	/**
+	 * The host the panel is currently mounted on, remembered so a chip click
+	 * can re-run the exact same switch path as `/sysmon chart|line` without
+	 * the component factory holding a stale `ctx` closure (the factory's ctx
+	 * could belong to an already-torn-down session; this variable is written
+	 * by enable()/disable(), the same ledger that owns activeMode).
+	 */
+	let host: UiHost | undefined;
 
 	function sample() {
 		try {
@@ -448,6 +502,93 @@ export default function (pi: ExtensionAPI) {
 			width,
 		);
 
+	// Chip hit rectangle in component-local coordinates, refreshed by every
+	// render(width). handleMouse is only wired up when this is set (fullscreen
+	// render happened); a regular-mode render clears it, so no stale rectangle
+	// survives a fullscreen→regular switch.
+	let chipRect: { x: number; y: number; w: number } | undefined;
+
+	/**
+	 * Hit-test + dispatch for the chip, shared by all three modes.
+	 *
+	 * pi only synthesizes a `click` for the component that returned
+	 * `{handled:true}` on the matching `press`, so both must be claimed inside
+	 * the chip rectangle. Outside it, `undefined` is returned — pi's fallback
+	 * (drag text selection) stays completely untouched.
+	 */
+	/**
+	 * Hit-test + dispatch for the chip, shared by all three modes.
+	 *
+	 * pi only synthesizes a `click` for the component that returned
+	 * `{handled:true}` on the matching `press`, so both must be claimed inside
+	 * the chip rectangle. Outside it, `undefined` is returned — pi's fallback
+	 * (drag text selection) stays completely untouched.
+	 *
+	 * `fullscreenNow` re-reads the tui Proxy per **event** (same live check as
+	 * render): `chipRect` is only refreshed on render, and pi reuses this very
+	 * component object across tuiMode switches without re-running the factory,
+	 * so right after a fullscreen→regular switch a one-frame window exists where
+	 * the stale rectangle would still be hit-testable. Reading the mode here
+	 * (not trusting the last render) closes that window — regular mode stays
+	 * zero-side-effect no matter when the event arrives.
+	 */
+	function handleChipMouse(
+		tui: TuiLike,
+		ev: MouseEv,
+	): { handled: true } | undefined {
+		if (tui.mode !== "fullscreen") return undefined;
+		if (ev.type !== "press" && ev.type !== "click") return undefined;
+		if (ev.button !== "left") return undefined;
+		const r = chipRect;
+		if (!r) return undefined;
+		// Defend against partial events (stub hosts, older pi): a missing
+	// coordinate/size means "can't prove a hit" → treat as outside.
+		const x = ev.x;
+		const y = ev.y;
+		if (x === undefined || y === undefined) return undefined;
+		const h = ev.height ?? 0;
+		// No separate `x >= (ev.width ?? 0)` guard: the chip rectangle is
+		// right-aligned to the **rendered** width, so `x >= r.x + r.w` already
+		// rejects every column at/after the rectangle's right edge — a width
+		// guard can only fire on columns the rect test already rejects (the
+		// two conditions are provably redundant; mutation testing caught the
+		// original pair surviving as dead code).
+		// `y >= h` is NOT redundant: the rectangle's row comes from the last
+	// render while `ev.height` comes from the event, and pi's layout can lag
+	// one frame behind the component's row count after a reflow — that guard
+		// is what drops clicks aimed at rows the host doesn't think exist.
+		if (
+			x < r.x ||
+			x >= r.x + r.w ||
+			y !== r.y ||
+			y >= h
+		)
+			return undefined;
+		if (ev.type === "click") toggleMode();
+		return { handled: true };
+	}
+
+	/**
+	 * The single funnel for mode switching — the chip click goes through the
+	 * exact same path as `/sysmon chart|line` (`mode = next; writeCfg;
+	 * applyEnabled`), so persistence scope can't drift between the two entries.
+	 *
+	 * Only chart ↔ line: footer has no line-mode counterpart to toggle into
+	 * (and the chip is what a footer user clicked, so landing in line mode is
+	 * exactly what they asked for).
+	 *
+	 * Never writes the config's `enabled` field: that is the global default,
+	 * writable by `/sysmon global on|off` only. applyEnabled records this
+	 * session's choice as a session entry, same as the command handler does.
+	 */
+	function toggleMode() {
+		const h = host;
+		if (!h) return; // nothing mounted → nothing to toggle
+		mode = mode === "status" ? "chart" : "status";
+		writeCfg({ mode, placement });
+		applyEnabled(true, h);
+	}
+
 	/**
 	 * Shared component skeleton for all modes: installs the timer, samples each
 	 * frame, is disposable.
@@ -458,9 +599,17 @@ export default function (pi: ExtensionAPI) {
 	 * the component factory; two timer-management styles (who calls `stop()`
 	 * when, which timer the `timer` variable points at) would drift sooner or
 	 * later. Now this is the only place that touches `timer`.
+	 *
+	 * `extraRow` is an optional constant trailing row (the chip row in
+	 * fullscreen mode). It lives in the skeleton — not inside render — so
+	 * regular mode is byte-identical to before (no row appended, no handler
+	 * touched) and the row-count contract is owned in one place.
 	 */
-	function makeSampled(render: (theme: ThemeLike, width: number) => string[]) {
-		return (tui: { requestRender(): void }, theme: ThemeLike) => {
+	function makeSampled(
+		render: (theme: ThemeLike, width: number, fs: boolean) => string[],
+		extraRow?: (theme: ThemeLike, width: number, fs: boolean) => string,
+	) {
+		return (tui: TuiLike, theme: ThemeLike) => {
 			// When rebuilding a component, first stop any old timer that may still
 			// exist: `setWidget` calls the factory every time, while `stop()` clears
 			// the module-level `timer` — without this, two `setInterval`s would run
@@ -494,14 +643,74 @@ export default function (pi: ExtensionAPI) {
 					if (timer === localTimer) timer = undefined;
 				},
 				invalidate() {},
-				render: (width: number) => render(theme, width),
+				render: (width: number) => {
+					// The mode check **must live inside render**, not in the factory:
+					// pi's tui is a Proxy forwarding to the current renderer, and
+					// switchTuiMode swaps the renderer while reusing this very
+					// component object (the factory is not re-run). Reading `tui.mode`
+					// here sees the *current* mode every frame.
+				const fs = tui.mode === "fullscreen";
+				const lines = render(theme, width, fs);
+				if (fs && extraRow) {
+					const row = extraRow(theme, width, fs);
+					// A chart-mode extra row (y=-1 sentinel from chipRow) is appended
+					// below the panel, so its local y is the body row count; a
+					// line-mode extra row IS the body (fs body returns []), and its
+					// chipRect already carries y=0.
+					if (chipRect && chipRect.y < 0) chipRect.y = lines.length;
+					lines.push(row);
+				} else {
+					chipRect = undefined;
+				}
+				return lines;
+			},
+				// Returning `undefined` in regular mode (or for hits outside the
+				// chip) leaves pi's fallback behavior — drag text selection over the
+				// panel — completely untouched.
+				handleMouse: (ev: MouseEv) => handleChipMouse(tui, ev),
 			};
 		};
 	}
 
+	/**
+	 * The trailing chip row for chart/footer mode: a right-aligned `[line]`
+	 * chip on its own row. This is the **only** allowed row-count change:
+	 * fullscreen takes 1 row out of the existing maxRows budget (makeChart
+	 * subtracts it), so the total never exceeds the budget and regular mode is
+	 * untouched. For a given width the row count is constant — the row exists in
+	 * fullscreen regardless of data, so the editor never shifts.
+	 */
+	const chipRow = (theme: ThemeLike, width: number): string => {
+		const w = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+		// Right-align: pad on the left. At widths narrower than the chip itself
+		// the chip is dropped entirely — never render an overflowing row
+		// (overflow makes pi exit outright; iron rule #1).
+		if (w < CHIP_CHART_W) {
+			chipRect = undefined;
+			return renderStyledLine(theme, [], w);
+		}
+		chipRect = { x: w - CHIP_CHART_W, y: -1 /* resolved by the skeleton to the appended row index */, w: CHIP_CHART_W };
+		return renderStyledLine(
+			theme,
+			[
+				{ text: " ".repeat(w - CHIP_CHART_W) },
+				{ text: CHIP_CHART_TO_LINE, color: "muted" },
+			],
+			w,
+		);
+	};
+
 	/** The chart component (widget and footer differ only in row budget) */
 	const makeChart = (maxRows: number) =>
-		makeSampled((theme, width) => renderPanelFor(theme, width, maxRows));
+		makeSampled(
+			// The chip row's cost comes out of the **row budget**, not the
+			// constant: fullscreen subtracts 1 so panel + chip stays within
+			// maxRows, while regular mode (fs=false) gets the identical budget
+			// and therefore byte-identical rows to before this feature.
+			(theme, width, fs) =>
+				renderPanelFor(theme, width, maxRows - (fs ? 1 : 0)),
+			(theme, width) => chipRow(theme, width),
+		);
 
 	/**
 	 * The component for `line` mode: always 1 row, content adapts to width.
@@ -514,23 +723,83 @@ export default function (pi: ExtensionAPI) {
 	 * be at the bottom" hold.
 	 */
 	const makeLine = () =>
-		makeSampled((theme, width) => {
-			// **Must use the `width` given by the layout**: that's the number of
-			// columns actually available this frame; rendering wider is out of
-			// bounds, and out of bounds makes pi exit outright (the iron rule).
-			// Never fall back to `process.stdout.columns` — that's the **full
-			// terminal width**, while a widget's actual usable width can be narrower
-			// (container padding / other widgets in the same row), so hitting that
-			// fallback actually runs toward overflowing. `renderStyledLine` itself
-			// clamps non-finite values to 1, so this only needs to handle the floor.
-			return [renderStyledLine(theme, plainLine(width), width)];
-		});
+		makeSampled(
+			(theme, width, fs) => {
+				// **Must use the `width` given by the layout**: that's the number of
+				// columns actually available this frame; rendering wider is out of
+				// bounds, and out of bounds makes pi exit outright (the iron rule).
+				// Never fall back to `process.stdout.columns` — that's the **full
+				// terminal width**, while a widget's actual usable width can be narrower
+				// (container padding / other widgets in the same row), so hitting that
+				// fallback actually runs toward overflowing. `renderStyledLine` itself
+				// clamps non-finite values to 1, so this only needs to handle the floor.
+				//
+				// Fullscreen: the body returns **zero rows** — the single row is
+				// produced by extraRow below (text + chip in one line), so the mode
+				// stays at exactly 1 row and the editor never shifts.
+				if (fs) return [];
+				return [renderStyledLine(theme, plainLine(width), width)];
+			},
+			// Fullscreen: line mode stays **exactly 1 row**. The chip borrows its
+			// columns from the text: `plainLine` gets `width - chip` and goes
+			// through plainLineSegs's existing "drop whole groups, never split a
+			// number" degradation, then the chip is appended and the whole row is
+			// padded to width by renderStyledLine.
+			(theme, width, _fs) => {
+				const w = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+				if (w <= CHIP_LINE_W) {
+					// Extremely narrow: show only the chip, or nothing at all when even
+					// the chip doesn't fit — never overflow.
+					if (w === CHIP_LINE_W) {
+						chipRect = { x: 0, y: 0, w: CHIP_LINE_W };
+						return renderStyledLine(
+							theme,
+							[{ text: CHIP_LINE_TO_CHART, color: "muted" }],
+							w,
+						);
+					}
+					chipRect = undefined;
+					return renderStyledLine(theme, [], w);
+				}
+				const bodyW = w - CHIP_LINE_W;
+				chipRect = { x: bodyW, y: 0, w: CHIP_LINE_W };
+				// Body and chip are rendered **as two fixed-width strings and
+				// concatenated**: rendering them as one segment list would let
+				// renderStyledLine's truncation eat the chip whenever the kept
+				// body groups exceed bodyW (plainLineSegs always keeps its first
+				// group even when it alone overflows the budget). Rendering the
+				// body at exactly bodyW truncates the body — never the chip.
+				const body = renderStyledLine(theme, plainLine(bodyW), bodyW);
+				const chip = renderStyledLine(
+					theme,
+					[{ text: CHIP_LINE_TO_CHART, color: "muted" }],
+					CHIP_LINE_W,
+				);
+				return body + chip;
+			},
+		);
 
 	function enable(ctx: UiHost): boolean {
 		if (!ctx.hasUI) return false;
 		stop();
 		sample();
+		// Cross-surface cleanup: footer and widget are two **different** mount
+		// surfaces (setFooter vs setWidget), and the mode-change path below mounts
+		// unconditionally without a leading disable() — so switching footer →
+		// chart/line would leave the footer mounted next to the widget (both live,
+		// both sampling; measured: `/sysmon footer` then `/sysmon chart` never
+		// emitted "footer:off"). The same widget key already self-cleans on the
+		// widget↔widget switches (setWidget replaces under one key), so only the
+		// surface we are NOT mounting onto needs this explicit clear. chipRect
+		// is cleared too: the freshly mounted component hasn't rendered yet, so a
+		// click arriving before its first render must not hit a stale rectangle.
+		const was = activeMode;
 		activeMode = mode;
+		host = ctx;
+		chipRect = undefined;
+		if (was === "footer" && mode !== "footer") ctx.ui.setFooter(undefined);
+		if (was !== undefined && was !== "footer" && mode === "footer")
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
 
 		if (mode === "status") {
 			// Use a widget instead of `setStatus`: a widget's `placement` can
@@ -561,6 +830,8 @@ export default function (pi: ExtensionAPI) {
 		stop();
 		const was = activeMode;
 		activeMode = undefined;
+		host = undefined;
+		chipRect = undefined;
 		if (!ctx.hasUI || was === undefined) return;
 		// chart and status(line) share the same widget key (mutually exclusive,
 		// never both present), so cleanup for both is the same statement — don't

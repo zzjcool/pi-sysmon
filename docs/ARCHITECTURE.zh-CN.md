@@ -469,6 +469,10 @@ if (Array.isArray(content)) {
 `WIDGET_MAX_ROWS`？那是**自选的屏幕预算**（免得图表把聊天区挤没），不是平台限制。
 footer 模式用更大的 `FOOTER_MAX_ROWS`，因为底部本来就占了那块空间。
 
+fullscreen TUI 模式下，预算里有一行会花在可点击的 `[line]`/`[chart]` 标签上
+（`makeChart` 里的 `maxRows - (fs ? 1 : 0)`）：标签出现时面板**不会超出预算**；
+而 regular 模式 —— 那时终端拥有回滚区、组件根本收不到鼠标事件 —— 渲染输出逐字节不变。
+
 ## Tokens 图（LLM token 吞吐）
 
 第四张图，默认开（`PI_SYSMON_TOKENS=0` 可关）。它和前三个**数据来源完全不同**：
@@ -602,6 +606,28 @@ setInterval 1s ──► meter.tick(now)    // 出桶 → tps → hist.tps 环�
 - 多进程（herdr subagent）各自是独立 pi，各自画自己的图 —— 单进程计数器天然正确。
 
 ## 图表挂在编辑器上方还是下方
+
+### fullscreen 点击标签（鼠标事件能到达 widget —— 但仅限 fullscreen）
+
+pi 只在 **fullscreen TUI 模式**下把鼠标事件路由给组件（`tui-mode.js`：`TuiAltScreen`
+启动时发 `?1000h/?1002h/?1006h`；regular 模式的 `TuiMainScreen` 完全没有鼠标代码，
+那时终端拥有回滚区）。两个事实让标签得以工作：
+
+1. **送达**：widget 是 pi widget 容器的裸子组件，而 `dispatchMouseToLayout` 只跳过
+   「**有 layout node** 且用默认 `Container.handleMouse`」的组件 —— 普通容器不满足，
+   于是事件带着**组件局部 y**（已减去 childY）转发到我们的组件。
+2. **click 合成**：pi 只对「press 返回过 `{handled:true}` 的组件」在同格无移动的
+   release 时合成 `click`。所以处理器只在 **chip 矩形内**认领 press 与 click ——
+   矩形外一律返回 `undefined`，落回 pi 的文本选择处理，完全不受影响。
+
+两个容易踩的坑（开发中都踩过）：
+
+- 交给工厂的 `tui` 是**转发到当前 renderer 的 Proxy**，而 `switchTuiMode` 会**不重跑工厂**
+  地复用同一组件对象 —— 所以 fullscreen 判断必须写在 `render()` **以及** 鼠标处理器里
+  （逐事件），绝不能在工厂创建时判定；否则 fullscreen→regular 切换后的一帧里，
+  陈旧的命中矩形仍然可点。
+- tmux/zellij/screen 下 pi 只开 button-motion 上报（没有 `move` 事件），悬停反馈不可用
+  —— 标签必须在没有悬停的情况下也看起来能点。
 
 pi 的 `setWidget(key, content, options)` 的 `options.placement` 是公开 API：
 

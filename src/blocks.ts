@@ -53,7 +53,7 @@ export interface History {
  *
  * Cost (known and explicitly accepted by the user): one spike pins the scale
  * until it rolls out of the 60s window, during which later values look small.
- * We used to default to `1/6` (only the last 10s) to mitigate that, but it
+ * We tried defaulting to `1/6` (only the last 10s) to mitigate that, but it
  * created a lying-scale problem: "tick says 293KB while a spike reaches the top
  * of the screen".
  *
@@ -145,8 +145,8 @@ export type Placement = "aboveEditor" | "belowEditor";
  * `belowEditor` — consistent with the error tolerance of `PI_SYSMON_LABEL` /
  * `PI_SYSMON_MODE`: one misconfigured env var shouldn't break the whole extension.
  *
- * Note that older versions defaulted to `aboveEditor`, so
- * `PI_SYSMON_PLACEMENT=above` is the switch to keep the old look after upgrading.
+ * During development the default was `aboveEditor`, so `PI_SYSMON_PLACEMENT=above`
+ * restores that look.
  */
 export function parsePlacement(v: string | undefined): Placement {
 	const s = (v ?? "").trim().toLowerCase();

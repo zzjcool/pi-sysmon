@@ -5,7 +5,9 @@
 	"type": "module",
 	"license": "MIT",
 	"private": false,
+	"author": "zzjcool",
 	"keywords": [
+		"pi-package",
 		"pi",
 		"pi-extension",
 		"pi-coding-agent",
@@ -34,20 +36,35 @@
 		"src",
 		"docs",
 		"README.md",
+		"README.zh-CN.md",
+		"CHANGELOG.md",
 		"LICENSE"
 	],
+	"publishConfig": {
+		"access": "public"
+	},
 	"pi": {
-		"extensions": ["./src/index.ts"]
+		"extensions": ["./src/index.ts"],
+		"image": "https://raw.githubusercontent.com/zzjcool/pi-sysmon/main/docs/images/overview.png"
 	},
 	"scripts": {
 		"test": "node --experimental-strip-types --test 'test/*.test.ts'",
 		"typecheck": "tsc --noEmit",
 		"build:single": "node scripts/bundle-single-file.mjs",
-		"check": "npm run typecheck && npm test"
+		"check": "npm run typecheck && npm test",
+		"prepublishOnly": "npm run check"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		},
+		"@earendil-works/pi-tui": {
+			"optional": true
+		}
 	},
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "^0.85.1",

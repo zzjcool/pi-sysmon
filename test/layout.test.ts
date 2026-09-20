@@ -1392,8 +1392,8 @@ test("parsePlacement: defaults to below (belowEditor), only explicit 'above' goe
 			"belowEditor",
 			`${JSON.stringify(v)} should parse/fall back to below`,
 		);
-	// Only values that clearly mean "above" go up (this was the old default;
-	// it's the escape hatch for upgrade appearance preservation)
+	// Only values that clearly mean "above" go up (this was the development-time
+	// default; the escape hatch for keeping the old look)
 	for (const v of ["above", "ABOVE", " above ", "aboveEditor", "top"])
 		assert.equal(parsePlacement(v), "aboveEditor", `"${v}" should parse to above`);
 });

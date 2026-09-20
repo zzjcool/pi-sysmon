@@ -592,7 +592,7 @@ export function rateAxis(dataMax: number): AxisSpec {
 	const dm = Number.isFinite(dataMax) && dataMax > 0 ? dataMax : 0;
 	// Empty data (dm=0): can't let all four labels collapse into `0.0`.
 	// Ticks are now **overlaid on the plot area**, and four `0.0`s stacked on
-	// the chart are messier than the old version (ticks in their own column).
+	// the chart are messier than putting the ticks in their own column.
 	// Provide a minimal usable scale (1 unit) so labels read `0.0/0.5/1.0/1.5` —
 	// the chart is still a flat line but the ticks at least make sense.
 	const effective = dm === 0 ? 1 : dm;

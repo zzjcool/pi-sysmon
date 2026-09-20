@@ -90,7 +90,7 @@ bottom 在同样宽度下会把四张图硬挤成一行（每张 16 列左右）
 pi install npm:pi-sysmon
 
 # 或锁定具体版本
-pi install npm:pi-sysmon@0.2.0
+pi install npm:pi-sysmon@0.3.0
 
 # 或直接装 git 源
 pi install git:github.com/zzjcool/pi-sysmon

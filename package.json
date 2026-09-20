@@ -1,6 +1,6 @@
 {
 	"name": "pi-sysmon",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "bottom-style braille system monitor charts (CPU / memory / network / LLM token throughput) for the pi coding agent",
 	"type": "module",
 	"license": "MIT",

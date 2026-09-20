@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-20
+
 ### Added
 
 - **Click-to-switch chip (fullscreen TUI only).** In pi's fullscreen TUI mode the panel shows a
@@ -55,5 +57,6 @@ installable with `pi install npm:pi-sysmon`.
   existing file that only carries the older `enabled: false` field is read as "global default off".
 - `chart` and `line` share one widget, so both follow `above`/`below` placement.
 
-[Unreleased]: https://github.com/zzjcool/pi-sysmon/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-sysmon/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zzjcool/pi-sysmon/releases/tag/v0.2.0

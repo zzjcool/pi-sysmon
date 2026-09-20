@@ -98,7 +98,7 @@ output / `R` cache reads), so the two can be compared directly. A few details:
 pi install npm:pi-sysmon
 
 # or pin an exact version
-pi install npm:pi-sysmon@0.2.0
+pi install npm:pi-sysmon@0.3.0
 
 # or straight from git
 pi install git:github.com/zzjcool/pi-sysmon

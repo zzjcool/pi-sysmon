@@ -16,7 +16,7 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
 
 </div>
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [X @zzjcoo](https://x.com/zzjcoo)
 
 ## Features
 
@@ -435,6 +435,8 @@ These were actually hit and fixed; recorded here to avoid repeats:
 ## Contributing
 
 Issues and PRs are welcome. Run `npm run check` to make sure tests and type checking pass.
+
+You can also reach me on X: [**@zzjcoo**](https://x.com/zzjcoo)
 
 ## Acknowledgements
 

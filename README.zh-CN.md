@@ -16,7 +16,7 @@ CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史
 
 </div>
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [X @zzjcoo](https://x.com/zzjcoo)
 
 ## 特性
 
@@ -395,6 +395,8 @@ CPU 段永远保留。
 ## 贡献
 
 欢迎 issue 和 PR。跑 `npm run check` 确保测试与类型检查通过。
+
+也欢迎在 X 上找我：[**@zzjcoo**](https://x.com/zzjcoo)
 
 ## 致谢
 

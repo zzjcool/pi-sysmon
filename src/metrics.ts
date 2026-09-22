@@ -295,7 +295,10 @@ export function parseNetstatIb(text: string): { rx: number; tx: number } {
 	const perIface = new Map<string, { rx: number; tx: number }>();
 	for (const line of text.split("\n")) {
 		const tokens = line.trim().split(/\s+/);
-		if (tokens.length < 8) continue;
+		// Name Mtu Network + the 7 trailing counters is the minimum a real row can
+		// have. Requiring all 10 keeps a truncated/garbled row from being
+		// right-anchored onto the wrong columns and injecting a bogus number.
+		if (tokens.length < 10) continue;
 		const name = tokens[0] ?? "";
 		if (!name || name === "Name" || skipIface(name)) continue;
 		const tail = tokens.slice(-7); // Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll

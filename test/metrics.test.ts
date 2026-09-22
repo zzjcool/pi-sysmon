@@ -188,6 +188,15 @@ en1 1500 fe80::1 5 - 1234 6 - 4321 -
 	assert.deepEqual(parseNetstatIb(dashed), { rx: 1234, tx: 4321 });
 });
 
+test("parseNetstatIb: a truncated row is ignored, not right-anchored onto false columns", () => {
+	// 8 tokens — too short to be a real row: the trailing counters would line up
+	// wrong if slice(-7) were trusted blindly, so such a row must contribute nothing.
+	const txt = `Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+en2 1500 10.0.0.2 5 7 1234 6 8
+`;
+	assert.deepEqual(parseNetstatIb(txt), { rx: 0, tx: 0 });
+});
+
 /* ------------------------------------------------------------------ */
 /* 4. parseIostat — CPU from the *second* sample                        */
 /* ------------------------------------------------------------------ */

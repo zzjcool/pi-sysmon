@@ -19,8 +19,9 @@
  *          `Bytes (Read)`/`Bytes (Write)` counters *and* the read/write split
  *          that iostat's MB/s column lacks, at ~20ms per call. This is what
  *          keeps collect()'s counter+differential logic untouched.
- * `parseIostat` is still implemented (and tested) per the frozen plan, and is
- * used as the CPU fallback should os.cpus() ever be unusable.
+ * `parseIostat` stays implemented (and tested): it is the CPU fallback should
+ * os.cpus() ever be unusable, and its tested agreement with os.cpus() is the
+ * executable evidence for the architecture decision above.
  */
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
@@ -255,11 +256,11 @@ export function parseVmStat(text: string, pageSize?: number): VmStat {
 }
 
 /**
- * Used memory, following macOS `top`'s PhysMem semantics: pages that are free,
- * inactive or speculative are treated as reclaimable, so
- * `used = total - (free + inactive + speculative)`.
- * (The frozen plan specifies exactly this formula; note it runs higher than
- * top's own "used" figure, which also subtracts the compressor's footprint.)
+ * Used memory: pages that are free, inactive or speculative are treated as
+ * reclaimable, so `used = total - (free + inactive + speculative)`.
+ * (Note this is deliberately NOT top's "used" figure: top counts inactive as
+ * used and only subtracts free+purgeable, so this formula runs lower than top.
+ * It matches the MemAvailable convention of the Linux path above.)
  */
 export function vmStatUsedBytes(v: VmStat, pageSize: number, total: number): number {
 	const reclaimable = (v.free + v.inactive + v.speculative) * pageSize;
@@ -399,6 +400,9 @@ export function parseIostat(text: string): IostatCpu {
  * values are true monotonic counters with a read/write split — exactly the shape
  * collect()'s `(disk.read - lastDisk.read) / dt` differential expects, so the
  * Linux differencing logic needs no darwin special case.
+ * (Caveat: disk images / removable media mount their own IOBlockStorageDriver;
+ * ejecting one makes its counters vanish, so the total can step DOWN. The
+ * collector's Math.max(0, …) clamp absorbs it as a one-tick rate hole.)
  */
 export function parseIoreg(text: string): { read: number; write: number } {
 	let read = 0;

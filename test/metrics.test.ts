@@ -158,6 +158,14 @@ test("vmStatUsedBytes: clamps to 0 when the reclaimable pages exceed total", () 
 	assert.equal(vmStatUsedBytes(v, v.pageSize, 1024), 0);
 });
 
+test("vmStatUsedBytes: an all-zero page census reports the whole RAM as used", () => {
+	// The degenerate boundary: no reclaimable pages at all (e.g. a truncated
+	// vm_stat where every counter line failed to parse). used must fall back
+	// to `total`, not to NaN/0/negative — the panel must still render a number.
+	const v = parseVmStat("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n");
+	assert.equal(vmStatUsedBytes(v, v.pageSize, 34359738368), 34359738368);
+});
+
 /* ------------------------------------------------------------------ */
 /* 3. parseNetstatIb — per-interface de-duplication                     */
 /* ------------------------------------------------------------------ */
@@ -197,6 +205,17 @@ en2 1500 10.0.0.2 5 7 1234 6 8
 	assert.deepEqual(parseNetstatIb(txt), { rx: 0, tx: 0 });
 });
 
+test("parseNetstatIb: bridge0 traffic IS counted (it is a real macOS interface)", () => {
+	// macOS's bridge0 (unlike Linux's br-*) carries real virtualization traffic
+	// and must stay in the totals. This pins skipIface's boundary: if someone
+	// later adds `startsWith("bridge")`, this test must go red.
+	const txt = `Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+bridge0 1500 <Link#4> 7 0 999 8 0 888 0
+lo0 16384 <Link#1> 34000450 0 28785346652 34000450 0 28785346652 0
+`;
+	assert.deepEqual(parseNetstatIb(txt), { rx: 999, tx: 888 });
+});
+
 /* ------------------------------------------------------------------ */
 /* 4. parseIostat — CPU from the *second* sample                        */
 /* ------------------------------------------------------------------ */
@@ -225,6 +244,25 @@ test("parseIostat: tolerates an optional ni column", () => {
 	assert.equal(c.sy, 2);
 	assert.equal(c.id, 96);
 	assert.ok(Math.abs(c.busyPct - 4) < 1e-9);
+});
+
+test("parseIostat: with -c 3 the LAST sample wins (the 1st is since-boot, the 2nd lags)", () => {
+	// Three sample blocks: only the final one reflects "now". A first-wins or
+	// middle-wins regression must be caught here, not on a user's dashboard.
+	const c = parseIostat(`          disk0      cpu     load average
+    KB/t tps  MB/s  us sy id   1m  5m  15m
+   12.47  58  0.71   6 2 91  2.3 2.5 2.6
+                        
+    KB/t tps  MB/s  us sy id
+    6.41  58  0.36   8 3 88
+                        
+    KB/t tps  MB/s  us sy id
+    3.21  40  0.20   3 2 94
+`);
+	assert.equal(c.us, 3);
+	assert.equal(c.sy, 2);
+	assert.equal(c.id, 94);
+	assert.ok(Math.abs(c.busyPct - (100 * 5) / 99) < 1e-9);
 });
 
 test("parseIostat: junk input degrades to zeros instead of throwing", () => {

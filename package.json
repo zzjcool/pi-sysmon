@@ -1,6 +1,6 @@
 {
 	"name": "pi-sysmon",
-	"version": "0.5.0",
+	"version": "0.6.0",
 	"description": "bottom-style braille system monitor charts (CPU / memory / network / LLM token throughput) for the pi coding agent",
 	"type": "module",
 	"license": "MIT",
@@ -44,7 +44,9 @@
 		"access": "public"
 	},
 	"pi": {
-		"extensions": ["./src/index.ts"],
+		"extensions": [
+			"./src/index.ts"
+		],
 		"image": "https://raw.githubusercontent.com/zzjcool/pi-sysmon/main/docs/images/overview.png"
 	},
 	"scripts": {

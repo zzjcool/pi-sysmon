@@ -199,3 +199,18 @@ export function fmtHitPct(v: number): string {
 	const n = Math.round(Math.min(100, Math.max(0, v)));
 	return `${n}%`;
 }
+
+/**
+ * Format context-window usage as an integer percentage: `42%` / `100%`.
+ *
+ * **Delegates to `fmtHitPct`** rather than duplicating the body: both are
+ * "integer percent, width-bounded by construction (max `100%` = 4 columns)"
+ * readouts living in the same scarcest-space title bar, and a second copy of
+ * the clamp/round dance is exactly the kind of drift this file exists to
+ * prevent. The separate name exists for intent at the call site — a hit rate
+ * and a context fill level are different quantities that happen to share a
+ * formatting rule (and a `N%` suffix).
+ */
+export function fmtCtxPct(v: number): string {
+	return fmtHitPct(v);
+}

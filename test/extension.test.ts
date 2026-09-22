@@ -103,6 +103,7 @@ async function loadExtension(flags: Record<string, unknown> = {}) {
 	factory(api as any);
 
 	const sessionStart = () => events.get("session_start")?.[0]?.({}, ctx);
+	const sessionShutdown = () => events.get("session_shutdown")?.[0]?.();
 	const run = (args: string) => commands.get("sysmon")?.(args, ctx);
 	const cfg = (): Record<string, unknown> =>
 		JSON.parse(readFileSync(configFile, "utf8"));
@@ -143,7 +144,7 @@ async function loadExtension(flags: Record<string, unknown> = {}) {
 	const mount = (tuiMode: string) => instantiate(lastWidget(), makeTui(tuiMode));
 	const mountFooter = (tuiMode: string) =>
 		instantiate(footers.at(-1) as AnyFn | undefined, makeTui(tuiMode));
-	return { ctx, entries, ui, sessionStart, run, cfg, notifies, lastWidget, mount, mountFooter, makeTui, instantiate, ansiTheme };
+	return { ctx, entries, ui, sessionStart, sessionShutdown, run, cfg, notifies, lastWidget, mount, mountFooter, makeTui, instantiate, ansiTheme };
 }
 
 /* ------------------------------------------------------------------ */
@@ -670,5 +671,67 @@ test("fullscreen footer: chip renders, click toggles to the line widget and clea
 			);
 	} finally {
 		comp.dispose();
+	}
+});
+
+/* ------------------------------------------------------------------ */
+/* Context-window usage (◔N%) — fed by ctx.getContextUsage()           */
+/* ------------------------------------------------------------------ */
+
+test("context usage: chart title shows ◔N% from getContextUsage(), degraded on null/throw/absent", async () => {
+	// The reading must come from pi's own ledger (the same number the built-in
+	// footer shows), refreshed per sample. Three degradation paths are pinned:
+	//   1. `percent: null` (post-compaction window) ⇒ no ◔ at all (not ◔0%);
+	//   2. a throwing/absent getContextUsage on the host ⇒ same absence,
+	//      and system sampling must keep working;
+	//   3. session_shutdown drops the remembered ctx.
+	// The fake ctx in loadExtension doesn't implement getContextUsage, so it is
+	// grafted on per test.
+	let usage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
+	const h = await loadExtension();
+	h.ctx.getContextUsage = () => {
+		if (!usage) throw new Error("boom");
+		return usage;
+	};
+	await h.sessionStart();
+	// sessionStart is idempotent (unmount→remount) **and re-samples**, so it is
+	// also the refresh point between readings below: the first sample ran before
+	// `usage` was armed, so re-drive it per assertion. Mounting the widget
+	// factory each time gives a component that reads the live ctxPct.
+	const renderTitle = async (): Promise<string> => {
+		await h.sessionStart();
+		const comp = h.mount("regular");
+		try {
+			return stripAnsi(
+				comp.render(160).find((l: string) => l.includes("Tokens")) ?? "",
+			);
+		} finally {
+			comp.dispose();
+		}
+	};
+	// Normal reading: 12345/200000 = 6.17% → ◔6%
+	usage = { tokens: 12_345, contextWindow: 200_000, percent: 6.1725 };
+	assert.match(await renderTitle(), /◔6%/);
+	// High fill takes the warning tier (pi footer thresholds)
+	usage = { tokens: 150_000, contextWindow: 200_000, percent: 75 };
+	assert.match(await renderTitle(), /◔75%/);
+	// Post-compaction: percent null ⇒ absent, never ◔0%
+	usage = { tokens: null, contextWindow: 200_000, percent: null };
+	assert.ok(!(await renderTitle()).includes("◔"));
+	// Host throws ⇒ degrade, sampling continues (the panel still renders)
+	usage = undefined;
+	const threw = await renderTitle();
+	assert.ok(!threw.includes("◔"), threw);
+	assert.ok(threw.includes("Tokens"), "panel must survive a throwing host");
+	// Shutdown clears the remembered ctx: a later render must not resurrect
+	// a stale reading even if usage becomes available again through it.
+	await h.sessionShutdown();
+	usage = { tokens: 12_345, contextWindow: 200_000, percent: 50 };
+	const after = h.mount("regular");
+	try {
+		const t = stripAnsi(after.render(160).find((l: string) => l.includes("Tokens")) ?? "");
+		assert.ok(!t.includes("◔"), "session_shutdown must drop the remembered ctx");
+	} finally {
+		after.dispose();
 	}
 });

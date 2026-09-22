@@ -18,6 +18,7 @@
  * WIDGET_MAX_ROWS).
  */
 import type {
+	ContextUsage,
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
@@ -55,6 +56,16 @@ import {
 // ThemeLike is imported uniformly from chart-panel.ts, avoiding two diverging definitions.
 // `Mode` and `Placement` live in blocks.ts (which owns the matching
 // `parseMode`/`parsePlacement`) and are re-exported here for legacy call sites.
+/**
+ * Structural stand-in for pi's `ExtensionContext` — but only the fields this
+ * extension actually reads. `getContextUsage` is optional: the fake ctx in
+ * tests doesn't implement it, and the whole reading degrades to "unknown"
+ * (◔ segment simply absent) rather than crashing.
+ */
+type CtxUsageHost = {
+	getContextUsage(): ContextUsage | undefined;
+};
+
 /**
  * A host that can use the UI. The name dates back to the setStatus era (when
  * it was also needed to clear the status line); now it's only used to mount
@@ -363,6 +374,22 @@ export default function (pi: ExtensionAPI) {
 	 * hit rate before the first reply even arrives.
 	 */
 	let lastHit: number | undefined;
+	/**
+	 * **Context-window usage** in percent (0..100), refreshed every sample from
+	 * pi's own `ctx.getContextUsage()` — the same number pi's built-in footer
+	 * shows, so the two readouts can be cross-checked.
+	 *
+	 * `undefined` = unknown (no model yet, or the post-compaction window where
+	 * pi itself reports `percent: null` until the next LLM response): the `◔N%`
+	 * segment is simply absent, the same way `·N%` is absent before the first
+	 * measurable prompt. Deliberately **not** re-derived from our own token
+	 * totals — pi's estimate accounts for system prompt, tool results, and
+	 * compaction boundaries; re-deriving it here would be a second ledger
+	 * guaranteed to drift.
+	 */
+	let ctxPct: number | undefined;
+	/** The most recent event context with `getContextUsage()` — see sample(). */
+	let usageHost: CtxUsageHost | undefined;
 
 	/** Add one assistant message's exact usage into the cumulative totals (guards against duplicates/bad values) */
 	const addUsage = (u: unknown): void => {
@@ -411,6 +438,23 @@ export default function (pi: ExtensionAPI) {
 
 	function sample() {
 		try {
+			// Context usage first: pi recomputes it per call, and it's O(entries) —
+			// reading it once per sample (1 Hz by default) is exactly the sampling
+			// cadence this block already runs at. Wrapped defensively: a throwing
+			// host (old pi without the method, stubbed tests) degrades to "unknown",
+			// never kills system sampling.
+			try {
+				const u = usageHost?.getContextUsage();
+				// `percent: null` (post-compaction) must map to `undefined` (unknown),
+				// never to 0 — "91% a second ago" collapsing to "0%" after a compaction
+				// would look like a reset that never happened.
+				ctxPct =
+					u && typeof u.percent === "number" && Number.isFinite(u.percent)
+						? u.percent
+						: undefined;
+			} catch {
+				ctxPct = undefined;
+			}
 			snap = collector.collect();
 			pushCapped(hist.cpu, snap.cpuPct, STORE_CAP);
 			pushCapped(hist.mem, snap.memPct, STORE_CAP);
@@ -480,6 +524,8 @@ export default function (pi: ExtensionAPI) {
 		theme: ThemeLike,
 		width: number,
 		maxRows: number,
+		/** Whether the `↑`/`↓`/`R` token totals may be shown — footer mode only (see BlockOptions.showTokenTotals). */
+		showTokenTotals: boolean,
 	): string[] {
 		const { points, windowSecs } = resolveWindow({
 			windowSecs: defaultWindowSecs,
@@ -510,6 +556,12 @@ export default function (pi: ExtensionAPI) {
 			// never touches the cache degrades to the old single-curve Tokens block
 			// without any special casing here.
 			hitNow: tokCacheRead > 0 ? lastHit : undefined,
+			// Context-window usage — same "unknown ⇒ absent" degradation as hitNow.
+			ctxPct,
+			// Cumulative token counters: only footer mode replaces pi's own footer
+			// (and its `↑ ↓ R` reading) — widget modes sit next to it, where showing
+			// the same numbers twice is pure noise.
+			showTokenTotals,
 			labelMode,
 			// `undefined` is taken over by the `?? DEFAULT_...` inside buildBlocks, so pass it through
 			scaleWindowFrac,
@@ -540,6 +592,8 @@ export default function (pi: ExtensionAPI) {
 				// Same gating as the chart path above, so both modes show a hit rate
 				// (or neither does) — never a `·0%` on the line while the chart omits it.
 				hitNow: tokCacheRead > 0 ? lastHit : undefined,
+				// Context-window usage — same value, same degradation as the chart path.
+				ctxPct,
 			},
 			width,
 		);
@@ -742,15 +796,20 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
-	/** The chart component (widget and footer differ only in row budget) */
-	const makeChart = (maxRows: number) =>
+	/** The chart component (widget and footer differ only in row budget — and in whether the token totals are shown) */
+	const makeChart = (maxRows: number, showTokenTotals: boolean) =>
 		makeSampled(
 			// The chip row's cost comes out of the **row budget**, not the
 			// constant: fullscreen subtracts 1 so panel + chip stays within
 			// maxRows, while regular mode (fs=false) gets the identical budget
 			// and therefore byte-identical rows to before this feature.
 			(theme, width, fs) =>
-				renderPanelFor(theme, width, maxRows - (fs ? 1 : 0)),
+				renderPanelFor(
+					theme,
+					width,
+					maxRows - (fs ? 1 : 0),
+					showTokenTotals,
+				),
 			(theme, width) => chipRow(theme, width),
 		);
 
@@ -857,14 +916,17 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (mode === "chart") {
-			ctx.ui.setWidget(WIDGET_KEY, makeChart(WIDGET_MAX_ROWS), {
+			// Widget mode sits next to pi's own footer (which shows ↑/↓/R), so the
+			// totals are off — no duplicate readings.
+			ctx.ui.setWidget(WIDGET_KEY, makeChart(WIDGET_MAX_ROWS, false), {
 				placement,
 			});
 			return true;
 		}
 
-		// footer: replace the whole bottom bar
-		ctx.ui.setFooter(makeChart(FOOTER_MAX_ROWS));
+		// footer: replace the whole bottom bar. pi's own footer (and its
+		// `↑ ↓ R` token readout) vanishes with it, so the totals go ON here.
+		ctx.ui.setFooter(makeChart(FOOTER_MAX_ROWS, true));
 		return true;
 	}
 
@@ -1050,6 +1112,16 @@ export default function (pi: ExtensionAPI) {
 	// thinking, tool-call arguments.
 	// `*_end.content` is the full text of the whole block; counting it would
 	// **double-count** the deltas already counted, so never touch it.
+	// ── Context-usage source: remember a ctx that can answer getContextUsage ──
+	// Every handler receives essentially the same context object (backed by the
+	// live agent session), so remembering the latest one keeps the reading live
+	// across `/new` and `/resume` without any extra bookkeeping. `session_start`
+	// and `message_end` are the natural refresh points; `session_shutdown` clears
+	// it so a stale session's number can't linger into the next one.
+	const rememberCtx = (ctx: CtxUsageHost): void => {
+		usageHost = ctx;
+	};
+
 	pi.on("message_update", (event) => {
 		const ev = event.assistantMessageEvent;
 		// Write the type guards out in full instead of just checking `"delta" in ev`:
@@ -1069,15 +1141,23 @@ export default function (pi: ExtensionAPI) {
 	// The `usage` from `message_end` is the provider's authoritative value, so
 	// just accumulate it — and it matches pi footer's convention (summing over
 	// session entries).
-	pi.on("message_end", (event) => {
+	pi.on("message_end", (event, ctx) => {
 		// Only count assistant messages: user messages also trigger message_end,
 		// and counting them would double-count the uplink (the prompt text itself
 		// is not token usage).
 		if (event.message.role !== "assistant") return;
 		addUsage(event.message.usage);
+		// message_end fires on every turn boundary — the context usage estimate
+		// moves exactly then (the new assistant usage is what it's computed
+		// from), so refresh the remembered ctx here too even though sample() reads
+		// it per tick anyway. Cheap (an assignment), and it keeps the reading live
+		// even before the next sample lands.
+		rememberCtx(ctx);
 	});
 
 	pi.on("session_start", (_e, ctx) => {
+		// Fresh session ⇒ fresh context ledger (model may differ, entries reset).
+		rememberCtx(ctx);
 		// Display preferences and the global on/off default come from the file.
 		const cfg = readCfg();
 		if (cfg.mode) mode = cfg.mode; // remember last mode
@@ -1107,5 +1187,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		stop();
 		activeMode = undefined;
+		// Drop the remembered ctx with the session: its getContextUsage() reads the
+		// dying session's entries, and keeping it would freeze the last reading
+		// (or worse, resurrect it) in whatever session mounts the monitor next.
+		usageHost = undefined;
+		ctxPct = undefined;
 	});
 }

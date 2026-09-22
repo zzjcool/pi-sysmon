@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
 	estimateDeltaTokens,
 	createTpsMeter,
+	fmtCtxPct,
 	fmtHitPct,
 	fmtTps,
 	hitRate,
@@ -387,4 +388,25 @@ test("meter: add tolerates bad input and never throws (external events have no t
 	assert.equal(m.pending(), 0, "bad input must not contribute tokens");
 	assert.equal(estimateDeltaTokens(undefined as unknown as string), 0);
 	assert.equal(estimateDeltaTokens(null as unknown as string), 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* 6. fmtCtxPct (context-window usage)                                 */
+/* ------------------------------------------------------------------ */
+
+test("fmtCtxPct: same integer-percent contract as fmtHitPct (width-bounded, never NaN)", () => {
+	// Context usage shares the title bar's scarcest-space discipline, so its
+	// formatter must satisfy the same hard constraints: integer, clamped to
+	// [0,100] so the string can never exceed `100%` (4 columns), non-finite → 0%.
+	assert.equal(fmtCtxPct(42.4), "42%");
+	assert.equal(fmtCtxPct(42.5), "43%"); // rounds, doesn't truncate
+	assert.equal(fmtCtxPct(0), "0%");
+	assert.equal(fmtCtxPct(100), "100%");
+	assert.equal(fmtCtxPct(100.6), "100%"); // clamp, not grow
+	assert.equal(fmtCtxPct(-5), "0%");
+	assert.equal(fmtCtxPct(Number.NaN), "0%");
+	assert.equal(fmtCtxPct(Number.POSITIVE_INFINITY), "0%");
+	for (const v of [fmtCtxPct(99.9), fmtCtxPct(0.1), fmtCtxPct(1e9), fmtCtxPct(-1e9)]) {
+		assert.ok(v.length <= FMT_HIT_MAX, `${v} exceeds the ${FMT_HIT_MAX}-column budget`);
+	}
 });

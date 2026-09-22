@@ -76,11 +76,14 @@ each), making the curves unreadable.
 ### The two directions of the Tokens chart
 
 ```
-┌ Tokens ─ ~58t/s ·92% ⌀87%  ↑5.9k ↓60 R2.7k ─┐
+┌ Tokens ─ ~58t/s ·92% ⌀87% ◔42% ─┐
 ```
 
-The readings use the same convention as pi's own status bar (`↑` upstream input / `↓` downstream
-output / `R` cache reads), so the two can be compared directly. A few details:
+The readings deliberately avoid duplicating pi's own status bar: in widget modes (chart / line)
+the panel sits right next to it, and pi already permanently displays `↑` upstream input / `↓`
+downstream output / `R` cache reads — so those three counters are omitted here. Only `/sysmon footer`
+mode (which **replaces** pi's status bar, taking its token readout with it) shows them again.
+A few details:
 
 - **The main curve only plots the downstream rate.** The two directions have completely different shapes
   over time (upstream is one bulk upload; downstream streams token by token — a measured ratio of
@@ -88,7 +91,19 @@ output / `R` cache reads), so the two can be compared directly. A few details:
 - **`~` only appears on the rate** — it's estimated from streaming deltas; the cumulative figures
   come from the provider's exact `usage`, so they carry no `~`. Which number to trust is obvious at a glance.
 - As the block narrows, segments are dropped by importance: rate → instantaneous hit → cumulative
-  hit → upstream → downstream → cache reads.
+  hit → context usage → (footer mode: upstream → downstream → cache reads).
+
+### Context usage: `◔N%`
+
+The `◔N%` reading (a partly-filled circle — "how full the context window is") is the **same
+number pi's own status bar shows** (from `ctx.getContextUsage()`, pi's own estimate over the live
+session — system prompt, tool results, and compaction boundaries included), so the two readouts
+can be cross-checked. It is deliberately **not** re-derived from the chart's own token totals:
+pi's estimate accounts for things those totals can't see.
+
+The color follows pi's footer thresholds: muted normally, warning above 70%, error above 90%.
+Unknown readings (no model yet, or the window right after a `/compact` — pi reports no percent
+until the next LLM response) degrade to an absent segment, never to a bogus `◔0%`.
 
 ### Cache hit rate: the second curve
 

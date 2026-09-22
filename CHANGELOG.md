@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Context-window usage `◔N%` in the Tokens readout** (both chart title bar and `line` mode).
+  The number comes from pi's own `ctx.getContextUsage()` — the exact same ledger the built-in
+  footer displays — refreshed once per sample, so the two readouts can be cross-checked.
+  - Sits between the hit rates and the cumulative counters in the segment priority order: on a
+    narrowing block it survives while `↑`/`↓`/`R` yield, and only the hit rates outlast it.
+  - Color follows pi's footer thresholds: muted normally, warning above 70%, error above 90%.
+  - Unknown readings degrade to an absent segment, never a bogus `◔0%`: no model yet, or the
+    post-`/compact` window where pi reports no percent until the next LLM response. A throwing
+    or absent host `getContextUsage` degrades the same way without breaking system sampling.
+
+### Changed
+
+- **Removed the duplicate `↑`/`↓`/`R` token counters** from the Tokens readout in widget modes
+  (chart / line). pi's own footer sits right below the panel and permanently shows those exact
+  numbers, so showing them twice was pure noise. `/sysmon footer` mode keeps them: it replaces
+  pi's footer, and its token readout vanishes with it.
+
 ## [0.5.0] — 2026-09-22
 
 ### Fixed

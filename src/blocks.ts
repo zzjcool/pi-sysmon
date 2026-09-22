@@ -22,7 +22,7 @@ import { fmtBytes, fmtRate, type Snapshot } from "./metrics.ts";
 // The TPS formatter lives in the tokens module (the rightful home of anything
 // token-related); import it here rather than writing a second copy — two
 // formatters for the same quantity will drift sooner or later.
-import { fmtHitPct, fmtTps, hitRate } from "./tokens.ts";
+import { fmtCtxPct, fmtHitPct, fmtTps, hitRate } from "./tokens.ts";
 
 /** History series to plot as curves (all numeric arrays, index 0 = oldest) */
 export interface History {
@@ -112,6 +112,28 @@ export interface BlockOptions {
 	 * cumulative session average, which is what the second curve draws.
 	 */
 	hitNow?: number;
+	/**
+	 * **Context-window usage** in percent (0..100), from pi's own
+	 * `ctx.getContextUsage().percent` — the exact same ledger pi's built-in
+	 * footer displays, so the two readouts can be cross-checked.
+	 *
+	 * `undefined` means "unknown": no model / no context window yet, or the
+	 * window right after a compaction (pi reports `percent: null` until the
+	 * next LLM response — the last assistant usage there reflects the
+	 * *pre-compaction* context, which would wildly overstate it). Shown as
+	 * `◔N%` in the title bar.
+	 */
+	ctxPct?: number;
+	/**
+	 * Show the cumulative `↑`/`↓`/`R` token counters in the Tokens title bar.
+	 *
+	 * **Off by default**: in widget modes (chart / line) the panel sits right
+	 * next to pi's own footer, which permanently displays the same
+	 * `↑input ↓output RcacheRead` — duplicating them is pure noise. Only
+	 * `footer` mode turns it on, because there the panel **replaces** pi's
+	 * footer and its token readout vanishes with it.
+	 */
+	showTokenTotals?: boolean;
 	/**
 	 * Where to put the readouts: `title` (default) = border title bar; `box` =
 	 * floating box at the top-right corner; `both` = draw both; `none` = draw neither.
@@ -260,10 +282,48 @@ export interface LineOptions {
 	tokensCacheRead?: number;
 	/** Instantaneous cache hit rate of the last assistant turn (0..100), shown as `·N%` */
 	hitNow?: number;
+	/** Context-window usage percent from pi's `getContextUsage()`, shown as `◔N%` */
+	ctxPct?: number;
+	/**
+	 * Show the cumulative `↑`/`↓`/`R` counters. Only for `footer` mode (where
+	 * this line **replaces** pi's own footer and its `↑5.7k ↓11 R640` reading);
+	 * widget modes sit next to that footer, where the same numbers are already
+	 * on screen — duplicating them is pure noise.
+	 */
+	showTokenTotals?: boolean;
 }
 
 /** Segment construction helper: saves every readout from writing `{ text, color }` in full */
 const seg = (text: string, color?: ThemeColor): Seg => ({ text, color });
+
+/**
+ * Color for the context-usage readout, from the same thresholds as pi's
+ * built-in footer (>90 → error, >70 → warning, else muted): "context almost
+ * full" should visually scream at the same fill level it screams in the
+ * footer, not at some parochial one.
+ *
+ * A named helper instead of an inline ternary chain — both modes use it, and
+ * the thresholds are load-bearing enough to deserve a name.
+ */
+function ctxPctColor(pct: number): ThemeColor {
+	if (pct > 90) return "error";
+	if (pct > 70) return "warning";
+	return "muted";
+}
+
+/**
+ * Build the `◔N%` context-usage segment shared by both modes, or `undefined`
+ * when the reading is unknown (no model yet, or the post-compaction window
+ * where pi itself reports `percent: null`).
+ */
+function ctxSeg(pct: number | undefined): Seg | undefined {
+	if (pct === undefined || !Number.isFinite(pct)) return undefined;
+	// `◔` (U+25D4 CIRCLE WITH UPPER RIGHT QUADRANT BLACK) is a partly-filled
+	// circle — "how full the context window is" at a glance; width 1 (same
+	// class as `⌀`/`·`, verified via pi-tui's visibleWidth), so it costs the
+	// same one column as the other point readouts in the title bar.
+	return { text: ` ◔${fmtCtxPct(pct)}`, color: ctxPctColor(pct) };
+}
 
 /**
  * The text line of `line` mode — returns **tiered segments**; when width runs
@@ -351,10 +411,18 @@ export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
 	if (seenCache && opts.hitNow !== undefined && Number.isFinite(opts.hitNow))
 		tokSegs.push(seg(` ·${fmtHitPct(opts.hitNow)}`, "success"));
 	if (seenCache) tokSegs.push(seg(` ⌀${fmtHitPct(cumHit)}`, "warning"));
-	// Cumulative initials `↑`/`↓`/`R` match pi's built-in footer in character and order, directly comparable
-	if (tokIn > 0) tokSegs.push(seg(` ↑${fmtTokensTotal(tokIn)}`, "muted"));
-	if (tokOut > 0) tokSegs.push(seg(` ↓${fmtTokensTotal(tokOut)}`, "muted"));
-	if (seenCache) tokSegs.push(seg(` R${fmtTokensTotal(tokR)}`, "muted"));
+	// Context-window usage — same segment, same colors, same position in the
+	// sequence as the chart title bar (see the comment there), so the two modes
+	// stay cross-checkable.
+	const ctx = ctxSeg(opts.ctxPct);
+	if (ctx) tokSegs.push(ctx);
+	// Cumulative `↑`/`↓`/`R` — footer mode only (same reasoning as the chart
+	// path: pi's own footer already carries these in widget modes).
+	if (opts.showTokenTotals) {
+		if (tokIn > 0) tokSegs.push(seg(` ↑${fmtTokensTotal(tokIn)}`, "muted"));
+		if (tokOut > 0) tokSegs.push(seg(` ↓${fmtTokensTotal(tokOut)}`, "muted"));
+		if (seenCache) tokSegs.push(seg(` R${fmtTokensTotal(tokR)}`, "muted"));
+	}
 	groups.push(tokSegs);
 
 	if (s) {
@@ -734,12 +802,26 @@ export function buildBlocks(
 			infoSegs.push({ text: ` ·${fmtHitPct(opts.hitNow)}`, color: "success" });
 		if (seenCache)
 			infoSegs.push({ text: ` ⌀${fmtHitPct(cumHit)}`, color: "warning" });
-		if (tokIn > 0)
-			infoSegs.push({ text: `  \u2191${fmtTokensTotal(tokIn)}`, color: "muted" });
-		if (tokOut > 0)
-			infoSegs.push({ text: ` \u2193${fmtTokensTotal(tokOut)}`, color: "muted" });
-		if (seenCache)
-			infoSegs.push({ text: ` R${fmtTokensTotal(tokR)}`, color: "muted" });
+		// Context-window usage — `◔` reads as "how full the context window is".
+		// Sits after the hit rates, before the cumulative counters: it's the one
+		// number here the user can't recompute from anywhere else on the chart
+		// (pi's own footer aside), so it outranks the `↑`/`↓`/`R` background info
+		// and yields only to the hit rates, whose second curve lives in this
+		// block. Same segment/color source as line mode — one helper, no drift.
+		const ctx = ctxSeg(opts.ctxPct);
+		if (ctx) infoSegs.push(ctx);
+		// Cumulative `↑`/`↓`/`R` — only in footer mode (showTokenTotals): in
+		// widget modes pi's own footer already shows these exact numbers right
+		// below the panel, and duplicating them was pure noise. They stay last in
+		// the priority order (background info, drops first on narrow blocks).
+		if (opts.showTokenTotals) {
+			if (tokIn > 0)
+				infoSegs.push({ text: `  \u2191${fmtTokensTotal(tokIn)}`, color: "muted" });
+			if (tokOut > 0)
+				infoSegs.push({ text: ` \u2193${fmtTokensTotal(tokOut)}`, color: "muted" });
+			if (seenCache)
+				infoSegs.push({ text: ` R${fmtTokensTotal(tokR)}`, color: "muted" });
+		}
 		// ── Second curve: cumulative hit rate (only once cache reads exist) ──
 		// It has its **own 0..100% scale**, but no second gutter: its values are
 		// pre-mapped onto the TPS axis (`hit% / 100 × axisTop`) and the series is

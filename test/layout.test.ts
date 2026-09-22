@@ -44,6 +44,7 @@ import {
 	DEFAULT_SCALE_WINDOW_FRAC,
 	MIN_TPS_SCALE,
 	TPS_GUTTER,
+	type BlockOptions,
 	type History,
 } from "../src/blocks.ts";
 
@@ -1113,18 +1114,21 @@ test("fmtTokensTotal: magnitude boundaries and width upper bound (aligned with p
 	}
 });
 
-test("buildBlocks: Tokens block is wired correctly (both up/down shown, same accounting as pi footer)", () => {
+test("buildBlocks: Tokens block is wired correctly (totals shown only when showTokenTotals)", () => {
 	// Asserting only the block name isn't enough: if the series were wired to
 	// some other history array (like hist.cpu), or the reading args were
 	// forgotten (always 0), a name-only test would still pass.
 	const h = fakeHist(50);
-	const tok = buildBlocks(h, fakeSnap(), {
-		points: 30,
-		tpsNow: 250,
-		tokensIn: 5671,
-		tokensOut: 11,
-		tokensCacheRead: 640,
-	}).find((b) => b.name === "Tokens");
+	const mk = (over: Partial<BlockOptions> = {}) =>
+		buildBlocks(h, fakeSnap(), {
+			points: 30,
+			tpsNow: 250,
+			tokensIn: 5671,
+			tokensOut: 11,
+			tokensCacheRead: 640,
+			...over,
+		}).find((b) => b.name === "Tokens");
+	const tok = mk();
 	assert.ok(tok, "there should be a Tokens block by default (PI_SYSMON_TOKENS defaults on)");
 	assert.deepEqual(
 		tok.series[0]?.values,
@@ -1139,14 +1143,22 @@ test("buildBlocks: Tokens block is wired correctly (both up/down shown, same acc
 		title.startsWith("~250t/s"),
 		`the rate reading should carry ~ and use the compact form: ${JSON.stringify(title)}`,
 	);
-	// Both up/down must appear (the user's reported problem: only one direction)
-	assert.ok(title.includes("\u2191"), `should contain upload: ${title}`);
-	assert.ok(title.includes("\u2193"), `should contain download: ${title}`);
-	// Numbers match pi footer's formatTokens (lowercase k)
-	assert.ok(title.includes("5.7k"), `↑5671 should format as 5.7k: ${title}`);
-	assert.ok(title.includes("R640"), `cache reads should show as R640: ${title}`);
+	// Widget modes sit next to pi's own footer, which permanently shows the
+	// same `↑ ↓ R` numbers — so the default is OFF (no duplicate readings).
+	assert.ok(!title.includes("\u2191"), `widget default must not duplicate upload: ${title}`);
+	assert.ok(!title.includes("\u2193"), `widget default must not duplicate download: ${title}`);
+	assert.ok(!title.includes("R640"), `widget default must not duplicate cache reads: ${title}`);
+	// Footer mode (showTokenTotals) replaces pi's footer, so the totals come
+	// back — same accounting, same format as pi footer's formatTokens (lowercase k).
+	const ftTitle = (mk({ showTokenTotals: true })?.titleInfo ?? [])
+		.map((s) => s.text)
+		.join("");
+	assert.ok(ftTitle.includes("\u2191"), `footer mode should contain upload: ${ftTitle}`);
+	assert.ok(ftTitle.includes("\u2193"), `footer mode should contain download: ${ftTitle}`);
+	assert.ok(ftTitle.includes("5.7k"), `↑5671 should format as 5.7k: ${ftTitle}`);
+	assert.ok(ftTitle.includes("R640"), `cache reads should show as R640: ${ftTitle}`);
 	// Cumulative values are exact numbers reported by the provider and **must not** carry `~`
-	const ioOnly = title.slice(title.indexOf("\u2191"));
+	const ioOnly = ftTitle.slice(ftTitle.indexOf("\u2191"));
 	assert.ok(!ioOnly.includes("~"), `cumulative values must not carry ~ (they're exact): ${ioOnly}`);
 	assert.ok((tok.scaleWindowPoints ?? 0) > 0, "Tokens is a rate chart, it should have a scale window");
 });
@@ -1178,6 +1190,9 @@ test("buildBlocks: Tokens cumulative readings degrade segment by segment with wi
 			tokensIn: 5671,
 			tokensOut: 11,
 			tokensCacheRead: 640,
+			// Footer mode: the totals are part of the degradation chain. The widget
+			// default (off) is pinned by the wired-correctly test above.
+			showTokenTotals: true,
 		});
 	const tok = mkReading().find((b) => b.name === "Tokens");
 	const all = (tok?.titleInfo ?? []).map((s) => s.text).join("");
@@ -1228,6 +1243,19 @@ test("buildBlocks: Tokens cumulative readings degrade segment by segment with wi
 		`block width 41 shouldn't have cache reads yet: ${shown(41)}`,
 	);
 	assert.ok(shown(42).includes("R640"), shown(42));
+	// And the widget default: even at a generous width the totals stay off —
+	// pi's own footer already shows them right below the panel.
+	const plain = buildBlocks(h, fakeSnap(), {
+		points: 30,
+		tpsNow: 250,
+		tokensIn: 5671,
+		tokensOut: 11,
+		tokensCacheRead: 640,
+	}).find((b) => b.name === "Tokens");
+	assert.ok(
+		!(plain?.titleInfo ?? []).map((s) => s.text).join("").includes("R640"),
+		"widget default must keep the totals off at any width",
+	);
 });
 
 test("buildBlocks: Tokens instantaneous `·` segment outranks the cumulative `⌀` one (⌀ yields first)", () => {
@@ -1462,29 +1490,36 @@ test("buildBlocks: without cache reads the Tokens block stays single-curve and h
 	assert.ok(!title.includes("\u00b7"), `no · segment without cache reads: ${title}`);
 	assert.ok(!title.includes("\u2300"), `no ⌀ segment without cache reads: ${title}`);
 	assert.ok(!title.includes("R"), `no R readout without cache reads: ${title}`);
-	// The other readings survive untouched
-	assert.ok(title.includes("~250t/s") && title.includes("\u2191") && title.includes("\u2193"), title);
+	// The other readings survive untouched (totals are footer-only now, so no
+	// ↑/↓ in the widget default either)
+	assert.ok(title.includes("~250t/s"), title);
 });
 
-test("buildBlocks: Tokens title segments are ordered rate → · → ⌀ → ↑ → ↓ → R", () => {
+test("buildBlocks: Tokens title segments are ordered rate → · → ⌀ → ◔ → ↑ → ↓ → R", () => {
 	// Segment order **is** the degradation policy (the title bar accumulates
 	// segment by segment and drops the tail), so the order must be asserted
-	// directly, not inferred from the narrow-width cases.
-	const tok = buildBlocks(fakeHist(50), fakeSnap(), {
-		points: 30,
-		tpsNow: 250,
-		tokensIn: 5671,
-		tokensOut: 11,
-		tokensCacheRead: 640,
-		hitNow: 88,
-	}).find((b) => b.name === "Tokens");
-	const segs = tok?.titleInfo ?? [];
+	// directly, not inferred from the narrow-width cases. Footer mode
+	// (showTokenTotals) covers the full chain; the widget default is the same
+	// list minus the trailing ↑/↓/R.
+	const mk = (over: Partial<BlockOptions> = {}) =>
+		buildBlocks(fakeHist(50), fakeSnap(), {
+			points: 30,
+			tpsNow: 250,
+			tokensIn: 5671,
+			tokensOut: 11,
+			tokensCacheRead: 640,
+			hitNow: 88,
+			ctxPct: 42,
+			...over,
+		}).find((b) => b.name === "Tokens");
+	const segs = mk({ showTokenTotals: true })?.titleInfo ?? [];
 	const texts = segs.map((s) => s.text);
 	// Exact sequence (the leading spaces belong to the segment they precede)
 	assert.deepEqual(texts, [
 		"~250t/s",
 		" \u00b788%",
 		" \u230010%",
+		" \u25d442%",
 		"  \u21915.7k",
 		" \u219311",
 		" R640",
@@ -1492,11 +1527,16 @@ test("buildBlocks: Tokens title segments are ordered rate → · → ⌀ → ↑
 	// …and with the colors that let the two modes be cross-checked
 	assert.deepEqual(
 		segs.map((s) => s.color),
-		["accent", "success", "warning", "muted", "muted", "muted"],
+		["accent", "success", "warning", "muted", "muted", "muted", "muted"],
 	);
 	// The cumulative rate is recomputed from the running totals: 640 / (640+5671)
 	const cum = (640 / (640 + 5671)) * 100; // ≈10.14 → 10%
 	assert.equal(texts[2], ` \u2300${Math.round(cum)}%`);
+	// Widget default: same head, no totals
+	assert.deepEqual(
+		(mk()?.titleInfo ?? []).map((s) => s.text),
+		["~250t/s", " \u00b788%", " \u230010%", " \u25d442%"],
+	);
 });
 
 test("Tokens readings stay visible at minimum block width (regression)", () => {
@@ -2226,9 +2266,13 @@ test("plainLineSegs: includes token readouts (rate + session cumulative), same c
 	// The old implementation had no tokens at all — this is the regression guard
 	assert.match(text, /TOK/);
 	assert.match(text, /~1\.2Kt\/s/); // fmtTps(1234)
-	assert.match(text, /↑5\.7k/); // same convention as pi footer's formatTokens (lowercase k)
-	assert.match(text, /↓89/);
-	assert.match(text, /R2\.7k/);
+	// Widget default: no ↑/↓/R — pi's own footer right below already shows
+	// those exact numbers, and duplicating them was pure noise.
+	assert.doesNotMatch(text, /↑5\.7k/, "token ↑ must be off in widget line mode");
+	assert.doesNotMatch(text, /↓89/);
+	assert.doesNotMatch(text, /R2\.7k/);
+	// (the NET group's own ↑/↓ network arrows are a different reading and may
+	// stay — only the **token** totals were the duplicate)
 	// Cache hit rates: `·` instantaneous then `⌀` cumulative — same characters,
 	// same order, same colors as the Tokens chart's title bar, so the two modes
 	// can be cross-checked.
@@ -2260,11 +2304,14 @@ test("plainLineSegs: TOK group sits before NET, and NET is the group dropped fir
 		tokensOut: 987654,
 		tokensCacheRead: 543210,
 		hitNow: 88,
+		ctxPct: 42,
 	};
-	// 80 columns: TOK is in, NET is out (measured: NET only appears at 84+)
-	const w80 = segsText(plainLineSegs(opts, 80));
-	assert.match(w80, /TOK /, `TOK must survive at 80 cols: ${w80}`);
-	assert.doesNotMatch(w80, /NET /, `NET should already be dropped at 80 cols: ${w80}`);
+	// 70 columns: TOK is in, NET is out (measured: the full line is now 71
+	// cols — without the token totals it got ~19 cols shorter, so NET only
+	// appears at 71+)
+	const w70 = segsText(plainLineSegs(opts, 70));
+	assert.match(w70, /TOK /, `TOK must survive at 70 cols: ${w70}`);
+	assert.doesNotMatch(w70, /NET /, `NET should already be dropped at 70 cols: ${w70}`);
 	// Wide enough for both: TOK comes first
 	const wide = segsText(plainLineSegs(opts, 200));
 	assert.ok(
@@ -2497,4 +2544,121 @@ test("plainLineSegs: non-finite widths must not degenerate into 'everything fits
 		assert.match(text, /CPU/, `w=${w} must still keep the first segment`);
 		assert.doesNotMatch(text, /TOK /, `w=${w} must not degenerate into the full line —— ${text}`);
 	}
+});
+
+/* ------------------------------------------------------------------ */
+/* Context-window usage (◔N%) — fed by pi's getContextUsage()          */
+/* ------------------------------------------------------------------ */
+
+test("buildBlocks: ctxPct adds a ◔ segment after ⌀, before ↑, colored by pi's footer thresholds", () => {
+	// The reading is shown in both the chart title bar and line mode, so the
+	// position (after the hit rates, before the cumulative counters) and the
+	// color thresholds (>90 error, >70 warning, else muted — pi footer's own)
+	// must be pinned here, once, for the shared helper both modes call.
+	const mk = (ctxPct: number) =>
+		buildBlocks(fakeHist(50), fakeSnap(), {
+			points: 30,
+			tpsNow: 250,
+			tokensIn: 5671,
+			tokensOut: 11,
+			tokensCacheRead: 640,
+			hitNow: 88,
+			ctxPct,
+		}).find((b) => b.name === "Tokens");
+	const segs = mk(42)?.titleInfo ?? [];
+	const texts = segs.map((s) => s.text);
+	// Exact sequence (widget default, no totals): rate → · → ⌀ → ◔
+	assert.deepEqual(texts, ["~250t/s", " \u00b788%", " \u230010%", " \u25d442%"]);
+	// Colors: muted at 42% (the same tier as the other context info)
+	assert.deepEqual(
+		segs.map((s) => s.color),
+		["accent", "success", "warning", "muted"],
+	);
+	// Thresholds: >70 warning, >90 error — identical to pi's built-in footer
+	assert.equal(mk(71)?.titleInfo?.[3]?.color, "warning", "71% must be warning");
+	assert.equal(mk(91)?.titleInfo?.[3]?.color, "error", "91% must be error");
+	// Degradation: the segment sits before ↑, so on a narrow block ◔ survives
+	// while the cumulative counters are dropped — it's the one number the user
+	// can't recompute from anywhere else on the chart.
+	const shown = (blockW: number): string => {
+		const tok = mk(42);
+		assert.ok(tok, "Tokens block must exist");
+		const lines = renderPanel(
+			plainTheme,
+			[tok],
+			blockW,
+			{ cols: 1, bands: 1, widths: [blockW], plotRows: 4, totalRows: 8 },
+			60,
+		);
+		return (lines[0] ?? "").trimEnd();
+	};
+	assert.ok(shown(31).includes("\u2300"), `⌀ should appear at width 31: ${shown(31)}`);
+	// ◔ first fits at width 36 (rate 7 + · 5 + ⌀ 5 + ◔ 5 = 22 = roomForInfo(36));
+	// ↑ would need 7 more (width 43), so at 36 ◔ is present while ↑ is not —
+	// exactly the "context usage outranks the cumulative counters" policy.
+	assert.ok(!shown(35).includes("\u25d4"), `◔ shouldn't fit yet at width 35: ${shown(35)}`);
+	assert.ok(shown(36).includes("\u25d4"), `◔ must appear at width 36: ${shown(36)}`);
+	assert.ok(!shown(36).includes("\u2191"), `↑ must yield before ◔ at width 36: ${shown(36)}`);
+});
+
+test("buildBlocks: ctxPct undefined / non-finite / no-cache ⇒ no ◔ segment at all", () => {
+	// Unknown (post-compaction, no model) must degrade to "absent", never to a
+	// bogus ◔0% — the same rule as `·N%` before the first measurable prompt.
+	// And it must NOT be gated on `seenCache`: context usage exists even when
+	// the provider never reports cache reads (e.g. a non-caching provider with
+	// a 200k window at 50%).
+	for (const bad of [undefined, Number.NaN, Number.POSITIVE_INFINITY]) {
+		const title = buildBlocks(fakeHist(50), fakeSnap(), {
+			points: 30,
+			tokensCacheRead: 640,
+			ctxPct: bad,
+		})
+			.find((b) => b.name === "Tokens")
+			?.titleInfo?.map((s) => s.text)
+			.join("");
+		assert.ok(!title?.includes("\u25d4"), `ctxPct=${bad} must not render ◔: ${title}`);
+	}
+	const noCache = buildBlocks(fakeHist(50), fakeSnap(), {
+		points: 30,
+		tokensCacheRead: 0,
+		ctxPct: 55,
+	})
+		.find((b) => b.name === "Tokens")
+		?.titleInfo?.map((s) => s.text)
+		.join("");
+	assert.ok(
+		noCache?.includes("\u25d455%"),
+		`◔ must render even without cache reads: ${noCache}`,
+	);
+});
+
+test("plainLineSegs: ctxPct renders the same ◔ segment with the same colors as the chart", () => {
+	// Cross-checkable by construction: same helper, same position (after ⌀,
+	// before ↑), same color tiers. 71% exercises the warning tier so the color
+	// assertion isn't vacuous.
+	const segs = plainLineSegs(
+		{
+			snap: fakeSnap(),
+			tpsNow: 1234,
+			tokensIn: 5671,
+			tokensOut: 89,
+			tokensCacheRead: 2700,
+			hitNow: 88,
+			ctxPct: 71,
+		},
+		200,
+	);
+	const text = segs.map((s) => s.text).join("");
+	assert.match(text, /◔71%/);
+	assert.ok(
+		text.indexOf("⌀") < text.indexOf("◔") && text.indexOf("◔") < text.indexOf("↑"),
+		`order must be ⌀ → ◔ → ↑: ${text}`,
+	);
+	const ctxSegColor = segs.find((s) => s.text.includes("◔"))?.color;
+	assert.equal(ctxSegColor, "warning", "71% must be warning in line mode too");
+	// Unknown ⇒ absent, same as the chart
+	const unknown = plainLineSegs({ snap: fakeSnap(), ctxPct: undefined }, 200).map((s) =>
+		s.text,
+	).join("");
+	assert.ok(!unknown.includes("◔"), unknown);
 });

@@ -6,7 +6,7 @@
 
 CPU · Memory · Network · Tokens — real-time history curves drawn with braille dot-matrix characters
 
-[![test](https://img.shields.io/badge/tests-143%2F143-brightgreen)](#testing)
+[![test](https://img.shields.io/badge/tests-167%2F167-brightgreen)](#testing)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="Four charts side by side: CPU / Memory / Network / Tokens" width="100%">
@@ -76,18 +76,43 @@ each), making the curves unreadable.
 ### The two directions of the Tokens chart
 
 ```
-┌ Tokens ─ ~58t/s  ↑5.9k ↓60 R2.7k ─┐
+┌ Tokens ─ ~58t/s ·92% ⌀87%  ↑5.9k ↓60 R2.7k ─┐
 ```
 
 The readings use the same convention as pi's own status bar (`↑` upstream input / `↓` downstream
 output / `R` cache reads), so the two can be compared directly. A few details:
 
-- **The curve only plots the downstream rate.** The two directions have completely different shapes
+- **The main curve only plots the downstream rate.** The two directions have completely different shapes
   over time (upstream is one bulk upload; downstream streams token by token — a measured ratio of
   about 516:1), so plotting them on the same axis would flatten downstream to 0.2% of the height.
 - **`~` only appears on the rate** — it's estimated from streaming deltas; the cumulative figures
   come from the provider's exact `usage`, so they carry no `~`. Which number to trust is obvious at a glance.
-- As the block narrows, segments are dropped by importance: rate → upstream → downstream → cache reads.
+- As the block narrows, segments are dropped by importance: rate → instantaneous hit → cumulative
+  hit → upstream → downstream → cache reads.
+
+### Cache hit rate: the second curve
+
+Cached prompt tokens are billed far cheaper than fresh input, so the hit rate is the one number
+that says whether the cache is actually working. The Tokens block shows it two ways:
+
+- **`⌀N%` — session-cumulative hit rate** (the yellow curve). `⌀` reads as "average"; the value is
+  recomputed from the session's running totals every time a message lands, so the curve is a
+  staircase — honest, since the underlying numbers are exact provider-reported totals with no
+  sub-frame information to draw.
+- **`·N%` — instantaneous hit rate** (title bar only). The last turn's own
+  `cacheRead / (cacheRead + input)` ratio; this is the actionable one; the cumulative average
+  would hide a cache-missing turn for a long time.
+
+The yellow curve has its **own fixed 0–100% scale**, pre-mapped onto the TPS axis and excluded
+from the y-scale: a 90% hit rate always renders as 90% of the plot height, even while a
+3000 t/s streaming spike pushes the TPS axis top higher. The gutter still shows TPS only — the
+color binding (yellow curve ⇄ the `⌀` readout) is what tells the two apart.
+
+Both readouts appear only once the provider has reported a cache read (`R`); sessions that never
+touch the cache degrade to the previous single-curve block unchanged. In `line` mode the same
+`·N%`/`⌀N%` readouts appear (gated identically), and the token group now sits before NET in the
+importance order — when the line runs out of room, whole groups are dropped from the tail, and
+the token readout is far less recoverable from elsewhere on screen.
 
 ## Installation
 
@@ -98,7 +123,7 @@ output / `R` cache reads), so the two can be compared directly. A few details:
 pi install npm:pi-sysmon
 
 # or pin an exact version
-pi install npm:pi-sysmon@0.3.0
+pi install npm:pi-sysmon@0.4.0
 
 # or straight from git
 pi install git:github.com/zzjcool/pi-sysmon
@@ -370,7 +395,7 @@ widths (the `┌ CPU ─ 1.91 1.80 2.17 ───┐` kind). For example:
 ## Testing
 
 ```bash
-npm test          # 143 unit tests (braille 13 + layout 66 + tokens 23 + state 26 + extension 15)
+npm test          # 167 unit tests (braille 13 + layout 74 + tokens 31 + state 26 + extension 23)
 ```
 
 ```bash

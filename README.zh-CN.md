@@ -6,7 +6,7 @@
 
 CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史曲线
 
-[![test](https://img.shields.io/badge/tests-143%2F143-brightgreen)](#测试)
+[![test](https://img.shields.io/badge/tests-167%2F167-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="四图并排：CPU / Memory / Network / Tokens" width="100%">
@@ -69,17 +69,38 @@ bottom 在同样宽度下会把四张图硬挤成一行（每张 16 列左右）
 ### Tokens 图的上下行
 
 ```
-┌ Tokens ─ ~58t/s  ↑5.9k ↓60 R2.7k ─┐
+┌ Tokens ─ ~58t/s ·92% ⌀87%  ↑5.9k ↓60 R2.7k ─┐
 ```
 
 读数与 pi 自己的状态栏同口径（`↑` 上行 input / `↓` 下行 output / `R` 缓存读），
 所以两边可以直接对照。几个细节：
 
-- **曲线只画下行速率**。两个方向的时间形状完全不同（上行是一次性整块上传、
+- **主曲线只画下行速率**。两个方向的时间形状完全不同（上行是一次性整块上传、
   下行是逐字流式，实测比例约 516:1），画同一根轴上会将下行压成 0.2% 高度。
 - **`~` 只加在速率上** —— 它是从流式增量估算的；累计值来自 provider 的
   精确 `usage`，所以不带 `~`。哪个数字可信，一眼能看出来。
-- 块变窄时按重要度逐段丢弃：速率 → 上行 → 下行 → 缓存读。
+- 块变窄时按重要度逐段丢弃：速率 → 瞬时命中率 → 累计命中率 → 上行 → 下行 → 缓存读。
+
+### 缓存命中率：第二根曲线
+
+缓存命中的 prompt token 计费远低于全新输入，所以命中率是唯一能回答“缓存到底有没有起作用”
+的数字。Tokens 块从两个视角展示它：
+
+- **`⌀N%` —— 会话累计命中率**（黄色曲线）。`⌀` 读作“平均”；每次消息落地时从会话累计值
+  重新计算，因此曲线是阶梯状 —— 这是诚实的：底层数字是 provider 精确上报的总量，
+  两个消息之间没有更细的信息可画。
+- **`·N%` —— 瞬时命中率**（仅标题栏）。最近一轮自己的
+  `cacheRead / (cacheRead + input)` 比例；这才是可据以行动的数字 ——
+  累计平均值会把一轮未命中缓存的请求藏很久。
+
+黄色曲线有**自己固定的 0–100% 量程**，预先映射到 TPS 轴上且不参与 y 轴量程计算：
+90% 的命中率永远渲染为绘图区高度的 90%，哪怕 3000 t/s 的流式尖峰把 TPS 轴顶抬高。
+刻度列仍然只显示 TPS —— 靠颜色绑定（黄色曲线 ⇄ `⌀` 读数）区分两根线。
+
+两个读数只在 provider 上报过缓存读（`R`）之后才出现；从未碰过缓存的会话会原样退回
+之前的单曲线块。`line` 模式同样显示 `·N%`/`⌀N%`（门控条件完全一致），并且 token 组
+在重要度顺序中排到了 NET 之前 —— line 放不下时整组从尾部丢弃，而 token 读数比网络
+速率更难从屏幕其他地方找回。
 
 ## 安装
 
@@ -90,7 +111,7 @@ bottom 在同样宽度下会把四张图硬挤成一行（每张 16 列左右）
 pi install npm:pi-sysmon
 
 # 或锁定具体版本
-pi install npm:pi-sysmon@0.3.0
+pi install npm:pi-sysmon@0.4.0
 
 # 或直接装 git 源
 pi install git:github.com/zzjcool/pi-sysmon
@@ -338,7 +359,7 @@ pi 单独测试与复用；`metrics.ts` 只负责读数，不关心怎么显示�
 ## 测试
 
 ```bash
-npm test          # 143 项单元测试（braille 13 + layout 66 + tokens 23 + state 26 + extension 15）
+npm test          # 167 项单元测试（braille 13 + layout 74 + tokens 31 + state 26 + extension 23）
 ```
 
 ```bash

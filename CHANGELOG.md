@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-21
+
+### Added
+
+- **Cache hit-rate on the Tokens block (dual-line).** A second, yellow curve plots the
+  session-cumulative prompt-cache hit rate on its **own fixed 0–100% scale** (pre-mapped onto the
+  TPS axis and excluded from the y-scale, so a 3000 t/s spike can't squash the 90% line to the
+  floor), and the title bar gains two readouts: `·N%` — the **instantaneous** hit rate of the last
+  turn, computed from that turn's own `usage` so it reacts immediately when a turn misses the
+  cache — and `⌀N%` — the cumulative session average, exactly what the yellow curve draws. Both
+  only appear once the provider has reported a cache read; sessions that never touch the cache
+  degrade to the previous single-curve block unchanged.
+- **`line` mode gains the same hit-rate readouts** (`·N%` / `⌀N%`), gated identically to the
+  chart so the two modes can never disagree.
+
+### Changed
+
+- **`line` mode group order is now CPU → MEM → TOK → NET** (was `… NET → TOK`): when the line
+  runs out of room, whole groups are dropped from the tail, and the token readout is far less
+  recoverable from elsewhere on screen than the network rate, so it outranks NET.
+
 ## [0.3.0] — 2026-09-20
 
 ### Added
@@ -57,6 +78,7 @@ installable with `pi install npm:pi-sysmon`.
   existing file that only carries the older `enabled: false` field is read as "global default off".
 - `chart` and `line` share one widget, so both follow `above`/`below` placement.
 
-[Unreleased]: https://github.com/zzjcool/pi-sysmon/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-sysmon/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zzjcool/pi-sysmon/releases/tag/v0.2.0

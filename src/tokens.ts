@@ -146,3 +146,56 @@ export function fmtTps(tps: number): string {
  * `~12.3K tok/s` disappeared exactly that way).
  */
 export const FMT_TPS_MAX = 8;
+
+/**
+ * Cache hit rate in percent, 0..100.
+ *
+ * Definition: `cacheRead / (cacheRead + input) × 100` — of the prompt tokens
+ * the provider had to look at, how many were served from the prompt cache
+ * instead of being re-billed as fresh input. This is the number that tells you
+ * whether the cache is actually working (a low rate means every turn re-uploads
+ * the whole context).
+ *
+ * Contract: `cacheRead + input <= 0` (nothing to compare), NaN/Infinity, or a
+ * negative input all return 0 — the value feeds a chart series and a title
+ * readout, and a NaN would poison both the shared token axis and the width
+ * bookkeeping (wrong width → overflow → pi exits).
+ */
+export function hitRate(cacheRead: number, input: number): number {
+	// Guard each operand before adding: `Infinity + (-Infinity)` is NaN, so a
+	// single `Number.isFinite(cacheRead + input)` check would accept the
+	// poisoned sum. Also rejects negatives: a negative token count is not a
+	// cache miss, it's garbage.
+	if (!Number.isFinite(cacheRead) || !Number.isFinite(input)) return 0;
+	if (cacheRead < 0 || input < 0) return 0;
+	const total = cacheRead + input;
+	// `<= 0` covers the empty denominator (no prompt tokens yet): there is no
+	// meaningful rate to report, and dividing would give NaN/Infinity.
+	if (total <= 0) return 0;
+	const pct = (cacheRead / total) * 100;
+	// Clamp defensively: floating point can only push the result a hair outside
+	// [0,100], but the chart axis and the width budget both assume the range.
+	return Math.min(100, Math.max(0, pct));
+}
+
+/**
+ * Format a hit rate as an integer percentage: `87%` / `100%`.
+ *
+ * Integer (not one decimal) on purpose: the title bar is the scarcest space in
+ * this UI — the extra `.4` would cost two columns and tell the user nothing
+ * (the curve already shows the fine shape).
+ *
+ * **Width is bounded by construction**: clamping to `[0,100]` before rounding
+ * leaves at most `100%` = 4 columns, so callers can budget it exactly (this is
+ * the same "never emit an unbounded-width readout" rule as `FMT_TPS_MAX`;
+ * an over-wide title row makes pi exit).
+ *
+ * Non-finite input becomes `0%` rather than `NaN%`/`Infinity%`: same reasoning
+ * as `fmtTps` — a stray character in the title row corrupts its width
+ * accounting, and pi exits on an over-wide line.
+ */
+export function fmtHitPct(v: number): string {
+	if (!Number.isFinite(v)) return "0%";
+	const n = Math.round(Math.min(100, Math.max(0, v)));
+	return `${n}%`;
+}

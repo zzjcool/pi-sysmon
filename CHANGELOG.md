@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-22
+
+### Fixed
+
+- **macOS: all metrics read 0** (CPU / memory / network / disk). The collector only implemented
+  Linux's `/proc` readers; on darwin every read threw and degraded to zeros, so only the load
+  averages were real. Collection now branches per platform:
+  - **CPU** — `os.cpus()` cumulative ticks (the exact `/proc/stat` counter model); `iostat`'s
+    2nd sample is kept as a tested fallback, since `iostat -c 2` blocks a full second per call.
+  - **Memory** — `vm_stat` + `sysctl -n hw.memsize`, with `used = total − (free + inactive +
+    speculative) × pageSize` (the MemAvailable convention, not `os.freemem()`, which over-reports
+    by ~35 percentage points on macOS).
+  - **Network** — `netstat -ib`, de-duplicated per interface (max row wins), skipping only
+    `lo0` / `veth*` / `docker*` / `br-*`; `bridge0` / `utun*` / `awdl*` carry real traffic and
+    stay counted.
+  - **Disk** — `ioreg`'s `IOBlockStorageDriver` `Bytes (Read)/(Write)` cumulative counters, the
+    same counter+differential shape as Linux's `/proc/diskstats`, at ~20 ms per call.
+  All Linux paths are byte-for-byte unchanged; every darwin parser is exported as a pure
+  function and covered by fixture tests.
+- **Single-file bundle silently lost `node:child_process`.** The bundler strips source imports
+  and re-declares them from a hand-written header list, which the new `execFileSync` import
+  never made it into — so the bundled extension threw `ReferenceError` inside `execText()`'s
+  try/catch and every darwin metric read 0 again, while typecheck and unit tests stayed green
+  (they import sources, never the bundle). The import ships now, and a new **Self-check 2b**
+  fails the build when any external symbol is missing from the bundle header.
+
+### Added
+
+- 24 new tests (167 → 191): pure-parser fixtures for `vm_stat` / `netstat -ib` / `iostat` / `ioreg`,
+  plus darwin-only live smoke tests with induced CPU / network / disk load.
+
 ## [0.4.0] — 2026-09-21
 
 ### Added
@@ -78,7 +109,8 @@ installable with `pi install npm:pi-sysmon`.
   existing file that only carries the older `enabled: false` field is read as "global default off".
 - `chart` and `line` share one widget, so both follow `above`/`below` placement.
 
-[Unreleased]: https://github.com/zzjcool/pi-sysmon/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-sysmon/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zzjcool/pi-sysmon/releases/tag/v0.2.0

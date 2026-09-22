@@ -85,6 +85,7 @@ const HEADER = `/**
  *   PI_SYSMON_MODE=chart         initial mode
  */
 
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import os, { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -233,6 +234,61 @@ function main() {
 		);
 		for (const m of missing) console.error(`    ${m}`);
 		console.error("  → if it's a new module, add it to MODULES; if it's a name collision, add it to RENAMES.");
+		process.exit(1);
+	}
+
+	// Self-check 2b: every runtime symbol imported from EXTERNAL packages
+	// (node:* builtins and npm deps) must be present in the HEADER's import
+	// list — stripModuleSyntax removes all import lines and relies on the HEADER
+	// to re-declare them. A missing one is the same ReferenceError class as
+	// check 2, but sneakier: it only fails when the code path runs (the extension
+	// loads fine, the value is just `undefined` until called). This exact bug
+	// shipped once: `execFileSync` from node:child_process was stripped and the
+	// macOS metrics silently degraded to zeros inside catch blocks.
+	const headerImports = new Set();
+	// Match BOTH forms: `import { a, b } from "x"` and `import def, { a } from "x"`
+	// (the HEADER uses the latter for node:os). Both named specifier lists are
+	// the same `[^{}]*` shape, so one regex with an optional default-binding
+	// prefix covers them; bare `import x from` has no named list to check.
+	for (const m of HEADER.matchAll(/import\s+(?:type\s+)?(?:[\w$]+\s*,\s*)?\{([^{}]*)\}\s+from\s+"[^"]+";/g)) {
+		const isTypeOnlyImport = /^\s*import\s+type\b/.test(m[0]);
+		if (isTypeOnlyImport) continue;
+		for (const raw of (m[1] ?? "").split(",")) {
+			const t = raw.trim();
+			if (t && !/^type\s/.test(t)) headerImports.add(t.replace(/\s+as\s+.*$/, "").trim());
+		}
+	}
+	// Also allow the sources' own `import os, { homedir }` mixed form to satisfy
+	// the check when the HEADER imports the default binding of the same module.
+	const headerDefaultBindings = new Set();
+	for (const m of HEADER.matchAll(/import\s+([\w$]+)\s*(?:,|\{)/g)) headerDefaultBindings.add(m[1]);
+	const missingExternal = [];
+	for (const mod of MODULES) {
+		const src = readFileSync(join(SRC, mod.file), "utf8");
+		// external imports: not relative ("./x") — node builtins and npm packages alike.
+		// Same mixed-form tolerance: `import os, { homedir } from "node:os"` must parse too.
+		for (const m of src.matchAll(/import\s+(?:type\s+)?(?:[\w$]+\s*,\s*)?\{([^{}]*)\}\s+from\s+"(?!\.\/)[^"]+";/g)) {
+			const isTypeOnlyImport = /^\s*import\s+type\b/.test(m[0]);
+			if (isTypeOnlyImport) continue;
+			for (const raw of (m[1] ?? "").split(",")) {
+				const t = raw.trim();
+				if (!t || /^type\s/.test(t)) continue;
+				const name = t.replace(/\s+as\s+.*$/, "").trim();
+				if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue;
+				// A named import is satisfied either by the HEADER's named list or by a
+				// HEADER default binding of the same name (e.g. os's methods accessed as
+				// `os.homedir()` would also work at runtime).
+				if (!headerImports.has(name) && !headerDefaultBindings.has(name))
+					missingExternal.push(`${name} (imported by ${mod.file} but absent from the HEADER import list)`);
+			}
+		}
+	}
+	if (missingExternal.length > 0) {
+		console.error(
+			"✗ the following external-package symbols are imported by sources but missing from the HEADER imports (runtime ReferenceError in the bundle):",
+		);
+		for (const m of missingExternal) console.error(`    ${m}`);
+		console.error("  → add them to the HEADER's import list in this script.");
 		process.exit(1);
 	}
 

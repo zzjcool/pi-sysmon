@@ -1309,6 +1309,62 @@ test("buildBlocks: Tokens plots the cumulative hit rate as a second (warning) cu
 	);
 });
 
+test("buildBlocks: a sustained-low-TPS session squashes the TPS curve against the yellow line's 100 (pins the shared-axis extreme)", () => {
+	// The documented reverse of "high TPS ⇒ yellow hugs the floor": with an
+	// **idle session** the cumulative hit rate can legitimately be 100% while TPS
+	// is ~5, so the yellow line's raw 100 is the largest value on the shared axis
+	// and pins the top at 100×1.5 = 150t/s. TPS then renders as a flat line near
+	// the floor. The axis isn't lying (its top really is 150t/s), but its unit
+	// says nothing about the percentage curve — a known limitation, accepted for
+	// the single-gutter/single-scale simplicity.
+	//
+	// This is a **pin, not a wish**: if `tokenAxis` (or the "no independent
+	// normalization" decision) ever changes, the numbers below move and this test
+	// makes the regression loud instead of silent.
+	const n = 50;
+	const flat = (v: number) => new Array(n).fill(v);
+	const hist: History = {
+		cpu: flat(20),
+		mem: flat(50),
+		netRx: flat(1000),
+		netTx: flat(1000),
+		diskR: flat(1000),
+		diskW: flat(1000),
+		tps: flat(5),
+		sessHit: flat(100),
+	};
+	const tok = buildBlocks(hist, fakeSnap(), {
+		points: 30,
+		tpsNow: 5,
+		tokensIn: 5671,
+		tokensOut: 11,
+		tokensCacheRead: 640, // seenCache gate on, so the yellow line exists
+		hitNow: 88,
+	}).find((b) => b.name === "Tokens");
+	assert.ok(tok);
+	// The extreme value on the axis is the yellow line's 100 (the TPS values are 5).
+	// `renderBlock` feeds `axis()` the max over every series, so derive it the same
+	// way instead of hardcoding the 100.
+	let dataMax = 0;
+	for (const s of tok.series)
+		for (const v of s.values) if (Number.isFinite(v) && v > dataMax) dataMax = v;
+	assert.equal(dataMax, 100, "the yellow line's raw percentage is the series max");
+	assert.equal(
+		tok.axis(dataMax, 4).max,
+		150,
+		"100×1.5 — the yellow line's raw percentage pins the shared token axis",
+	);
+	// With TPS alone (5×1.5 = 7.5 < the floor) the axis would be much shorter:
+	// this is exactly the squatting behaviour being pinned.
+	assert.ok(tok.axis(5, 4).max < tok.axis(dataMax, 4).max);
+	// …and it must render without blowing up: every line exactly the tested width.
+	const W = 96;
+	const lines = renderPanel(plainTheme, [tok], W, computeLayout(W, 6, 4, 18), 60);
+	assert.ok(lines.length > 0, "the Tokens block must render");
+	for (const line of lines)
+		assert.equal(visibleWidth(line), W, `line wider than ${W}: ${JSON.stringify(line)}`);
+});
+
 test("buildBlocks: without cache reads the Tokens block stays single-curve and has no ·/⌀ segments", () => {
 	// This is the pre-existing behaviour for a session that never touches the
 	// prompt cache: no second curve, no hit-rate readouts. `tokR === 0` is the
@@ -2197,6 +2253,9 @@ test("sweep: line mode renders at exactly the declared width at any width (overf
 					tokensIn: 1234567,
 					tokensOut: 987654,
 					tokensCacheRead: 543210,
+					// `hitNow` too, so the `·N%` segment is actually rendered and
+					// width-swept in line mode (it's the one segment gated on it).
+					hitNow: 88,
 				},
 				w,
 			);

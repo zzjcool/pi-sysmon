@@ -726,6 +726,9 @@ export function buildBlocks(
 		// info (already exact in pi's own footer) and yield first.
 		// Leading spaces live inside each segment, so dropping one never glues its
 		// neighbours together (` ·` + `⌀` vs ` ⌀` stays correct either way).
+		// Note the `↑` segment carries **two** leading spaces (`  ↑`, not ` ↑`):
+		// that's the historical format aligned with pi's own footer, kept as-is,
+		// while `·`/`⌀` take a single space — don't "unify" them.
 		const infoSegs: StyledLine = [{ text: curTxt, color: "accent" }];
 		if (seenCache && opts.hitNow !== undefined && Number.isFinite(opts.hitNow))
 			infoSegs.push({ text: ` ·${fmtHitPct(opts.hitNow)}`, color: "success" });
@@ -743,6 +746,11 @@ export function buildBlocks(
 		// floor — that is the accepted behaviour: a second y-scale would need a
 		// second gutter, and two scales inside one 24-column block would leave no
 		// room for the plot itself.
+		// The reverse case is the same trade: with a **sustained low TPS** (e.g. an
+		// idle session, tps≈5) the yellow line's 100 pins the shared axis top at
+		// ≥150t/s (100×1.5), squashing the TPS curve against the floor. The axis
+		// number isn't lying — the top really is 150t/s — but its unit means
+		// nothing to the (percentage) yellow line; a known limitation.
 		// TPS must stay **series[0]**: `renderChartGlyphs` resolves same-cell
 		// collisions in favour of the lowest index, so the rate curve keeps its
 		// cells (and its colour) even when the two lines overlap.
@@ -759,6 +767,13 @@ export function buildBlocks(
 			titleInfo: at(snap ? infoSegs : undefined),
 			series: tokSeries,
 			legend: ab([[{ text: curTxt }]]),
+			// Known limitation with a sub-window (PI_SYSMON_SCALE_WINDOW < 1, not the
+			// default): the scale is sampled from the most recent points only, so a
+			// cumulative hit rate that has fallen can leave the yellow line's older,
+			// higher value (e.g. 100) above the sampled axis top. That trips
+			// `renderBlock`'s overflow detector, putting `+` on the top tick — which
+			// reads as "at least N tok/s" but is meaningless for a percentage. The
+			// rendering primitives are frozen, so this is declared, not fixed.
 			scaleWindowPoints: rateScalePts,
 			windowPoints: points,
 			// Token-unit ticks (can't reuse rateAxis: it would label tok/s as KB)

@@ -155,6 +155,18 @@ export interface MetricBlock {
 	/** Tick spec generator. dataMax = max within the scale sampling slice, plotRows = plot row count (for tick thinning) */
 	axis: (dataMax: number, plotRows: number) => AxisSpec;
 	/**
+	 * Optional single label overlaid at the **top-right** of the plot area —
+	 * the scale readout for a secondary, pre-mapped y axis (e.g. `100°` for the
+	 * CPU temperature curve, mirroring the TPS block's cache-hit-rate dual axis).
+	 *
+	 * The secondary series is expected to be `excludeFromScale` and pre-mapped
+	 * by the caller so that its values live on the primary axis' 0..max window
+	 * (for CPU: 1°C ≡ 1% of the plot height, so raw °C needs no mapping at all).
+	 * This label is the only on-screen trace of that second scale — skipped
+	 * entirely (like the left ticks) when the plot area is too narrow for it.
+	 */
+	rightAxisLabel?: string;
+	/**
 	 * The **target point count** represented by the entire x axis (window seconds
 	 * × 1000 / sampling interval).
 	 *
@@ -955,7 +967,13 @@ export function renderBlock(
 		}
 	}
 
-	const plotTop = 0; // start index of plot rows in `lines`
+	// Start index of plot rows in `lines`: 1, not 0 — `lines[0]` is the head
+	// (title/border) row pushed first; the plot rows start right after it.
+	// (Was 0 for a long time, which made the floating legend box's top border
+	// overlay the **title row** — masked by tests because the title row happens
+	// to contain its own ┌/┐ corners. Found while wiring the right-axis label,
+	// which needs the true top plot row to sit on.)
+	const plotTop = 1;
 	for (let r = 0; r < rows; r++) {
 		const row = blank(w);
 		row[0] = { ch: "│", color: edge };
@@ -996,6 +1014,7 @@ export function renderBlock(
 		lines.push(row);
 	}
 
+	let legendLx = -1; // left column of the floating box, when drawn
 	// ── Floating readout box: overlaid on the top-right corner of the plot area (bottom's legend TopRight) ──
 	if (block.legend && block.legend.length > 0) {
 		const legendInner = block.legend.reduce(
@@ -1031,6 +1050,7 @@ export function renderBlock(
 			const plotLeft = 1;
 			const plotRight = plotLeft + plotW;
 			const lx = plotRight - legendW;
+			legendLx = lx;
 			const boxTop: Row = [
 				{ ch: "┌", color: edge },
 				...Array.from({ length: Math.max(0, legendW - 2) }, () => ({
@@ -1061,6 +1081,38 @@ export function renderBlock(
 				overlay(lines[plotTop + 1 + i] ?? [], lx, row);
 			}
 			overlay(lines[plotTop + legendH - 1] ?? [], lx, boxBottom);
+		}
+	}
+
+	// ── Secondary (right) axis label: drawn AFTER the floating box so it can dodge it ──
+	// One label at the top row of the plot area, the mirror image of the left-tick
+	// overlay. Same discipline as the left side — it's reference info overlaid on
+	// the curve, and it's skipped when it wouldn't clear the left tick region plus
+	// a couple of curve columns (a cramped `100%100°` mashup is worse than no
+	// secondary scale).
+	//
+	// **Drawn after the legend box on purpose**: the box is painted over the
+	// top-right corner of the plot area (the exact spot the label wants), so
+	// when a box is present the label hugs the box's LEFT edge on the same row
+	// instead of being buried under it (measured: with `labelMode=box` the
+	// `100°` label was completely covered by the `AVG 37%` box and the
+	// temperature curve lost its scale readout). Same row, left of the box —
+	// reads naturally (`│100%  ⣀ 100°┌─────┐│`), and when no box is drawn the
+	// label sits flush against the right border as before.
+	if (block.rightAxisLabel) {
+		const labW = visibleWidth(block.rightAxisLabel);
+		// The right edge the label must clear: the right border normally, the
+		// floating box's left edge when one is drawn (plus a 1-column gap).
+		const rightEdge = legendLx >= 0 ? legendLx - 1 : w - 1;
+		// Left tick region ends at column 1+rawGutter; require 2 columns of gap.
+		// (rawGutter is the *left* spec's width even when showAxis is false —
+		// conservative is fine here: no left ticks drawn means even more room.)
+		if (labW > 0 && rightEdge - labW >= 1 + rawGutter + 2) {
+			overlay(
+				lines[plotTop] ?? [],
+				rightEdge - labW,
+				segsToRow([{ text: block.rightAxisLabel, color: axis }]),
+			);
 		}
 	}
 

@@ -741,22 +741,40 @@ export function buildBlocks(
 		if (seenCache)
 			infoSegs.push({ text: ` R${fmtTokensTotal(tokR)}`, color: "muted" });
 		// ── Second curve: cumulative hit rate (only once cache reads exist) ──
-		// It shares **the TPS axis as-is** (raw 0..100 values, no independent
-		// normalization). When TPS is high the yellow line therefore hugs the
-		// floor — that is the accepted behaviour: a second y-scale would need a
-		// second gutter, and two scales inside one 24-column block would leave no
-		// room for the plot itself.
-		// The reverse case is the same trade: with a **sustained low TPS** (e.g. an
-		// idle session, tps≈5) the yellow line's 100 pins the shared axis top at
-		// ≥150t/s (100×1.5), squashing the TPS curve against the floor. The axis
-		// number isn't lying — the top really is 150t/s — but its unit means
-		// nothing to the (percentage) yellow line; a known limitation.
+		// It has its **own 0..100% scale**, but no second gutter: its values are
+		// pre-mapped onto the TPS axis (`hit% / 100 × axisTop`) and the series is
+		// marked `excludeFromScale`, so the height of the yellow line is exactly
+		// `hit% × plot height` while the tick column keeps showing TPS only. Two
+		// scales, one gutter — the classic dual-axis chart, except the second scale
+		// is fixed (0..100) and therefore needs no labels; the color binding
+		// (yellow curve ⇄ the `⌀` title readout) is what tells them apart.
+		// Why pre-map instead of letting `renderBlock` scale both: with a shared axis
+		// a 3000 t/s spike pushes the top to 4500, so 90% renders as a 2%-tall line
+		// glued to the floor — invisible exactly when the model is streaming, i.e.
+		// when the user is looking at it.
 		// TPS must stay **series[0]**: `renderChartGlyphs` resolves same-cell
 		// collisions in favour of the lowest index, so the rate curve keeps its
 		// cells (and its colour) even when the two lines overlap.
-		const tokSeries: BlockSeries[] = [{ values: tail(hist.tps, points) }];
-		if (seenCache)
-			tokSeries.push({ values: tail(hist.sessHit, points), color: "warning" });
+		const tpsTail = tail(hist.tps, points);
+		const tokSeries: BlockSeries[] = [{ values: tpsTail }];
+		if (seenCache) {
+			// Same "finite and > 0 only" sampling rule as `renderBlock`'s dataMax (an
+			// all-zero/absent tail therefore falls back to the axis floor), and the
+			// top is derived through `tokenAxis` itself so the two formulas can't
+			// drift apart.
+			let tpsTailMax = 0;
+			for (const v of tpsTail)
+				if (Number.isFinite(v) && v > tpsTailMax) tpsTailMax = v;
+			// Reuse the axis' own `max × 1.5` (with its MIN_TPS_SCALE floor): hardcoding
+			// 1.5 here would silently de-sync the moment `tokenAxis` changes.
+			const scaleTop = tokenAxis(tpsTailMax).max;
+			const hitTail = tail(hist.sessHit, points);
+			tokSeries.push({
+				values: hitTail.map((h) => (scaleTop * h) / 100),
+				color: "warning",
+				excludeFromScale: true,
+			});
+		}
 		blocks.push({
 			name: "Tokens",
 			color: "accent",
@@ -767,13 +785,16 @@ export function buildBlocks(
 			titleInfo: at(snap ? infoSegs : undefined),
 			series: tokSeries,
 			legend: ab([[{ text: curTxt }]]),
-			// Known limitation with a sub-window (PI_SYSMON_SCALE_WINDOW < 1, not the
-			// default): the scale is sampled from the most recent points only, so a
-			// cumulative hit rate that has fallen can leave the yellow line's older,
-			// higher value (e.g. 100) above the sampled axis top. That trips
-			// `renderBlock`'s overflow detector, putting `+` on the top tick — which
-			// reads as "at least N tok/s" but is meaningless for a percentage. The
-			// rendering primitives are frozen, so this is declared, not fixed.
+			// Known limitations with a sub-window (PI_SYSMON_SCALE_WINDOW < 1, not the
+			// default): (a) the scale is sampled from the most recent points only, so
+			// `renderBlock`'s axis top can sit **below** the `scaleTop` used to
+			// pre-map the yellow line above → the yellow line is momentarily clamped
+			// to the top row (`renderBlock`'s overflow detector skips excluded
+			// series, so at least the `+` marker stays off the tick); (b) the reverse
+			// degeneracy is gone entirely: a **low**-TPS session no longer has its
+			// axis pinned by the percentage curve, because both the scale sampling
+			// and the overflow check now ignore the yellow series.
+			// The rendering primitives are frozen, so this is declared, not fixed.
 			scaleWindowPoints: rateScalePts,
 			windowPoints: points,
 			// Token-unit ticks (can't reuse rateAxis: it would label tok/s as KB)

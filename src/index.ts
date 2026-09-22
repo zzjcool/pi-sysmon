@@ -42,7 +42,7 @@ import {
 	type Mode,
 	type Placement,
 } from "./blocks.ts";
-import { createTpsMeter } from "./tokens.ts";
+import { createTpsMeter, hitRate } from "./tokens.ts";
 import { createCollector, type Snapshot } from "./metrics.ts";
 import {
 	lastSessionEnabled,
@@ -331,6 +331,7 @@ export default function (pi: ExtensionAPI) {
 		diskR: [],
 		diskW: [],
 		tps: [],
+		sessHit: [],
 	};
 	// ── TPS metering (LLM token throughput) ──────────────────────────────────
 	// The event side only does O(1) accumulation; the sampling side (sample
@@ -352,6 +353,16 @@ export default function (pi: ExtensionAPI) {
 	let tokIn = 0;
 	let tokOut = 0;
 	let tokCacheRead = 0;
+	/**
+	 * **Instantaneous** cache hit rate of the most recent assistant turn (0..100).
+	 *
+	 * `undefined` means "no measurable prompt has been reported yet" — it is
+	 * deliberately *not* initialised to 0. A real 0% (everything missed the
+	 * cache — expensive and worth showing in red) and "we have no idea yet" are
+	 * different states, and collapsing them would make the title bar claim a 0%
+	 * hit rate before the first reply even arrives.
+	 */
+	let lastHit: number | undefined;
 
 	/** Add one assistant message's exact usage into the cumulative totals (guards against duplicates/bad values) */
 	const addUsage = (u: unknown): void => {
@@ -362,9 +373,22 @@ export default function (pi: ExtensionAPI) {
 		// (wrong width computation → overflow → pi exits).
 		const n = (v: unknown) =>
 			typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
-		tokIn += n(o.input);
+		// This turn's own prompt-token counts, kept before they're folded into the
+		// session totals: the instantaneous rate must come from **this** turn's
+		// `usage`, not from the running sums (a cumulative ratio would barely
+		// move and would hide a cache-missing turn for a long time).
+		const inNow = n(o.input);
+		const rNow = n(o.cacheRead);
+		tokIn += inNow;
 		tokOut += n(o.output);
-		tokCacheRead += n(o.cacheRead);
+		tokCacheRead += rNow;
+		// Only overwrite when this turn actually carried prompt tokens: a message
+		// with no measurable prompt (e.g. a continuation that only streams output)
+		// tells us nothing about the current hit rate, so the previous turn's
+		// reading is kept instead of being clobbered with a meaningless 0%.
+		// That "keep the last known value" semantics is also why `lastHit` starts
+		// as `undefined` rather than 0 (see the declaration).
+		if (inNow + rNow > 0) lastHit = hitRate(rNow, inNow);
 	};
 
 	// Whether the monitor is *currently* mounted. Session-scoped: decided in
@@ -407,6 +431,15 @@ export default function (pi: ExtensionAPI) {
 			// of message_end.
 			void tokens;
 			pushCapped(hist.tps, tps, STORE_CAP);
+			// Session-cumulative hit rate, **recomputed here** from the running
+			// totals instead of kept in its own accumulator: one less ledger to
+			// drift, and the curve is naturally a staircase (it only moves when a
+			// message_end lands) — see the History.sessHit comment.
+			pushCapped(
+				hist.sessHit,
+				hitRate(tokCacheRead, tokIn),
+				STORE_CAP,
+			);
 		} catch {
 			snap = undefined;
 		}
@@ -471,6 +504,12 @@ export default function (pi: ExtensionAPI) {
 			tokensIn: tokIn,
 			tokensOut: tokOut,
 			tokensCacheRead: tokCacheRead,
+			// Last turn's instantaneous hit rate. `hitNow` is left `undefined` while
+			// no cache reads have happened at all: `buildBlocks` already gates the
+			// `·`/`⌀` readouts and the second curve on `tokR > 0`, so a session that
+			// never touches the cache degrades to the old single-curve Tokens block
+			// without any special casing here.
+			hitNow: tokCacheRead > 0 ? lastHit : undefined,
 			labelMode,
 			// `undefined` is taken over by the `?? DEFAULT_...` inside buildBlocks, so pass it through
 			scaleWindowFrac,
@@ -498,6 +537,9 @@ export default function (pi: ExtensionAPI) {
 				tokensIn: tokIn,
 				tokensOut: tokOut,
 				tokensCacheRead: tokCacheRead,
+				// Same gating as the chart path above, so both modes show a hit rate
+				// (or neither does) — never a `·0%` on the line while the chart omits it.
+				hitNow: tokCacheRead > 0 ? lastHit : undefined,
 			},
 			width,
 		);

@@ -7,7 +7,9 @@ import assert from "node:assert/strict";
 import {
 	estimateDeltaTokens,
 	createTpsMeter,
+	fmtHitPct,
 	fmtTps,
+	hitRate,
 	FMT_TPS_MAX,
 	type TokenDelta,
 } from "../src/tokens.ts";
@@ -241,9 +243,106 @@ test("fmtTps: all inputs are width-bounded and contain no scientific notation / 
 });
 
 /* ------------------------------------------------------------------ */
-/* 4. Disable/reenable semantics (a pure-function-level reproduction    */
-/*    of index.ts's stop() drain patch)                                 */
+/* 5. hitRate / fmtHitPct (cache hit rate)                              */
+/*                                                                     */
+/* Both feed the Tokens block's second curve and its title readout, so  */
+/* the hard constraints are the same as fmtTps's: never NaN/Infinity,   */
+/* and never an unbounded-width string (pi exits on an over-wide line). */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Width upper bound for `fmtHitPct` output, asserted (not imported): the frozen
+ * interface of tokens.ts exports only `hitRate`/`fmtHitPct`, so the bound is
+ * pinned here as a literal — `100%` is the widest legal form.
+ */
+const FMT_HIT_MAX = 4;
+
+test("hitRate: basic ratios", () => {
+	assert.equal(hitRate(900, 100), 90);
+	assert.equal(hitRate(100, 0), 100); // pure cache hits
+	assert.equal(hitRate(0, 500), 0); // pure cache misses
+	assert.equal(hitRate(640, 5671), (640 / 6311) * 100);
+});
+
+test("hitRate: empty denominator is 0, not NaN", () => {
+	// (0,0) is the state at session start / before the first message_end:
+	// 0/0 would be NaN and would poison the shared token axis. The negative
+	// cases are garbage input, and "garbage in → 0" is the only safe answer
+	// (a negative percentage would drag the curve below the axis floor).
+	assert.equal(hitRate(0, 0), 0);
+	assert.equal(hitRate(-5, 5), 0);
+	assert.equal(hitRate(5, -5), 0);
+	assert.equal(hitRate(-1, 0), 0);
+});
+
+test("hitRate: non-finite operands are 0 (guarded per operand, not on the sum)", () => {
+	assert.equal(hitRate(Number.NaN, 5), 0);
+	assert.equal(hitRate(5, Number.NaN), 0);
+	assert.equal(hitRate(Number.POSITIVE_INFINITY, 1), 0);
+	assert.equal(hitRate(1, Number.POSITIVE_INFINITY), 0);
+	// The nasty pair: +Inf and -Inf sum to NaN, so a check on the **sum** would
+	// let a NaN through — that's exactly why the guard is per-operand.
+	assert.equal(hitRate(Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY), 0);
+});
+
+test("hitRate: result always lies in 0..100 for arbitrary finite inputs", () => {
+	const vals = [0, 1, 7, 99, 640, 1e3, 1e6, 9.99e9];
+	for (const r of vals) {
+		for (const i of vals) {
+			const v = hitRate(r, i);
+			assert.ok(Number.isFinite(v), `hitRate(${r},${i}) = ${v}`);
+			assert.ok(v >= 0 && v <= 100, `hitRate(${r},${i}) = ${v} out of range`);
+		}
+	}
+});
+
+test("fmtHitPct: integer percent, no decimal point", () => {
+	assert.equal(fmtHitPct(87.4), "87%");
+	assert.equal(fmtHitPct(87.5), "88%");
+	assert.equal(fmtHitPct(0), "0%");
+	assert.equal(fmtHitPct(100), "100%");
+	assert.equal(fmtHitPct(99.4), "99%");
+});
+
+test("fmtHitPct: clamps out-of-range values instead of growing the string", () => {
+	assert.equal(fmtHitPct(100.6), "100%");
+	assert.equal(fmtHitPct(1e9), "100%");
+	assert.equal(fmtHitPct(-5), "0%");
+});
+
+test("fmtHitPct: non-finite input is `0%`, never `NaN%`/`Infinity%`", () => {
+	assert.equal(fmtHitPct(Number.NaN), "0%");
+	assert.equal(fmtHitPct(Number.POSITIVE_INFINITY), "0%");
+	assert.equal(fmtHitPct(Number.NEGATIVE_INFINITY), "0%");
+});
+
+test("fmtHitPct: output is never wider than 4 columns, for every input", () => {
+	// The title bar of the narrowest block (24 cols) can only spare a few
+	// columns; an over-wide reading would either vanish entirely or, worse,
+	// overflow the rendered row and make pi exit.
+	// `.length` is the right measure here (as in the fmtTps test above): the
+	// output is pure ASCII (`digits + %`), so char count == display columns.
+	for (let v = -10; v <= 110; v += 0.5) {
+		const s = fmtHitPct(v);
+		assert.ok(
+			s.length <= FMT_HIT_MAX,
+			`fmtHitPct(${v}) = ${JSON.stringify(s)} exceeds ${FMT_HIT_MAX} columns`,
+		);
+	}
+	for (const v of [
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		-1e9,
+		1e9,
+		0,
+		100,
+	]) {
+		const s = fmtHitPct(v);
+		assert.ok(s.length <= FMT_HIT_MAX, `fmtHitPct(${v}) = ${JSON.stringify(s)}`);
+		assert.ok(!/NaN|Infinity/.test(s), s);
+	}
+});
+
 
 test("meter: tokens accumulated while disabled are drained at stop-drain, no fake spike on the first frame after re-enable", () => {
 	// This reproduces the semantics of the line

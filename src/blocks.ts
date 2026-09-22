@@ -12,6 +12,7 @@ import {
 	rateAxis,
 	segsWidth,
 	type AxisSpec,
+	type BlockSeries,
 	type MetricBlock,
 	type Seg,
 	type StyledLine,
@@ -21,7 +22,7 @@ import { fmtBytes, fmtRate, type Snapshot } from "./metrics.ts";
 // The TPS formatter lives in the tokens module (the rightful home of anything
 // token-related); import it here rather than writing a second copy — two
 // formatters for the same quantity will drift sooner or later.
-import { fmtTps } from "./tokens.ts";
+import { fmtHitPct, fmtTps, hitRate } from "./tokens.ts";
 
 /** History series to plot as curves (all numeric arrays, index 0 = oldest) */
 export interface History {
@@ -39,6 +40,20 @@ export interface History {
 	 * `src/tokens.ts` — see the comments there.
 	 */
 	tps: number[];
+	/**
+	 * **Session-cumulative cache hit rate** (0..100), sampled once per frame.
+	 *
+	 * Not a metered quantity either: it is recomputed each sample from the running
+	 * totals (`hitRate(tokCacheRead, tokIn)`) and is therefore a **step function**
+	 * — it only moves when a `message_end` arrives, holding flat in between. That
+	 * staircase shape is intentional and honest: the underlying numbers are exact
+	 * provider-reported totals, so there is no sub-frame information to draw.
+	 *
+	 * Stored (rather than derived on the fly from a cumulative history) so the
+	 * curve shows **how much this session's cache behaviour has changed**, instead
+	 * of one single number repeated across the whole window.
+	 */
+	sessHit: number[];
 }
 
 /**
@@ -87,6 +102,16 @@ export interface BlockOptions {
 	tokensOut?: number;
 	/** Session-cumulative cache-read tokens (`usage.cacheRead`), shown as `R…` */
 	tokensCacheRead?: number;
+	/**
+	 * **Instantaneous** cache hit rate of the most recent assistant turn (0..100),
+	 * computed from that turn's own `usage.input` / `usage.cacheRead`.
+	 *
+	 * Undefined means "no turn has reported a measurable prompt yet" (session
+	 * start, or a message that carried no prompt tokens). The title bar shows it
+	 * as `·N%` — the dot marks it as the *point* value, against `⌀N%`, the
+	 * cumulative session average, which is what the second curve draws.
+	 */
+	hitNow?: number;
 	/**
 	 * Where to put the readouts: `title` (default) = border title bar; `box` =
 	 * floating box at the top-right corner; `both` = draw both; `none` = draw neither.
@@ -233,6 +258,8 @@ export interface LineOptions {
 	tokensOut?: number;
 	/** Session-cumulative cache-read tokens (exact `usage.cacheRead`) */
 	tokensCacheRead?: number;
+	/** Instantaneous cache hit rate of the last assistant turn (0..100), shown as `·N%` */
+	hitNow?: number;
 }
 
 /** Segment construction helper: saves every readout from writing `{ text, color }` in full */
@@ -253,7 +280,7 @@ const seg = (text: string, color?: ThemeColor): Seg => ({ text, color });
  *
  * Now it's "a segment sequence sorted by importance + dropping whole segments
  * from the tail":
- *  · Descending importance: CPU → MEM → NET → Tokens (rate and cumulative);
+ *  · Descending importance: CPU → MEM → TOK → NET;
  *  · Each segment carries its own color, **same name, same color** as chart
  *    mode, so the two modes can be cross-checked against each other;
  *  · Truncation only happens when the whole line doesn't fit, and **never cuts
@@ -291,29 +318,52 @@ export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
 			seg(`${s.memPct.toFixed(0)}%`, "warning"),
 			seg(` ${fmtBytes(s.memUsed)}`, "muted"),
 		]);
+	}
+
+	// Token group: same convention as chart mode's `Tokens` block (current rate +
+	// hit rates + session cumulative).
+	// Emitted **even without a snapshot** — TPS doesn't depend on /proc; it's the
+	// only metric that still means anything on non-Linux.
+	//
+	// It sits **before NET**, unlike the old CPU→MEM→NET→TOK order: when the line
+	// runs out of room, whole groups are dropped from the tail, and the token
+	// readout is far less recoverable from anywhere else on screen than the
+	// network rate — so it outranks NET. There is deliberately **no in-group
+	// degradation** (the group is all-or-nothing): the line is a single row with
+	// no room for a second curve, and a half-dropped token group would show a
+	// rate whose meaning depends on which neighbours happened to fit.
+	const tps = opts.tpsNow ?? 0;
+	const tokIn = opts.tokensIn ?? 0;
+	const tokOut = opts.tokensOut ?? 0;
+	const tokR = opts.tokensCacheRead ?? 0;
+	// Same derived values as `buildBlocks` (see the long comment there): available
+	// cache reads, and the cumulative rate recomputed from the running totals.
+	// Deriving instead of storing keeps both modes reading from one source of
+	// truth — the same numbers the chart draws.
+	const seenCache = tokR > 0;
+	const cumHit = hitRate(tokR, tokIn);
+	const tokSegs: StyledLine = [
+		seg("TOK ", "muted"),
+		seg(`~${fmtTps(tps)}`, "accent"),
+	];
+	// Same order and colors as the chart title bar: instantaneous (`·`, success)
+	// then cumulative (`⌀`, warning — the color of the curve it corresponds to).
+	if (seenCache && opts.hitNow !== undefined && Number.isFinite(opts.hitNow))
+		tokSegs.push(seg(` ·${fmtHitPct(opts.hitNow)}`, "success"));
+	if (seenCache) tokSegs.push(seg(` ⌀${fmtHitPct(cumHit)}`, "warning"));
+	// Cumulative initials `↑`/`↓`/`R` match pi's built-in footer in character and order, directly comparable
+	if (tokIn > 0) tokSegs.push(seg(` ↑${fmtTokensTotal(tokIn)}`, "muted"));
+	if (tokOut > 0) tokSegs.push(seg(` ↓${fmtTokensTotal(tokOut)}`, "muted"));
+	if (seenCache) tokSegs.push(seg(` R${fmtTokensTotal(tokR)}`, "muted"));
+	groups.push(tokSegs);
+
+	if (s) {
 		groups.push([
 			seg("NET ", "muted"),
 			seg(`↑${fmtRate(s.txBps)}`, "warning"),
 			seg(` ↓${fmtRate(s.rxBps)}`, "accent"),
 		]);
 	}
-
-	// Token group: same convention as chart mode's `Tokens` block (current rate + session cumulative).
-	// Emitted **even without a snapshot** — TPS doesn't depend on /proc; it's the
-	// only metric that still means anything on non-Linux.
-	const tps = opts.tpsNow ?? 0;
-	const tokIn = opts.tokensIn ?? 0;
-	const tokOut = opts.tokensOut ?? 0;
-	const tokR = opts.tokensCacheRead ?? 0;
-	const tokSegs: StyledLine = [
-		seg("TOK ", "muted"),
-		seg(`~${fmtTps(tps)}`, "accent"),
-	];
-	// Cumulative initials `↑`/`↓`/`R` match pi's built-in footer in character and order, directly comparable
-	if (tokIn > 0) tokSegs.push(seg(` ↑${fmtTokensTotal(tokIn)}`, "muted"));
-	if (tokOut > 0) tokSegs.push(seg(` ↓${fmtTokensTotal(tokOut)}`, "muted"));
-	if (tokR > 0) tokSegs.push(seg(` R${fmtTokensTotal(tokR)}`, "muted"));
-	groups.push(tokSegs);
 
 	const joinedWidth = (gs: StyledLine[]): number =>
 		gs.reduce((acc, g) => acc + segsWidth(g), 0) + Math.max(0, gs.length - 1) * 2;
@@ -641,23 +691,90 @@ export function buildBlocks(
 		// The readout convention is **byte-identical to pi footer**
 		// (`↑input ↓output RcacheRead`, session cumulative), so the numbers on the
 		// chart can be checked directly against pi's bottom line.
-		// Order by descending importance (dropped from the tail on narrow blocks):
-		// current rate → uplink → downlink → cache read.
 		const cur = opts.tpsNow ?? 0;
 		const tokIn = opts.tokensIn ?? 0;
 		const tokOut = opts.tokensOut ?? 0;
 		const tokR = opts.tokensCacheRead ?? 0;
+		// ── Cache hit rate ──────────────────────────────────────────────
+		// Cached prompt tokens are billed far cheaper than fresh input, so the hit
+		// rate is the one number that says whether the cache is actually working.
+		// Two views of it, deliberately different:
+		//   · cumulative (`⌀`, what the yellow curve draws) — recomputed here from
+		//     the running session totals, so it never needs its own accumulator;
+		//   · instantaneous (`·`, title bar only) — the last turn's own ratio,
+		//     which is the actionable one (it reacts immediately when a turn
+		//     misses the cache; the cumulative average hides that for a long time).
+		// `⌀` (U+2300 DIAMETER SIGN, width 1) reads as "average" without stealing
+		// the `~` that already means "estimated" on the rate.
+		//
+		// `seenCache` / `cumHit` are derived, not stored: `seenCache ≡ tokR > 0`
+		// is just "the provider has ever reported a cache read this session", and
+		// `cumHit` is a pure function of the two cumulative counters already in
+		// this scope. Keeping them derived removes any chance of a second ledger
+		// drifting from the totals.
+		const seenCache = tokR > 0;
+		const cumHit = hitRate(tokR, tokIn);
 		// `~` only goes on the **rate**: it's estimated from delta text, not metered.
 		// Cumulative values come from the exact `usage` of `message_end`, so no `~` —
 		// the distinction itself is information for the user (which number to trust).
 		const curTxt = `~${fmtTps(cur)}`;
-		// Segmented construction: `↑`/`↓`/`R` same characters, same order as pi footer.
-		// Cumulative values use muted: they're background info and shouldn't fight
-		// the curve's accent for attention.
-		const ioSegs: StyledLine = [];
-		if (tokIn > 0) ioSegs.push({ text: `  \u2191${fmtTokensTotal(tokIn)}` });
-		if (tokOut > 0) ioSegs.push({ text: ` \u2193${fmtTokensTotal(tokOut)}` });
-		if (tokR > 0) ioSegs.push({ text: ` R${fmtTokensTotal(tokR)}` });
+		// Segmented construction: **descending importance**, since the title bar is
+		// accumulated segment by segment and drops from the tail when it runs out of
+		// room. Order: rate → instantaneous hit → cumulative hit → ↑ → ↓ → R.
+		// The two hit-rate readouts sit **right after the rate** because they're the
+		// subject of the second curve; the cumulative token counters are background
+		// info (already exact in pi's own footer) and yield first.
+		// Leading spaces live inside each segment, so dropping one never glues its
+		// neighbours together (` ·` + `⌀` vs ` ⌀` stays correct either way).
+		// Note the `↑` segment carries **two** leading spaces (`  ↑`, not ` ↑`):
+		// that's the historical format aligned with pi's own footer, kept as-is,
+		// while `·`/`⌀` take a single space — don't "unify" them.
+		const infoSegs: StyledLine = [{ text: curTxt, color: "accent" }];
+		if (seenCache && opts.hitNow !== undefined && Number.isFinite(opts.hitNow))
+			infoSegs.push({ text: ` ·${fmtHitPct(opts.hitNow)}`, color: "success" });
+		if (seenCache)
+			infoSegs.push({ text: ` ⌀${fmtHitPct(cumHit)}`, color: "warning" });
+		if (tokIn > 0)
+			infoSegs.push({ text: `  \u2191${fmtTokensTotal(tokIn)}`, color: "muted" });
+		if (tokOut > 0)
+			infoSegs.push({ text: ` \u2193${fmtTokensTotal(tokOut)}`, color: "muted" });
+		if (seenCache)
+			infoSegs.push({ text: ` R${fmtTokensTotal(tokR)}`, color: "muted" });
+		// ── Second curve: cumulative hit rate (only once cache reads exist) ──
+		// It has its **own 0..100% scale**, but no second gutter: its values are
+		// pre-mapped onto the TPS axis (`hit% / 100 × axisTop`) and the series is
+		// marked `excludeFromScale`, so the height of the yellow line is exactly
+		// `hit% × plot height` while the tick column keeps showing TPS only. Two
+		// scales, one gutter — the classic dual-axis chart, except the second scale
+		// is fixed (0..100) and therefore needs no labels; the color binding
+		// (yellow curve ⇄ the `⌀` title readout) is what tells them apart.
+		// Why pre-map instead of letting `renderBlock` scale both: with a shared axis
+		// a 3000 t/s spike pushes the top to 4500, so 90% renders as a 2%-tall line
+		// glued to the floor — invisible exactly when the model is streaming, i.e.
+		// when the user is looking at it.
+		// TPS must stay **series[0]**: `renderChartGlyphs` resolves same-cell
+		// collisions in favour of the lowest index, so the rate curve keeps its
+		// cells (and its colour) even when the two lines overlap.
+		const tpsTail = tail(hist.tps, points);
+		const tokSeries: BlockSeries[] = [{ values: tpsTail }];
+		if (seenCache) {
+			// Same "finite and > 0 only" sampling rule as `renderBlock`'s dataMax (an
+			// all-zero/absent tail therefore falls back to the axis floor), and the
+			// top is derived through `tokenAxis` itself so the two formulas can't
+			// drift apart.
+			let tpsTailMax = 0;
+			for (const v of tpsTail)
+				if (Number.isFinite(v) && v > tpsTailMax) tpsTailMax = v;
+			// Reuse the axis' own `max × 1.5` (with its MIN_TPS_SCALE floor): hardcoding
+			// 1.5 here would silently de-sync the moment `tokenAxis` changes.
+			const scaleTop = tokenAxis(tpsTailMax).max;
+			const hitTail = tail(hist.sessHit, points);
+			tokSeries.push({
+				values: hitTail.map((h) => (scaleTop * h) / 100),
+				color: "warning",
+				excludeFromScale: true,
+			});
+		}
 		blocks.push({
 			name: "Tokens",
 			color: "accent",
@@ -665,11 +782,19 @@ export function buildBlocks(
 			// failed on non-Linux), don't write readouts.
 			// TPS itself doesn't depend on /proc, but the invariant (no snapshot ⇒
 			// no readouts) is worth keeping.
-			titleInfo: at(
-				snap ? [{ text: curTxt, color: "accent" }, ...ioSegs] : undefined,
-			),
-			series: [{ values: tail(hist.tps, points) }],
+			titleInfo: at(snap ? infoSegs : undefined),
+			series: tokSeries,
 			legend: ab([[{ text: curTxt }]]),
+			// Known limitations with a sub-window (PI_SYSMON_SCALE_WINDOW < 1, not the
+			// default): (a) the scale is sampled from the most recent points only, so
+			// `renderBlock`'s axis top can sit **below** the `scaleTop` used to
+			// pre-map the yellow line above → the yellow line is momentarily clamped
+			// to the top row (`renderBlock`'s overflow detector skips excluded
+			// series, so at least the `+` marker stays off the tick); (b) the reverse
+			// degeneracy is gone entirely: a **low**-TPS session no longer has its
+			// axis pinned by the percentage curve, because both the scale sampling
+			// and the overflow check now ignore the yellow series.
+			// The rendering primitives are frozen, so this is declared, not fixed.
 			scaleWindowPoints: rateScalePts,
 			windowPoints: points,
 			// Token-unit ticks (can't reuse rateAxis: it would label tok/s as KB)

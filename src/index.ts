@@ -336,6 +336,7 @@ export default function (pi: ExtensionAPI) {
 
 	const hist: History = {
 		cpu: [],
+		cpuTemp: [],
 		mem: [],
 		netRx: [],
 		netTx: [],
@@ -457,6 +458,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			snap = collector.collect();
 			pushCapped(hist.cpu, snap.cpuPct, STORE_CAP);
+			pushCapped(hist.cpuTemp, snap.cpuTemp, STORE_CAP);
 			pushCapped(hist.mem, snap.memPct, STORE_CAP);
 			pushCapped(hist.netRx, snap.rxBps, STORE_CAP);
 			pushCapped(hist.netTx, snap.txBps, STORE_CAP);

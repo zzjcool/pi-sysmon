@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CPU temperature curve** — the CPU chart draws a second (red) line with its own fixed 0–100°C
+  scale sharing the plot area with CPU%, mirroring the Tokens chart's TPS/cache-hit-rate dual axis:
+  a `100°` label overlaid at the top-right corner of the plot area marks the secondary scale
+  (1°C ≡ 1% of the plot height — the two fixed scales coincide by construction, so raw °C needs
+  no pre-mapping), and the title bar carries the current `°C` reading after the load averages
+  (muted ≤75°C, warning ≤90°C, error above — where sustained throttling territory starts).
+  - The temperature series is `excludeFromScale`: a real 100°C+ reading can neither stretch the
+    CPU% axis nor trip a lying `+` overflow marker on the `100%` tick — pinned to the top simply
+    reads "at or above 100°C".
+  - Linux reads `/sys/class/hwmon` (`temp*_label`/`temp*_input`) with a CPU-ish label preference,
+    falling back to `/sys/class/thermal` zone types; macOS has no unprivileged CPU-temperature
+    API (`powermetrics` requires sudo), so a user-installed helper (`osx-cpu-temp` / `istats`)
+    is probed instead.
+  - No readable source ⇒ unknown ⇒ the second curve and the `100°` label are simply absent
+    (never a red line glued to 0°C) — same "unknown ⇒ absent" degradation as `◔N%`.
+
+### Fixed
+
+- **The floating legend box no longer invades the title row** — `renderBlock`'s `plotTop`
+  was 0 while `lines[0]` is the head/title row, so the box's top border was overlaid onto the
+  title (masked in tests because the title row happens to carry its own `┌`/`┐` corners).
+  Now the box starts on the first plot row. Found while wiring the right-axis label, which
+  needs the same "true top plot row" coordinate — and with a box present the `100°` label now
+  hugs the box's left edge on the same row instead of being buried underneath it.
+
 - **Context-window usage `◔N%` in the Tokens readout** (both chart title bar and `line` mode).
   The number comes from pi's own `ctx.getContextUsage()` — the exact same ledger the built-in
   footer displays — refreshed once per sample, so the two readouts can be cross-checked.

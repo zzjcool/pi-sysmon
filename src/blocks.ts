@@ -27,6 +27,16 @@ import { fmtCtxPct, fmtHitPct, fmtTps, hitRate } from "./tokens.ts";
 /** History series to plot as curves (all numeric arrays, index 0 = oldest) */
 export interface History {
 	cpu: number[];
+	/**
+	 * CPU package temperature (°C), sampled once per frame from `Snapshot.cpuTemp`.
+	 *
+	 * **0 = unknown**: platforms with no readable sensor push 0s, and
+	 * `buildBlocks` gates the temperature curve on "history actually contains a
+	 * >0 reading" — so the CPU block degrades to the old single-curve form
+	 * instead of drawing a misleading line glued to 0°C. (Same "unknown ⇒ absent"
+	 * degradation as `ctxPct`.)
+	 */
+	cpuTemp: number[];
 	mem: number[];
 	netRx: number[];
 	netTx: number[];
@@ -308,6 +318,20 @@ const seg = (text: string, color?: ThemeColor): Seg => ({ text, color });
 function ctxPctColor(pct: number): ThemeColor {
 	if (pct > 90) return "error";
 	if (pct > 70) return "warning";
+	return "muted";
+}
+
+/**
+ * Color for the CPU-temperature readout and curve. Thresholds picked so that
+ * a normal laptop CPU (40..85°C under load) reads `error` only when actually
+ * hot: >90°C is where sustained throttling territory starts on modern
+ * package sensors; >75°C already deserves attention (sustained boost).
+ * Below that the reading is `muted` — informative, not alarming (a 50°C idle
+ * painted red would be pure noise).
+ */
+function tempColor(celsius: number): ThemeColor {
+	if (celsius > 90) return "error";
+	if (celsius > 75) return "warning";
 	return "muted";
 }
 
@@ -614,10 +638,51 @@ export function buildBlocks(
 	// Absolute point count rather than a fraction, because a fraction applied to
 	// the short arrays of early startup yields a growing scale window, making
 	// recovery time erratic (measured drifting from 10s to 18s).
-	const rateScalePts = Math.max(
-		1,
-		Math.round(points * (opts.scaleWindowFrac ?? DEFAULT_SCALE_WINDOW_FRAC)),
-	);
+const rateScalePts = Math.max(
+1,
+Math.round(points * (opts.scaleWindowFrac ?? DEFAULT_SCALE_WINDOW_FRAC)),
+);
+
+// ── CPU temperature series (second curve, only once a reading exists) ──
+// The temperature has its **own 0..100°C scale** while sharing the CPU%
+// axis' geometry — 1°C ≡ 1% of the plot height, so raw °C values need no
+// pre-mapping (unlike the Tokens block's hit-rate curve, whose 0..100% has
+// to be scaled onto the TPS axis' varying top; here both scales are fixed,
+// and they coincide by construction). The `100°` label overlaid at the
+// top-right corner of the plot area is the only on-screen trace of this
+// second scale, mirroring how the TPS block's hit-rate curve works (two
+// scales, one gutter; the colour binding — red line ⇄ the `°` title
+// readout — is what tells them apart).
+//
+// Gate: `hasTemp` requires a >0 reading within the visible window — a
+// platform with no readable sensor pushes 0s, and "unknown ⇒ curve absent"
+// beats drawing a line glued to 0°C (same degradation as `ctxPct`).
+const cpuTempTail = tail(hist.cpuTemp, points);
+let hasTemp = false;
+for (const v of cpuTempTail)
+if (Number.isFinite(v) && v > 0) {
+		hasTemp = true;
+		break;
+}
+const cpuSeries: BlockSeries[] = [{ values: tail(hist.cpu, points) }];
+if (hasTemp) {
+// `excludeFromScale` for the same two reasons as the hit-rate series:
+//  ① a real 100°C+ reading must not stretch the CPU% axis past 100.5
+//    (the height of the % curve would change meaning — the two scales
+//    would silently merge into one);
+//  ② `renderBlock`'s overflow detector skips excluded series, so a hot
+//    CPU (>100.5 axis units) clamps to the top row without lying a `+`
+//    onto the `100%` tick (the temperature curve has its own ceiling
+//    semantics: pinned to the top = "at or above 100°C").
+// CPU% stays **series[0]**: `renderChartGlyphs` resolves same-cell
+// collisions in favour of the lowest index, so the % curve keeps its
+// cells (and its colour) wherever the two lines cross.
+	cpuSeries.push({
+			values: cpuTempTail.map((t) => (Number.isFinite(t) && t > 0 ? t : 0)),
+			color: "error",
+			excludeFromScale: true,
+		});
+	}
 
 	const blocks: MetricBlock[] = [
 		{
@@ -625,7 +690,10 @@ export function buildBlocks(
 			name: "CPU",
 			color: "success",
 			// Title-bar readouts (descending importance; dropped from the tail on narrow blocks):
-			// current usage → 1/5/15 min load averages (the latter formatted like bottom's `CPU ─ 1.52 1.71 2.26`)
+			// current usage → 1/5/15 min load averages (the latter formatted like bottom's `CPU ─ 1.52 1.71 2.26`) → temperature.
+			// The temperature segment carries **two** leading spaces so it visually
+			// separates from the load averages, and drops first when the block is
+			// narrow — a load-average user loses nothing vs before this feature.
 			titleInfo: at(
 				snap
 					? [
@@ -634,10 +702,24 @@ export function buildBlocks(
 								text: `  ${snap.load1.toFixed(2)} ${snap.load5.toFixed(2)} ${snap.load15.toFixed(2)}`,
 								color: "muted",
 							},
+							...(snap.cpuTemp > 0
+								? ([
+										{ text: "  ", color: "muted" },
+										{
+											text: `${snap.cpuTemp.toFixed(0)}°`,
+											color: tempColor(snap.cpuTemp),
+										},
+									] as Seg[])
+								: []),
 						]
-					: undefined,
+						: undefined,
 			),
-			series: [{ values: tail(hist.cpu, points) }],
+		series: cpuSeries,
+		// The `100°` secondary-scale label (drawn by renderBlock at the plot
+		// area's top-right corner). `°` is width 1 (verified via pi-tui's
+		// visibleWidth), so the label is exactly 4 columns — constant width, no
+		// cross-frame jitter (ARCHITECTURE pitfall 6).
+		rightAxisLabel: hasTemp ? "100°" : undefined,
 			// Floating readout box for `PI_SYSMON_LABEL=box` (content overlaps the
 			// title bar's, but since only one of the two modes is enabled, no need
 			// to sacrifice information to avoid duplication)

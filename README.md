@@ -26,6 +26,11 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
 - **Four charts by default** — CPU / Memory / Network / **Tokens (LLM throughput rate)**;
   the Tokens chart shows, in real time, the output-token rate between this pi process and the model API,
   and cross-checks against the `⚡ 23.0 t/s (avg)` that pi itself shows in the status bar
+- **CPU temperature curve** — the CPU chart draws a second (red) line with its own 0–100°C scale
+  sharing the plot area with CPU% (a `100°` label marks the secondary scale at the top-right corner;
+  the title bar carries the current `°C` reading). Linux reads `/sys/class/hwmon` + `/sys/class/thermal`;
+  macOS has no unprivileged API, so an optional user-installed helper (`osx-cpu-temp` / `istats`) is probed —
+  without a source the chart silently degrades to the plain single-curve form
 - **Proper axes** — y-axis tick marks, an x-axis line, and time-window labels, replicating bottom's layout
 - **Top of y-axis = true window maximum** — the height at any point in the 60s window can be read
   directly off the top tick; the scale never lies (set `PI_SYSMON_SCALE_WINDOW=<1` to also enable

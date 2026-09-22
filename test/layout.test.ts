@@ -83,6 +83,7 @@ const plainTheme: ThemeLike = { fg: (_c, s) => s };
 
 const fakeSnap = (over: Partial<Snapshot> = {}): Snapshot => ({
 	cpuPct: 37,
+	cpuTemp: 61,
 	memUsed: 33 * 1024 ** 3,
 	memTotal: 64 * 1024 ** 3,
 	memPct: 52,
@@ -106,6 +107,11 @@ function fakeHist(n: number): History {
 		);
 	return {
 		cpu: wave(20, 15, 7),
+		// Realistic laptop range (45..75°C), non-flat so "is the red curve wired to
+		// cpuTemp?" is distinguishable from "is it drawing a constant?" — same
+		// discipline as sessHit. Values stay raw °C: `buildBlocks` maps nothing
+		// (1°C ≡ 1% of plot height by construction).
+		cpuTemp: wave(58, 12, 9),
 		mem: wave(50, 4, 11),
 		netRx: wave(20_000, 15_000, 5),
 		netTx: wave(5_000, 4_000, 3),
@@ -1368,6 +1374,7 @@ test("buildBlocks: a 90% hit rate renders in the upper half even with a 3000 t/s
 	const n = 50;
 	const hist: History = {
 		cpu: new Array(n).fill(20),
+		cpuTemp: new Array(n).fill(60),
 		mem: new Array(n).fill(50),
 		netRx: new Array(n).fill(1000),
 		netTx: new Array(n).fill(1000),
@@ -1424,6 +1431,7 @@ test("buildBlocks: a low-TPS session no longer has its token axis pinned by the 
 	const flat = (v: number) => new Array(n).fill(v);
 	const hist: History = {
 		cpu: flat(20),
+		cpuTemp: flat(60),
 		mem: flat(50),
 		netRx: flat(1000),
 		netTx: flat(1000),
@@ -1468,6 +1476,255 @@ test("buildBlocks: a low-TPS session no longer has its token axis pinned by the 
 	assert.ok(lines.length > 0, "the Tokens block must render");
 	for (const line of lines)
 		assert.equal(visibleWidth(line), W, `line wider than ${W}: ${JSON.stringify(line)}`);
+});
+
+/* ------------------------------------------------------------------ */
+/* 4b. CPU temperature curve (dual-axis, mirroring the TPS/hit-rate      */
+/*     pattern the user asked to imitate)                                */
+/* ------------------------------------------------------------------ */
+
+test("buildBlocks: CPU plots the temperature as a second (error) curve, CPU% staying series[0]", () => {
+	// The index order is **load-bearing**, not cosmetic (same as the Tokens
+	// block): `renderChartGlyphs` resolves a same-cell collision in favour of
+	// the lowest index, so CPU% must be series[0] or the red temperature line
+	// would steal the % curve's cells (and its colour) wherever they cross.
+	const h = fakeHist(50);
+	const cpu = buildBlocks(h, fakeSnap(), { points: 30 }).find(
+		(b) => b.name === "CPU",
+	);
+	assert.ok(cpu);
+	assert.equal(cpu.series.length, 2, "with a temperature reading there are two curves");
+	assert.deepEqual(
+		cpu.series[0]?.values,
+		h.cpu.slice(-30),
+		"series[0] must be CPU% (lowest index wins same-cell collisions)",
+	);
+	assert.equal(
+		cpu.series[0]?.color,
+		undefined,
+		"series[0] must carry no color so it inherits the block success colour",
+	);
+	assert.equal(cpu.series[1]?.color, "error", "series[1] is the red temperature line");
+	// The values are the **raw °C** — no pre-mapping: the temperature scale
+	// (0..100°C) and the % axis geometry coincide by construction (1°C ≡ 1% of
+	// plot height), unlike the Tokens block whose hit-rate curve is scaled onto
+	// the TPS axis' varying top.
+	assert.deepEqual(
+		cpu.series[1]?.values,
+		h.cpuTemp.slice(-30),
+		"series[1] must be the raw °C history",
+	);
+	assert.equal(
+		cpu.series[1]?.excludeFromScale,
+		true,
+		"the temperature line must be excluded from the y-scale and overflow detection",
+	);
+	// The secondary-scale readout at the top-right corner of the plot area.
+	assert.equal(cpu.rightAxisLabel, "100°");
+	// And the axis itself stays the fixed percent scale — the temperature
+	// series must not have stretched it (that's what excludeFromScale buys).
+	assert.equal(cpu.axis(999, 4).max, 100.5, "CPU range stays fixed at 100.5");
+});
+
+test("buildBlocks: no temperature source ⇒ single-curve CPU block, no `100°` label (graceful degradation)", () => {
+	// A platform whose sensor is unreadable pushes 0s; "unknown ⇒ curve absent"
+	// beats drawing a red line glued to 0°C. Same degradation philosophy as
+	// `ctxPct` (unknown ⇒ segment absent), pinned here so a future refactor
+	// can't quietly turn "unknown" into a fabricated 0°C reading.
+	const h = fakeHist(50);
+	h.cpuTemp = new Array(50).fill(0);
+	const snap = fakeSnap({ cpuTemp: 0 });
+	const cpu = buildBlocks(h, snap, { points: 30 }).find((b) => b.name === "CPU");
+	assert.ok(cpu);
+	assert.equal(cpu.series.length, 1, "no reading ⇒ no second curve");
+	assert.equal(cpu.rightAxisLabel, undefined, "no reading ⇒ no 100° label");
+	// The title bar must not carry a `0°` reading either.
+	const title = (cpu.titleInfo ?? []).map((s) => s.text).join("");
+	assert.ok(!title.includes("°"), `no ° in the title bar: ${JSON.stringify(title)}`);
+});
+
+test("buildBlocks: a temperature history with ANY real reading in the window turns the curve on", () => {
+	// The gate is over the **visible window** (not the whole store): a sensor
+	// that just came back (e.g. helper installed mid-session) flips the chart
+	// to two curves as soon as one >0 sample enters the window.
+	const h = fakeHist(50);
+	h.cpuTemp = new Array(50).fill(0);
+	h.cpuTemp[49] = 42; // one real reading, the newest
+	const cpu = buildBlocks(h, fakeSnap({ cpuTemp: 42 }), { points: 30 }).find(
+		(b) => b.name === "CPU",
+	);
+	assert.ok(cpu);
+	assert.equal(cpu.series.length, 2);
+	assert.equal(cpu.rightAxisLabel, "100°");
+	// Unknown points inside the window render as 0, not NaN (NaN coordinates
+	// are the road to out-of-bounds crashes — ARCHITECTURE pitfall 4).
+	const tail = cpu.series[1]?.values ?? [];
+	assert.ok(tail.every((v) => Number.isFinite(v)), `no NaN in the temp series: ${tail}`);
+});
+
+test("buildBlocks: the CPU title bar carries the temperature readout after the load averages", () => {
+	// Descending importance: usage% → load1/5/15 → `°`. The temperature
+	// segment is **last** so it drops first on narrow blocks — a user who
+	// cares about load averages loses nothing vs before this feature.
+	const h = fakeHist(50);
+	const cpu = buildBlocks(h, fakeSnap({ cpuTemp: 61.4 }), { points: 30 }).find(
+		(b) => b.name === "CPU",
+	);
+	assert.ok(cpu);
+	const texts = (cpu.titleInfo ?? []).map((s) => s.text);
+	const joined = texts.join("");
+	assert.ok(joined.includes("61°"), `rounded °C reading: ${JSON.stringify(joined)}`);
+	assert.ok(
+		joined.indexOf("61°") > joined.indexOf("1.23 4.56 7.89"),
+		"the ° reading must come after the load averages",
+	);
+});
+
+test("renderBlock: the `100°` secondary label lands at the plot area's top-right corner", () => {
+	const h = fakeHist(50);
+	const cpu = buildBlocks(h, fakeSnap(), { points: 30 }).find((b) => b.name === "CPU");
+	assert.ok(cpu);
+	const W = 50;
+	const plotRows = 6;
+	const lines = renderPanel(
+		plainTheme,
+		[cpu],
+		W,
+		{ cols: 1, bands: 1, widths: [W], plotRows, totalRows: plotRows + BLOCK_CHROME_ROWS },
+		60,
+	);
+	// Top plot row = lines[1] (after the title row). The label must sit flush
+	// against the right border: `100°`'s last column is w-2 (border at w-1).
+	const top = lines[1] ?? "";
+	const at = (i: number) => top[i];
+	assert.equal(at(W - 1), "│", "right border column");
+	assert.ok(top.endsWith("100°│"), `label flush against the right border: ${JSON.stringify(top)}`);
+	// The left tick (`100%`) must still be there — the two scales coexist.
+	assert.ok(top.includes("100%"), `left tick present: ${JSON.stringify(top)}`);
+	// The temperature curve is drawn in the error colour: with wave(58,12,9)
+	// data the red line must exist somewhere in the plot area.
+	const ansiLines = renderPanel(
+		ansiTheme,
+		[cpu],
+		W,
+		{ cols: 1, bands: 1, widths: [W], plotRows, totalRows: plotRows + BLOCK_CHROME_ROWS },
+		60,
+	);
+	const plot = ansiLines.slice(1, 1 + plotRows).join("\n");
+	assert.ok(
+			plot.includes("\x1b[31m"),
+			"the red temperature curve must be drawn somewhere in the plot area",
+		);
+});
+
+test("renderBlock: the `100°` label dodges the floating legend box instead of hiding under it", () => {
+	// labelMode=box: the floating box is painted over the plot area's top-right
+	// corner — the exact spot the `100°` label wants. The label must hug the
+	// box's LEFT edge on the same row (never under it, never dropped):
+	// `│100%          100° ┌───────┐│`.
+	// This also pins the `plotTop` fix: the box's top border must sit on the
+	// FIRST PLOT ROW, not on the title row (the old plotTop=0 overlaid it onto
+	// the title, masked by the title's own ┌/┐ corners).
+	const h = fakeHist(50);
+	const cpu = buildBlocks(h, fakeSnap(), { points: 30, labelMode: "box" }).find(
+		(b) => b.name === "CPU",
+	);
+	assert.ok(cpu);
+	const W = 50;
+	const plotRows = 6;
+	const lines = renderPanel(
+		plainTheme,
+		[cpu],
+		W,
+		{ cols: 1, bands: 1, widths: [W], plotRows, totalRows: plotRows + BLOCK_CHROME_ROWS },
+		60,
+	);
+	// The box top border ┌…┐ is on the first plot row (lines[1]), NOT on the title row.
+	const title = lines[0] ?? "";
+	const firstPlot = lines[1] ?? "";
+	assert.ok(
+		!/┌─+┐/.test(title.replace("┌ CPU", "")),
+		`the legend box top border must not invade the title row: ${JSON.stringify(title)}`,
+	);
+	assert.ok(firstPlot.includes("┌") && lines[2]?.includes("AVG"), `the box top is on the first plot row and the body on the second: ${JSON.stringify(firstPlot)}`);
+	// The label is present, to the LEFT of the box, on the same row as the box top.
+	const li = firstPlot.indexOf("100°");
+	const bi = firstPlot.indexOf("┌");
+	assert.ok(li >= 0, `100° must be drawn: ${JSON.stringify(firstPlot)}`);
+	assert.ok(
+			bi > li && bi - (li + 4) >= 1,
+			`100° must sit left of the box with a gap: ${JSON.stringify(firstPlot)}`,
+	);
+	// …and the left percent tick still leads the row.
+	assert.ok(firstPlot.startsWith("│100%"), `left tick present: ${JSON.stringify(firstPlot)}`);
+});
+
+test("renderBlock: the `100°` label is dropped when the block is too narrow (never overflows)", () => {
+	// The right-label guard requires room for the left tick + the label + a
+	// 2-column gap. Below that the label must be **absent** — a cramped
+	// `100%100°` mashup is worse than no secondary scale, and an overflowing
+	// row crashes pi outright.
+	const h = fakeHist(50);
+	for (let w = 6; w <= 40; w++) {
+		const cpu = buildBlocks(h, fakeSnap(), { points: 30 }).find((b) => b.name === "CPU");
+		assert.ok(cpu);
+		const lines = renderPanel(
+			plainTheme,
+			[cpu],
+			w,
+			{ cols: 1, bands: 1, widths: [w], plotRows: 4, totalRows: 4 + BLOCK_CHROME_ROWS },
+			60,
+		);
+		for (const l of lines) assert.ok(visibleWidth(l) <= w, `w=${w}: ${JSON.stringify(l)}`);
+		// `100°` never appears glued to the left tick; when present it must
+		// have at least 2 columns of separation from the left tick region.
+		const top = lines[1] ?? "";
+		const li = top.indexOf("100%");
+		const ri = top.indexOf("100°");
+		if (ri >= 0) {
+			assert.ok(li >= 0, `w=${w}: right label without left tick`);
+			assert.ok(
+				ri - (li + 4) >= 2,
+				`w=${w}: right label too close to the left tick: ${JSON.stringify(top)}`,
+			);
+		}
+	}
+});
+
+test("renderBlock: a hot CPU (>100°C) clamps to the top without stretching the % axis or lying a `+`", () => {
+	// The two excludeFromScale guarantees, at render level:
+	//  ① the % axis stays 100.5 (a 105°C reading must not stretch it);
+	//  ② the overflow detector skips the excluded series, so the `100%` tick
+	//     carries no `+` (the temperature curve's own ceiling semantics: pinned
+	//     to the top = "at or above 100°C").
+	const n = 50;
+	const h = fakeHist(n);
+	h.cpuTemp = new Array(n).fill(105); // sustained >100°C
+	const cpu = buildBlocks(h, fakeSnap({ cpuTemp: 105 }), { points: 30 }).find(
+		(b) => b.name === "CPU",
+	);
+	assert.ok(cpu);
+	// Scale: derive dataMax the same way renderBlock does (excluded series skipped).
+	let dataMax = 0;
+	for (const s of cpu.series) {
+		if (s.excludeFromScale) continue;
+		for (const v of s.values) if (Number.isFinite(v) && v > dataMax) dataMax = v;
+	}
+	assert.equal(cpu.axis(dataMax, 4).max, 100.5, "a 105°C reading must not stretch the % axis");
+	// Render: no `+` on the top tick, exact widths everywhere.
+	const W = 50;
+	const lines = renderPanel(
+		plainTheme,
+		[cpu],
+		W,
+		{ cols: 1, bands: 1, widths: [W], plotRows: 6, totalRows: 6 + BLOCK_CHROME_ROWS },
+		60,
+	);
+	assert.ok(lines.length > 0);
+	for (const line of lines)
+		assert.equal(visibleWidth(line), W, `line wider than ${W}: ${JSON.stringify(line)}`);
+	const topRow = lines[1] ?? "";
+	assert.ok(!topRow.includes("100%+"), `no overflow marker on the tick: ${JSON.stringify(topRow)}`);
 });
 
 test("buildBlocks: without cache reads the Tokens block stays single-curve and has no ·/⌀ segments", () => {
@@ -1651,6 +1908,7 @@ test("auto range: with an explicit sub-window, a fallen spike is marked `+` (reg
 	const mk = (age: number): History => {
 		const h: History = {
 			cpu: [],
+			cpuTemp: [],
 			mem: [],
 			netRx: [],
 			netTx: [],
@@ -1859,6 +2117,7 @@ test("auto range: by default (scale window == display window) the top tick never
 		for (const mult of [2, 10, 50, 1000]) {
 			const h: History = {
 				cpu: [],
+				cpuTemp: [],
 				mem: [],
 				netRx: [],
 				netTx: [],
@@ -1968,6 +2227,7 @@ test("auto range: recovery time is fixed, independent of how long it's been runn
 	const recoverSecs = (preFrames: number): number => {
 		const hist: History = {
 			cpu: [],
+			cpuTemp: [],
 			mem: [],
 			netRx: [],
 			netTx: [],
@@ -2080,6 +2340,7 @@ test("auto range: fall-back is smooth, no single-frame whole-chart jumps (regres
 	// 0), making the decay continuous.
 	const hist: History = {
 		cpu: [],
+		cpuTemp: [],
 		mem: [],
 		netRx: [],
 		netTx: [],

@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createCollector,
+	parseCpuTempText,
 	parseIoreg,
 	parseIostat,
 	parseNetstatIb,
@@ -288,6 +289,35 @@ test("parseIoreg: sums Bytes (Read)/Bytes (Write) across every driver", () => {
 
 test("parseIoreg: no drivers → zeros", () => {
 	assert.deepEqual(parseIoreg(""), { read: 0, write: 0 });
+});
+
+/* ------------------------------------------------------------------ */
+/* 5b. parseCpuTempText — macOS helper output (pure, offline)           */
+/* ------------------------------------------------------------------ */
+
+test("parseCpuTempText: osx-cpu-temp output (`61.5°C`)", () => {
+	assert.equal(parseCpuTempText("61.5°C\n"), 61.5);
+});
+
+test("parseCpuTempText: istats output (`CPU temperature: 61.50°C`)", () => {
+	assert.equal(parseCpuTempText("CPU temperature: 61.50°C\n"), 61.5);
+});
+
+test("parseCpuTempText: no number / junk → 0 (unknown, never garbage)", () => {
+	assert.equal(parseCpuTempText(""), 0);
+	assert.equal(parseCpuTempText("not available"), 0);
+	// A °F reading from a misconfigured helper must be rejected, not shown as
+	// a plausible-sounding 61°C-adjacent number... actually 61°F ≈ 16°C would
+	// parse as 61 — can't be helped without unit info; but 0°F / 300°F style
+	// out-of-window values are caught by the 0..150 sanity bound:
+	assert.equal(parseCpuTempText("-40°F"), 0);
+	assert.equal(parseCpuTempText("999999"), 0);
+});
+
+test("parseCpuTempText: takes the FIRST number (helpers print the reading first)", () => {
+	// istats in verbose mode prints several sensor values; the CPU reading is
+	// the first one, and the parse must not drift onto fan RPMs etc.
+	assert.equal(parseCpuTempText("61.8°C 5400rpm 33°C"), 61.8);
 });
 
 /* ------------------------------------------------------------------ */

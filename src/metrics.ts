@@ -77,6 +77,14 @@ function sectorSizeFor(dev: string): number {
 
 export interface Snapshot {
 	cpuPct: number;
+	/**
+	 * CPU package temperature in °C. **0 means unknown** (no readable sensor
+	 * on this platform / helper command absent) — the chart layer gates the
+	 * temperature curve on history actually containing a >0 reading, so a
+	 * platform without a source degrades to the old single-curve CPU block
+	 * instead of drawing a misleading line glued to 0°C.
+	 */
+	cpuTemp: number;
 	memUsed: number;
 	memTotal: number;
 	memPct: number;
@@ -190,6 +198,112 @@ function readDisk(): { read: number; write: number } {
 		/* non-Linux: return zeros */
 	}
 	return { read, write };
+}
+
+/** Read one integer-ish text file, or null. Small helper for /sys probing. */
+function readTextFile(path: string): string | null {
+	try {
+		return readFileSync(path, "utf8").trim();
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Linux CPU temperature, in °C, **without a hardcoded zone name**.
+ *
+ * `/sys/class/thermal` zone names vary wildly per vendor
+ * ("x86_pkg_temp", "soc_thermal", "cpu-thermal"…), so the lookup goes through
+ * the **label side** (hwmon `temp*_label` + `temp*_input`) with a preference
+ * list, and falls back to plain thermal_zone files for kernels without hwmon.
+ * Only CPU-ish labels match — "GPU", "battery", "ambient" sensors are skipped.
+ */
+const CPU_TEMP_LABEL_RE =
+	/(?:^|[_ -])(?:cpu|package|pkg|soc|core|tdie|tctl)(?:[_ -]|$)/i;
+
+function readCpuTempLinux(): number {
+	// 1) hwmon: prefer a sensor whose label names the CPU. Matches both
+	//    `coretemp` (label "Package id 0" / "Core 0") and ARM SoCs
+	//    (`k10temp` / `scpi_sensors`: label "Tdie" / "SoC temperature").
+	try {
+		const classes = ["hwmon", "thermal"];
+		for (const cls of classes) {
+			for (const d of readdirSync(`/sys/class/${cls}`)) {
+				const base = `/sys/class/${cls}/${d}`;
+				if (cls === "hwmon") {
+					// temp0 doesn't exist; temp1..tempN
+					for (let i = 1; i <= 12; i++) {
+						const label = readTextFile(`${base}/temp${i}_label`);
+						if (label && CPU_TEMP_LABEL_RE.test(label)) {
+							const raw = readTextFile(`${base}/temp${i}_input`);
+							const c = Number(raw);
+							if (Number.isFinite(c) && c > 0 && c < 150) return c / 1000;
+						}
+					}
+				}
+			}
+		}
+	} catch {
+		/* /sys unreadable: fall through */
+	}
+	// 2) thermal_zone fallback: type must look CPU-ish too, so an
+	//    acpitz/ambient zone can't feed a bogus 25°C into the chart.
+	try {
+		for (const d of readdirSync("/sys/class/thermal")) {
+			if (!d.startsWith("thermal_zone")) continue;
+			const type = readTextFile(`/sys/class/thermal/${d}/type`);
+			if (type && CPU_TEMP_LABEL_RE.test(type)) {
+				const raw = readTextFile(`/sys/class/thermal/${d}/temp`);
+				const c = Number(raw);
+				if (Number.isFinite(c) && c > 0 && c < 150) return c / 1000;
+			}
+		}
+	} catch {
+		/* non-Linux: fall through */
+	}
+	return 0;
+}
+
+/**
+ * Parse a temperature-reading line from a macOS helper command (`osx-cpu-temp`
+ * prints e.g. `61.5°C`, `istats cpu temperature` prints
+ * `CPU temperature: 61.50°C`). Pure, exported for offline testing.
+ *
+ * Returns 0 when no plausible number is found — "unknown", never garbage.
+ */
+export function parseCpuTempText(text: string): number {
+	// Take the first number; both helpers print the °C reading first (any
+	// trailing numbers are other sensors / counts).
+	const m = /(-?\d+(?:\.\d+)?)/.exec(text);
+	if (!m) return 0;
+	const c = Number(m[1]);
+	// Sanity window: a "CPU temperature" outside 0..150°C is a parse error,
+	// never a real reading (helper printing some other unit etc.).
+	return Number.isFinite(c) && c > 0 && c < 150 ? c : 0;
+}
+
+/**
+ * macOS CPU temperature.
+ *
+ * **Why a helper-command probe instead of a system API**: macOS exposes no
+ * unprivileged CPU-temperature API — the SMC keys need direct SMC access, and
+ * `powermetrics` (the only system tool that reads them) refuses to run without
+ * sudo. On this repo's dev machine none of these are available, so the only
+ * honest unprivileged route is a user-installed helper (`osx-cpu-temp`,
+ * `istats`). If none is installed this returns 0 and the chart degrades to
+ * the old single-curve CPU block — declared behaviour, not a bug.
+ */
+function readCpuTempDarwin(): number {
+	for (const [file, args] of [
+		["osx-cpu-temp", []],
+		["istats", ["cpu", "temperature"]],
+	] as const) {
+		const out = execText(file, [...args]);
+		if (out === null) continue;
+		const c = parseCpuTempText(out);
+		if (c > 0) return c;
+	}
+	return 0;
 }
 
 export interface Collector {
@@ -506,6 +620,7 @@ export function createCollector(): Collector {
 		const writeBps = Math.max(0, (disk.write - lastDisk.write) / dt);
 
 		const { used, total } = readMem();
+		const cpuTemp = IS_DARWIN ? readCpuTempDarwin() : readCpuTempLinux();
 
 		lastCpu = cpu;
 		lastNet = net;
@@ -516,6 +631,7 @@ export function createCollector(): Collector {
 
 		return {
 			cpuPct,
+			cpuTemp,
 			memUsed: used,
 			memTotal: total,
 			memPct: total > 0 ? (100 * used) / total : 0,

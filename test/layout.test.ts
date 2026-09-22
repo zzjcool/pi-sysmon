@@ -113,8 +113,9 @@ function fakeHist(n: number): History {
 		tps: wave(50, 30, 9),
 		// Non-flat and in the real 0..100 range: a flat series would make "is the
 		// second curve wired to sessHit?" indistinguishable from "is it drawing a
-		// constant?", and drifting out of range would silently invalidate the
-		// "shares the token axis (0..100, no independent normalization)" contract.
+		// constant?". The values stay **raw percentages** here (out of range would
+		// silently invalidate the source data), while `buildBlocks` is the layer
+		// that pre-maps them onto the TPS axis for rendering.
 		sessHit: wave(85, 8, 13),
 	};
 }
@@ -1302,25 +1303,95 @@ test("buildBlocks: Tokens plots the cumulative hit rate as a second (warning) cu
 		"series[0] must carry no color so it inherits the block accent",
 	);
 	assert.equal(tok.series[1]?.color, "warning", "series[1] is the yellow hit-rate line");
+	// The values are **not** the raw percentages: `buildBlocks` pre-maps them onto
+	// the TPS axis (`hit% / 100 × axis top`) and marks the series
+	// `excludeFromScale`, so that a 3000 t/s spike can't squash a 90% hit rate to
+	// a 2%-tall line glued to the floor. Derive the expected top through
+	// `tokenAxis` itself (same rule as `renderBlock`'s dataMax: finite and > 0).
+	const hitTail = h.sessHit.slice(-30);
+	const tpsTail = h.tps.slice(-30);
+	let tpsTailMax = 0;
+	for (const v of tpsTail) if (Number.isFinite(v) && v > tpsTailMax) tpsTailMax = v;
+	const scaleTop = tokenAxis(tpsTailMax).max;
+	assert.equal(
+		tok.series[1]?.excludeFromScale,
+		true,
+		"the yellow line must be excluded from the y-scale and overflow detection",
+	);
 	assert.deepEqual(
 		tok.series[1]?.values,
-		h.sessHit.slice(-30),
-		"series[1] must read hist.sessHit (not a recomputed cumulative scalar)",
+		hitTail.map((x) => (scaleTop * x) / 100),
+		"series[1] must be sessHit pre-mapped onto the TPS axis (0-100% share the plot height)",
+	);
+	assert.equal(
+		tok.series[1]?.values.length,
+		hitTail.length,
+		"pre-mapping must not drop or add points",
 	);
 });
 
-test("buildBlocks: a sustained-low-TPS session squashes the TPS curve against the yellow line's 100 (pins the shared-axis extreme)", () => {
-	// The documented reverse of "high TPS ⇒ yellow hugs the floor": with an
-	// **idle session** the cumulative hit rate can legitimately be 100% while TPS
-	// is ~5, so the yellow line's raw 100 is the largest value on the shared axis
-	// and pins the top at 100×1.5 = 150t/s. TPS then renders as a flat line near
-	// the floor. The axis isn't lying (its top really is 150t/s), but its unit
-	// says nothing about the percentage curve — a known limitation, accepted for
-	// the single-gutter/single-scale simplicity.
-	//
-	// This is a **pin, not a wish**: if `tokenAxis` (or the "no independent
-	// normalization" decision) ever changes, the numbers below move and this test
-	// makes the regression loud instead of silent.
+test("buildBlocks: a 90% hit rate renders in the upper half even with a 3000 t/s spike (no shared-axis squash)", () => {
+	// The bug this pins: with a **shared** token axis a 3000 t/s peak pushes the
+	// top to 4500 t/s, so a 90% hit rate lands at 90/4500 ≈ 2% of the axis height
+	// — i.e. the yellow line sits on the floor exactly while the model is
+	// streaming, which is precisely when the user is looking at the chart.
+	// After the fix the yellow line's height is its own percentage (`90% × plot
+	// height`), regardless of how tall the TPS axis is.
+	const n = 50;
+	const hist: History = {
+		cpu: new Array(n).fill(20),
+		mem: new Array(n).fill(50),
+		netRx: new Array(n).fill(1000),
+		netTx: new Array(n).fill(1000),
+		diskR: new Array(n).fill(1000),
+		diskW: new Array(n).fill(1000),
+		// Mostly idle, with one big response in the window (3000 t/s peak)
+		tps: Array.from({ length: n }, (_, i) => (i === n - 5 ? 3000 : 20)),
+		sessHit: new Array(n).fill(90),
+	};
+	const tok = buildBlocks(hist, fakeSnap(), {
+		points: 30,
+		tpsNow: 3000,
+		tokensIn: 5671,
+		tokensOut: 11,
+		tokensCacheRead: 640,
+	}).find((b) => b.name === "Tokens");
+	assert.ok(tok);
+	const plotRows = 6;
+	const W = 96;
+	const lines = renderPanel(
+		ansiTheme,
+		[tok],
+		W,
+		{ cols: 1, bands: 1, widths: [W], plotRows, totalRows: plotRows + 4 },
+		60,
+	);
+	// Plot rows come after the title row (`renderBlock` emits head first).
+	const plotLines = lines.slice(1, 1 + plotRows);
+	assert.equal(plotLines.length, plotRows, "the plot area must have the requested rows");
+	const WARN = "\x1b[33m";
+	const yellowRows = plotLines
+		.map((l, i) => (l.includes(WARN) ? i : -1))
+		.filter((i) => i >= 0);
+	assert.ok(
+		yellowRows.length > 0,
+		`the yellow hit-rate line must be drawn somewhere:\n${lines.join("\n")}`,
+	);
+	const topYellow = Math.min(...yellowRows);
+	assert.ok(
+		topYellow < plotRows / 2,
+		`a 90% hit rate must render in the upper half (row ${topYellow} of ${plotRows}, half=${plotRows / 2}):\n${lines.join("\n")}`,
+	);
+});
+
+test("buildBlocks: a low-TPS session no longer has its token axis pinned by the percentage curve", () => {
+	// This **replaces the old pin** (`sessHit=100 + tps=5 ⇒ axis top 150t/s`,
+	// where the raw percentage was fed into the shared scale and squashed the TPS
+	// curve against the floor). Now the yellow series is `excludeFromScale` and
+	// pre-mapped, so `renderBlock`'s dataMax only ever sees TPS: the axis top is
+	// `tokenAxis(5).max = MIN_TPS_SCALE = 10`, and the 100% hit rate maps to
+	// `10 × 100/100 = 10` — i.e. it touches the top of the (short) axis, which is
+	// the correct semantic for a 100% reading.
 	const n = 50;
 	const flat = (v: number) => new Array(n).fill(v);
 	const hist: History = {
@@ -1342,21 +1413,27 @@ test("buildBlocks: a sustained-low-TPS session squashes the TPS curve against th
 		hitNow: 88,
 	}).find((b) => b.name === "Tokens");
 	assert.ok(tok);
-	// The extreme value on the axis is the yellow line's 100 (the TPS values are 5).
-	// `renderBlock` feeds `axis()` the max over every series, so derive it the same
-	// way instead of hardcoding the 100.
+	// `renderBlock` computes dataMax over the non-excluded series only; derive it
+	// the same way instead of hardcoding 5.
 	let dataMax = 0;
-	for (const s of tok.series)
+	for (const s of tok.series) {
+		if (s.excludeFromScale) continue;
 		for (const v of s.values) if (Number.isFinite(v) && v > dataMax) dataMax = v;
-	assert.equal(dataMax, 100, "the yellow line's raw percentage is the series max");
+	}
+	assert.equal(dataMax, 5, "the yellow line's percentages must not feed the scale");
 	assert.equal(
 		tok.axis(dataMax, 4).max,
-		150,
-		"100×1.5 — the yellow line's raw percentage pins the shared token axis",
+		MIN_TPS_SCALE,
+		"a 5 t/s session floors the axis at 10t/s — it is no longer stretched to 150 by the hit rate",
 	);
-	// With TPS alone (5×1.5 = 7.5 < the floor) the axis would be much shorter:
-	// this is exactly the squatting behaviour being pinned.
-	assert.ok(tok.axis(5, 4).max < tok.axis(dataMax, 4).max);
+	// The pre-mapped 100% value: exactly the axis top (touching the ceiling).
+	// The window is `points=30`, so the tail slice is 30 points long.
+	assert.deepEqual(
+		tok.series[1]?.values,
+		flat(MIN_TPS_SCALE).slice(-30),
+		"100% maps to 10 × 100/100 = 10 (the axis top), not to a raw 100",
+	);
+	assert.equal(tok.series[1]?.excludeFromScale, true);
 	// …and it must render without blowing up: every line exactly the tested width.
 	const W = 96;
 	const lines = renderPanel(plainTheme, [tok], W, computeLayout(W, 6, 4, 18), 60);

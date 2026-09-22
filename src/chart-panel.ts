@@ -77,6 +77,19 @@ export interface BlockSeries {
 	/** Cells owned exclusively by this curve use this color; defaults to the
 	 *  block's main color. When multiple curves share a cell, the earlier series wins */
 	color?: ThemeColor;
+	/**
+	 * When true this series is excluded from the y-scale computation (dataMax
+	 * sampling) and from overflow detection — its values are expected to be
+	 * pre-mapped to the axis by the caller (e.g. a secondary 0-100% series
+	 * mapped onto the primary axis' scale).
+	 *
+	 * Known transient: the caller computes the mapping against the scale it saw
+	 * at build time; if a later frame's scale (from the *included* series only)
+	 * shrinks, the pre-mapped values can momentarily exceed `axisMax` and the
+	 * braille renderer clamps them to the top row. That is the existing safe
+	 * behaviour, so it is documented rather than special-cased here.
+	 */
+	excludeFromScale?: boolean;
 }
 
 /** Y-axis spec: labels (**index 0 at the bottom**, same as ratatui) + scale upper bound */
@@ -726,6 +739,10 @@ export function renderBlock(
 			: Number.POSITIVE_INFINITY;
 	const rolloff = scalePts !== Number.POSITIVE_INFINITY;
 	for (const s of block.series) {
+		// Pre-mapped series (e.g. a percentage drawn on the primary axis) must not
+		// feed the scale: their values are in the axis' unit only by courtesy of
+		// the caller's mapping, so sampling them would let them stretch the axis.
+		if (s.excludeFromScale) continue;
 		const n = s.values.length;
 		const span = Math.max(1, scalePts);
 		const from = Math.max(0, n - span);
@@ -782,6 +799,9 @@ export function renderBlock(
 	// hundred KB" while a spike clearly reaches the top of the screen: the scale would be lying.
 	let overflow = false;
 	for (const s of block.series) {
+		// Same reason as the scale sampling: an excluded series knows it is drawn
+		// in axis units, so it must never trip the `+` overflow marker.
+		if (s.excludeFromScale) continue;
 		for (const v of s.values) {
 			if (Number.isFinite(v) && v > axisMax) {
 				overflow = true;

@@ -111,6 +111,11 @@ function fakeHist(n: number): History {
 		diskR: wave(1_000, 900, 4),
 		diskW: wave(2_000, 1_500, 6),
 		tps: wave(50, 30, 9),
+		// Non-flat and in the real 0..100 range: a flat series would make "is the
+		// second curve wired to sessHit?" indistinguishable from "is it drawing a
+		// constant?", and drifting out of range would silently invalidate the
+		// "shares the token axis (0..100, no independent normalization)" contract.
+		sessHit: wave(85, 8, 13),
 	};
 }
 
@@ -343,8 +348,19 @@ test("sweep: at any width, every line's visible width <= terminal width (overflo
 		{ showTokens: false, showDisks: true },
 	] as const;
 	// Non-zero readings: `fmtTps(0)="0 tok/s"` takes the short branch and
-	// wouldn't catch long-reading overflow
-	const readings = { tpsNow: 12345, tpsTotal: 1234567 };
+	// wouldn't catch long-reading overflow.
+	// The token counters and `hitNow` are non-zero too, so every sweep iteration
+	// exercises the Tokens block's **second (hit-rate) curve** and all six title
+	// segments — otherwise the new content would never be width-checked, and the
+	// one thing this sweep exists for (overflow makes pi exit) would go
+	// unverified for exactly the newly added pixels.
+	const readings = {
+		tpsNow: 12345,
+		tokensIn: 1234567,
+		tokensOut: 987654,
+		tokensCacheRead: 543210,
+		hitNow: 88,
+	};
 	for (let w = 8; w <= 220; w++) {
 		for (const chartH of [1, 3, 4, 6]) {
 			for (const opts of variants) {
@@ -1135,18 +1151,24 @@ test("buildBlocks: Tokens block is wired correctly (both up/down shown, same acc
 });
 
 test("buildBlocks: Tokens cumulative readings degrade segment by segment with width (narrow blocks drop cache reads first)", () => {
-	// Order of descending importance: rate → upload → download → cache reads.
-	// Verify degradation really happens in this order, not "all or nothing".
+	// Order of descending importance: rate → hit rates → upload → download →
+	// cache reads. Verify degradation really happens in this order, not
+	// "all or nothing".
 	//
-	// The thresholds are **measured** (4 charts in 4×1, block width = column
-	// width - 0):
-	//   24–27 cols  rate only
-	//   28–31 cols  + rate+upload
-	//   32–36 cols  then +download
-	//   37+ cols    all four
-	// (With 4 charts at 96 cols each block is exactly 24 cols, so at the narrow
-	//  end you really only see the rate — that's an intentional priority, not a
-	//  bug.)
+	// The thresholds are **measured against a single Tokens block**, i.e. in
+	// block columns, so they don't move when the terminal layout's column split
+	// changes (they used to be expressed in terminal widths, which silently
+	// coupled them to `chooseColumns`):
+	//   21–25 cols  rate only
+	//   26–32 cols  + ⌀ cumulative hit rate
+	//   33–36 cols  + ↑ upload
+	//   37–41 cols  + ↓ download
+	//   42+ cols    + R cache reads
+	// (At 96 terminal columns the 4-up layout gives each block exactly 24 cols,
+	// so the narrow end really only shows the rate — that is an intentional
+	// priority, not a bug.)
+	// The `·` instantaneous segment is **not** part of this chain: it sits before
+	// `⌀` and only exists when a `hitNow` is supplied, so it has its own test.
 	const h = fakeHist(50);
 	const mkReading = () =>
 		buildBlocks(h, fakeSnap(), {
@@ -1158,42 +1180,246 @@ test("buildBlocks: Tokens cumulative readings degrade segment by segment with wi
 		});
 	const tok = mkReading().find((b) => b.name === "Tokens");
 	const all = (tok?.titleInfo ?? []).map((s) => s.text).join("");
-	// All four segments present when width isn't limited
+	// All five segments present when width isn't limited
 	assert.ok(
 		all.includes("\u2191") && all.includes("\u2193") && all.includes("R"),
 		all,
 	);
 
-	const shown = (w: number): string => {
-		const blocks = mkReading();
+	/** Render just the Tokens block at an explicit **block** width and return its title bar */
+	const shown = (blockW: number): string => {
 		const lines = renderPanel(
 			plainTheme,
-			blocks,
-			w,
-			computeLayout(w, 6, 4, 18),
+			mkReading().filter((b) => b.name === "Tokens"),
+			blockW,
+			{ cols: 1, bands: 1, widths: [blockW], plotRows: 4, totalRows: 8 },
 			60,
 		);
-		const head = lines[0] ?? "";
-		const i = head.lastIndexOf("Tokens");
-		return head.slice(
-			head.lastIndexOf("\u250c", i),
-			head.indexOf("\u2510", i) + 1,
-		);
+		return (lines[0] ?? "").trimEnd();
 	};
-	// Block width 24 (minimum with 4 charts) → keep the rate (the most important one)
-	const narrow = shown(96);
-	assert.ok(narrow.includes("t/s"), `at the narrowest at least the rate survives: ${narrow}`);
-	assert.ok(!narrow.includes("\u2191"), `at the narrowest, upload rightly yields its place: ${narrow}`);
-	// Block width 28 – 31 → upload appears
-	assert.ok(shown(112).includes("\u2191"), shown(112));
+	// Block width 21 (tighter than the 24-col minimum of a 4-up layout) → rate only
+	assert.ok(shown(21).includes("t/s"), `even at the narrowest the rate survives: ${shown(21)}`);
 	assert.ok(
-		!shown(112).includes("\u2193"),
-		`block width 28 shouldn't have download yet: ${shown(112)}`,
+		!shown(25).includes("\u2300"),
+		`block width 25 is one column short of ⌀: ${shown(25)}`,
 	);
-	// Block width 32+ → download appears
-	assert.ok(shown(128).includes("\u2193"), shown(128));
-	// Block width 37+ → cache reads appear
-	assert.ok(shown(150).includes("R640"), shown(150));
+	assert.ok(
+		!shown(25).includes("\u2191"),
+		`at the narrowest, upload rightly yields its place: ${shown(25)}`,
+	);
+	// Block width 26 → cumulative hit rate appears
+	assert.ok(shown(26).includes("\u2300"), `⌀ should appear at block width 26: ${shown(26)}`);
+	// Block width 33 → upload appears
+	assert.ok(
+		!shown(32).includes("\u2191"),
+		`block width 32 shouldn't have upload yet: ${shown(32)}`,
+	);
+	assert.ok(shown(33).includes("\u2191"), shown(33));
+	assert.ok(
+		!shown(33).includes("\u2193"),
+		`block width 33 shouldn't have download yet: ${shown(33)}`,
+	);
+	// Block width 37 → download appears
+	assert.ok(shown(37).includes("\u2193"), shown(37));
+	// Block width 42 → cache reads appear
+	assert.ok(
+		!shown(41).includes("R640"),
+		`block width 41 shouldn't have cache reads yet: ${shown(41)}`,
+	);
+	assert.ok(shown(42).includes("R640"), shown(42));
+});
+
+test("buildBlocks: Tokens instantaneous `·` segment outranks the cumulative `⌀` one (⌀ yields first)", () => {
+	// `·N%` (this turn) outranks `⌀N%` (session average) — it is the actionable
+	// number, and it sits directly after the rate. Since whole segments are
+	// dropped from the tail, that ordering means ⌀ disappears **while · still
+	// fits**. Measured on a single Tokens block:
+	//   21–25 cols  rate only
+	//   26–30 cols  + · (the instantaneous rate)
+	//   31+ cols    + ⌀ (the cumulative average)
+	const mk = () =>
+		buildBlocks(fakeHist(50), fakeSnap(), {
+			points: 30,
+			tpsNow: 250,
+			tokensIn: 5671,
+			tokensOut: 11,
+			tokensCacheRead: 640,
+			hitNow: 88,
+		});
+	const shown = (blockW: number): string => {
+		const lines = renderPanel(
+			plainTheme,
+			mk().filter((b) => b.name === "Tokens"),
+			blockW,
+			{ cols: 1, bands: 1, widths: [blockW], plotRows: 4, totalRows: 8 },
+			60,
+		);
+		return (lines[0] ?? "").trimEnd();
+	};
+	assert.ok(
+		!shown(25).includes("\u00b7"),
+		`block width 25 shouldn't have the instantaneous reading yet: ${shown(25)}`,
+	);
+	const medium = shown(26);
+	assert.ok(medium.includes("\u00b7"), `· should appear at block width 26: ${medium}`);
+	assert.ok(
+		!medium.includes("\u2300"),
+		`⌀ must yield first, it isn't due yet at block width 26: ${medium}`,
+	);
+	const wide = shown(31);
+	assert.ok(wide.includes("\u2300"), `⌀ should appear at block width 31: ${wide}`);
+	assert.ok(
+		wide.indexOf("\u00b7") < wide.indexOf("\u2300"),
+		`· must precede ⌀ in the title bar: ${wide}`,
+	);
+});
+
+test("buildBlocks: Tokens plots the cumulative hit rate as a second (warning) curve, TPS staying series[0]", () => {
+	// Two curves share the token chart once the provider has reported cache
+	// reads. The index order is **load-bearing**, not cosmetic:
+	// `renderChartGlyphs` resolves a same-cell collision in favour of the lowest
+	// index, so TPS must be series[0] or the yellow line would steal the rate
+	// curve's cells (and its colour) wherever the two overlap.
+	const h = fakeHist(50);
+	const tok = buildBlocks(h, fakeSnap(), {
+		points: 30,
+		tpsNow: 250,
+		tokensIn: 5671,
+		tokensOut: 11,
+		tokensCacheRead: 640,
+		hitNow: 88,
+	}).find((b) => b.name === "Tokens");
+	assert.ok(tok);
+	assert.equal(tok.series.length, 2, "with cache reads there are two curves");
+	assert.deepEqual(
+		tok.series[0]?.values,
+		h.tps.slice(-30),
+		"series[0] must be TPS (lowest index wins same-cell collisions)",
+	);
+	assert.equal(
+		tok.series[0]?.color,
+		undefined,
+		"series[0] must carry no color so it inherits the block accent",
+	);
+	assert.equal(tok.series[1]?.color, "warning", "series[1] is the yellow hit-rate line");
+	assert.deepEqual(
+		tok.series[1]?.values,
+		h.sessHit.slice(-30),
+		"series[1] must read hist.sessHit (not a recomputed cumulative scalar)",
+	);
+});
+
+test("buildBlocks: a sustained-low-TPS session squashes the TPS curve against the yellow line's 100 (pins the shared-axis extreme)", () => {
+	// The documented reverse of "high TPS ⇒ yellow hugs the floor": with an
+	// **idle session** the cumulative hit rate can legitimately be 100% while TPS
+	// is ~5, so the yellow line's raw 100 is the largest value on the shared axis
+	// and pins the top at 100×1.5 = 150t/s. TPS then renders as a flat line near
+	// the floor. The axis isn't lying (its top really is 150t/s), but its unit
+	// says nothing about the percentage curve — a known limitation, accepted for
+	// the single-gutter/single-scale simplicity.
+	//
+	// This is a **pin, not a wish**: if `tokenAxis` (or the "no independent
+	// normalization" decision) ever changes, the numbers below move and this test
+	// makes the regression loud instead of silent.
+	const n = 50;
+	const flat = (v: number) => new Array(n).fill(v);
+	const hist: History = {
+		cpu: flat(20),
+		mem: flat(50),
+		netRx: flat(1000),
+		netTx: flat(1000),
+		diskR: flat(1000),
+		diskW: flat(1000),
+		tps: flat(5),
+		sessHit: flat(100),
+	};
+	const tok = buildBlocks(hist, fakeSnap(), {
+		points: 30,
+		tpsNow: 5,
+		tokensIn: 5671,
+		tokensOut: 11,
+		tokensCacheRead: 640, // seenCache gate on, so the yellow line exists
+		hitNow: 88,
+	}).find((b) => b.name === "Tokens");
+	assert.ok(tok);
+	// The extreme value on the axis is the yellow line's 100 (the TPS values are 5).
+	// `renderBlock` feeds `axis()` the max over every series, so derive it the same
+	// way instead of hardcoding the 100.
+	let dataMax = 0;
+	for (const s of tok.series)
+		for (const v of s.values) if (Number.isFinite(v) && v > dataMax) dataMax = v;
+	assert.equal(dataMax, 100, "the yellow line's raw percentage is the series max");
+	assert.equal(
+		tok.axis(dataMax, 4).max,
+		150,
+		"100×1.5 — the yellow line's raw percentage pins the shared token axis",
+	);
+	// With TPS alone (5×1.5 = 7.5 < the floor) the axis would be much shorter:
+	// this is exactly the squatting behaviour being pinned.
+	assert.ok(tok.axis(5, 4).max < tok.axis(dataMax, 4).max);
+	// …and it must render without blowing up: every line exactly the tested width.
+	const W = 96;
+	const lines = renderPanel(plainTheme, [tok], W, computeLayout(W, 6, 4, 18), 60);
+	assert.ok(lines.length > 0, "the Tokens block must render");
+	for (const line of lines)
+		assert.equal(visibleWidth(line), W, `line wider than ${W}: ${JSON.stringify(line)}`);
+});
+
+test("buildBlocks: without cache reads the Tokens block stays single-curve and has no ·/⌀ segments", () => {
+	// This is the pre-existing behaviour for a session that never touches the
+	// prompt cache: no second curve, no hit-rate readouts. `tokR === 0` is the
+	// single gate for all three (`seenCache`), so this test pins the whole
+	// degradation path.
+	const h = fakeHist(50);
+	const tok = buildBlocks(h, fakeSnap(), {
+		points: 30,
+		tpsNow: 250,
+		tokensIn: 5671,
+		tokensOut: 11,
+		tokensCacheRead: 0,
+		hitNow: 88, // even a supplied reading must not leak through
+	}).find((b) => b.name === "Tokens");
+	assert.ok(tok);
+	assert.equal(tok.series.length, 1, "no cache reads ⇒ single curve");
+	const title = (tok.titleInfo ?? []).map((s) => s.text).join("");
+	assert.ok(!title.includes("\u00b7"), `no · segment without cache reads: ${title}`);
+	assert.ok(!title.includes("\u2300"), `no ⌀ segment without cache reads: ${title}`);
+	assert.ok(!title.includes("R"), `no R readout without cache reads: ${title}`);
+	// The other readings survive untouched
+	assert.ok(title.includes("~250t/s") && title.includes("\u2191") && title.includes("\u2193"), title);
+});
+
+test("buildBlocks: Tokens title segments are ordered rate → · → ⌀ → ↑ → ↓ → R", () => {
+	// Segment order **is** the degradation policy (the title bar accumulates
+	// segment by segment and drops the tail), so the order must be asserted
+	// directly, not inferred from the narrow-width cases.
+	const tok = buildBlocks(fakeHist(50), fakeSnap(), {
+		points: 30,
+		tpsNow: 250,
+		tokensIn: 5671,
+		tokensOut: 11,
+		tokensCacheRead: 640,
+		hitNow: 88,
+	}).find((b) => b.name === "Tokens");
+	const segs = tok?.titleInfo ?? [];
+	const texts = segs.map((s) => s.text);
+	// Exact sequence (the leading spaces belong to the segment they precede)
+	assert.deepEqual(texts, [
+		"~250t/s",
+		" \u00b788%",
+		" \u230010%",
+		"  \u21915.7k",
+		" \u219311",
+		" R640",
+	]);
+	// …and with the colors that let the two modes be cross-checked
+	assert.deepEqual(
+		segs.map((s) => s.color),
+		["accent", "success", "warning", "muted", "muted", "muted"],
+	);
+	// The cumulative rate is recomputed from the running totals: 640 / (640+5671)
+	const cum = (640 / (640 + 5671)) * 100; // ≈10.14 → 10%
+	assert.equal(texts[2], ` \u2300${Math.round(cum)}%`);
 });
 
 test("Tokens readings stay visible at minimum block width (regression)", () => {
@@ -1301,6 +1527,10 @@ test("auto range: with an explicit sub-window, a fallen spike is marked `+` (reg
 	const SPIKE = 10 * 1024 * 1024;
 	// age=25: the spike happened 25s ago, **still inside the 60s window**, but
 	// already outside the 10s scale window
+	// `sessHit: []` on purpose: these Network-focused fixtures carry no cache
+	// history, so `buildBlocks` sees `tokR === 0` and the Tokens block stays
+	// single-curve (exactly the shape the real session has before it has read
+	// anything from the prompt cache).
 	const mk = (age: number): History => {
 		const h: History = {
 			cpu: [],
@@ -1310,6 +1540,7 @@ test("auto range: with an explicit sub-window, a fallen spike is marked `+` (reg
 			diskR: [],
 			diskW: [],
 			tps: [],
+			sessHit: [],
 		};
 		for (let i = 0; i < POINTS; i++) {
 			const a = POINTS - 1 - i;
@@ -1517,6 +1748,7 @@ test("auto range: by default (scale window == display window) the top tick never
 				diskR: [],
 				diskW: [],
 				tps: [],
+				sessHit: [],
 			};
 			for (let i = 0; i < POINTS; i++) {
 				const a = POINTS - 1 - i;
@@ -1625,6 +1857,7 @@ test("auto range: recovery time is fixed, independent of how long it's been runn
 			diskR: [],
 			diskW: [],
 			tps: [],
+			sessHit: [],
 		};
 		const push = (v: number) => {
 			hist.netRx.push(v);
@@ -1736,6 +1969,7 @@ test("auto range: fall-back is smooth, no single-frame whole-chart jumps (regres
 		diskR: [],
 		diskW: [],
 		tps: [],
+		sessHit: [],
 	};
 	const push = (v: number) => {
 		hist.netRx.push(v);
@@ -1904,6 +2138,7 @@ test("plainLineSegs: includes token readouts (rate + session cumulative), same c
 			tokensIn: 5671,
 			tokensOut: 89,
 			tokensCacheRead: 2700,
+			hitNow: 88,
 		},
 		200,
 	);
@@ -1917,6 +2152,86 @@ test("plainLineSegs: includes token readouts (rate + session cumulative), same c
 	assert.match(text, /↑5\.7k/); // same convention as pi footer's formatTokens (lowercase k)
 	assert.match(text, /↓89/);
 	assert.match(text, /R2\.7k/);
+	// Cache hit rates: `·` instantaneous then `⌀` cumulative — same characters,
+	// same order, same colors as the Tokens chart's title bar, so the two modes
+	// can be cross-checked.
+	assert.match(text, /·88%/);
+	// cumulative = 2700 / (2700 + 5671) = 32.2% → 32%
+	assert.match(text, /⌀32%/);
+	assert.ok(
+		text.indexOf("·") < text.indexOf("⌀"),
+		`· must precede ⌀: ${text}`,
+	);
+	// Colors match the chart title bar, so the two modes are cross-checkable
+	// (and `⌀` carries the same warning color as the curve it describes).
+	const colorOf = (needle: string): string | undefined =>
+		segs.find((s) => s.text.includes(needle))?.color;
+	assert.equal(colorOf("~"), "accent");
+	assert.equal(colorOf("·"), "success");
+	assert.equal(colorOf("⌀"), "warning");
+});
+
+test("plainLineSegs: TOK group sits before NET, and NET is the group dropped first", () => {
+	// Group order is CPU → MEM → TOK → NET. Whole groups are dropped from the
+	// tail, so this single ordering decides which of the two survives a narrow
+	// terminal: the token readout is far less recoverable from anywhere else on
+	// screen than the network rate.
+	const opts = {
+		snap: fakeSnap(),
+		tpsNow: 12345,
+		tokensIn: 1234567,
+		tokensOut: 987654,
+		tokensCacheRead: 543210,
+		hitNow: 88,
+	};
+	// 80 columns: TOK is in, NET is out (measured: NET only appears at 84+)
+	const w80 = segsText(plainLineSegs(opts, 80));
+	assert.match(w80, /TOK /, `TOK must survive at 80 cols: ${w80}`);
+	assert.doesNotMatch(w80, /NET /, `NET should already be dropped at 80 cols: ${w80}`);
+	// Wide enough for both: TOK comes first
+	const wide = segsText(plainLineSegs(opts, 200));
+	assert.ok(
+		wide.indexOf("TOK ") < wide.indexOf("NET "),
+		`TOK must precede NET: ${wide}`,
+	);
+	// Sweep: NET may never appear while TOK is absent (that would mean the
+	// priority is reversed), and there must exist a width where exactly that
+	// drop happened (otherwise the ordering would be nominal).
+	let tokAlone = false;
+	for (let w = 1; w <= 200; w++) {
+		const text = segsText(plainLineSegs(opts, w));
+		if (text.includes("TOK ")) {
+			if (!text.includes("NET ")) tokAlone = true;
+		} else {
+			assert.ok(
+				!text.includes("NET "),
+				`w=${w}: NET survived although TOK was dropped —— ${JSON.stringify(text)}`,
+			);
+		}
+	}
+	assert.ok(tokAlone, "there must be a width where NET is gone but TOK stays");
+});
+
+test("plainLineSegs: without cache reads there is no ·/⌀ on the line either", () => {
+	// Same `seenCache` gate as the chart: both modes must agree, otherwise the
+	// line would show a hit rate the chart doesn't draw.
+	const text = segsText(
+		plainLineSegs(
+			{
+				snap: fakeSnap(),
+				tpsNow: 1234,
+				tokensIn: 5671,
+				tokensOut: 89,
+				tokensCacheRead: 0,
+				hitNow: 88,
+			},
+			200,
+		),
+	);
+	assert.match(text, /TOK/);
+	assert.doesNotMatch(text, /·/, `no instantaneous hit rate without cache reads: ${text}`);
+	assert.doesNotMatch(text, /⌀/, `no cumulative hit rate without cache reads: ${text}`);
+	assert.doesNotMatch(text, /R\d/, `no cache-read total without cache reads: ${text}`);
 });
 
 test("plainLineSegs: still emits the token line without a snapshot (the only meaningful metric on non-Linux)", () => {
@@ -1938,6 +2253,9 @@ test("sweep: line mode renders at exactly the declared width at any width (overf
 					tokensIn: 1234567,
 					tokensOut: 987654,
 					tokensCacheRead: 543210,
+					// `hitNow` too, so the `·N%` segment is actually rendered and
+					// width-swept in line mode (it's the one segment gated on it).
+					hitNow: 88,
 				},
 				w,
 			);
@@ -2024,8 +2342,11 @@ test("plainLineSegs: drops whole segments only when short on width; the result i
 		tokensCacheRead: 543210,
 	};
 	const full = segsText(plainLineSegs(opts, 500));
-	// First find the boundaries of the four segments: each segment's starting text
-	const marks = ["CPU ", "MEM ", "NET ", "TOK "];
+	// Group order by descending importance: CPU → MEM → TOK → NET.
+	// TOK sits **before** NET (a deliberate change): the token readout is much
+	// less recoverable from anywhere else on screen than the network rate, and
+	// whole groups are dropped from the tail.
+	const marks = ["CPU ", "MEM ", "TOK ", "NET "];
 	// For every width: the result must be a prefix of full (after trimming trailing
 	// spaces) and must end on a "segment boundary"
 	for (let w = 1; w <= 120; w++) {
@@ -2041,16 +2362,29 @@ test("plainLineSegs: drops whole segments only when short on width; the result i
 			`w=${w}: ends in a half number —— ${JSON.stringify(text)}`,
 		);
 	}
-	// Critical point: when the TOK segment fits, the NET segment before it must
-	// be complete (TOK must never squeeze NET out)
+	// Critical point: TOK must never squeeze NET out (it outranks NET), and when
+	// NET does survive, TOK is complete ahead of it.
 	const withTok = segsText(plainLineSegs(opts, 120));
 	assert.match(withTok, /TOK /);
 	assert.match(withTok, /NET /);
 	assert.ok(
-		withTok.indexOf("NET ") < withTok.indexOf("TOK "),
-		"NET must come before TOK (descending importance)",
+		withTok.indexOf("TOK ") < withTok.indexOf("NET "),
+		"TOK must come before NET (descending importance)",
 	);
-	// The relative order of the four segments is fixed
+	// NET is dropped first: there must exist a width where TOK survives alone
+	// without NET (otherwise the priority would be nominal only).
+	let tokWithoutNet = false;
+	for (let w = 1; w <= 120; w++) {
+		const text = segsText(plainLineSegs(opts, w));
+		if (text.includes("TOK ") && !text.includes("NET ")) tokWithoutNet = true;
+		// The reverse can never happen: NET present while TOK is gone
+		assert.ok(
+			!(text.includes("NET ") && !text.includes("TOK ")),
+			`w=${w}: NET survived while TOK was dropped —— ${JSON.stringify(text)}`,
+		);
+	}
+	assert.ok(tokWithoutNet, "NET must be droppable while TOK survives");
+	// The relative order of the four groups is fixed
 	const idx = marks.map((m) => full.indexOf(m));
 	for (let i = 1; i < idx.length; i++)
 		assert.ok(

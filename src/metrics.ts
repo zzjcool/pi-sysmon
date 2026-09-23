@@ -23,7 +23,12 @@
  * os.cpus() ever be unusable, and its tested agreement with os.cpus() is the
  * executable evidence for the architecture decision above.
  */
-import { execFileSync } from "node:child_process";
+import {
+	execFileSync,
+	spawn,
+	type ChildProcessByStdio,
+} from "node:child_process";
+import type { Readable } from "node:stream";
 import { readdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 
@@ -283,17 +288,102 @@ export function parseCpuTempText(text: string): number {
 }
 
 /**
+ * Parse one JSON line from `macmon pipe` and return the average CPU
+ * temperature (°C), or 0 = unknown. Pure, exported for offline testing.
+ * A >0 return means "trust this"; 0 means the line wasn't usable (truncated
+ * mid-line at the read timeout, schema drift, or a junk banner line).
+ */
+export function parseMacmonCpuTemp(line: string): number {
+	if (!line) return 0;
+	try {
+		const c: unknown = JSON.parse(line)?.temp?.cpu_temp_avg;
+		// `typeof` guards both a missing key (undefined) and a schema drift
+		// (string "44.1") — only a finite number in the physical window counts.
+		if (typeof c === "number" && Number.isFinite(c) && c > 0 && c < 150) return c;
+	} catch {
+		/* truncated/junk line: 0 = unknown */
+	}
+	return 0;
+}
+
+/**
  * macOS CPU temperature.
  *
- * **Why a helper-command probe instead of a system API**: macOS exposes no
+ * **Why helper-command probes instead of a system API**: macOS exposes no
  * unprivileged CPU-temperature API — the SMC keys need direct SMC access, and
  * `powermetrics` (the only system tool that reads them) refuses to run without
- * sudo. On this repo's dev machine none of these are available, so the only
- * honest unprivileged route is a user-installed helper (`osx-cpu-temp`,
- * `istats`). If none is installed this returns 0 and the chart degrades to
- * the old single-curve CPU block — declared behaviour, not a bug.
+ * sudo. Helpers are probed in order of trust; if none works this returns 0
+ * and the chart degrades to the old single-curve CPU block — declared
+ * behaviour, not a bug.
+ *
+ * 1. `macmon pipe` (brew core, Apple Silicon only): the only one that works
+ *    on ARM Macs today. It **streams one JSON line per interval forever**, so
+ *    it runs as a single **resident** async child process whose stdout is
+ *    parsed line by line into `macmonTemp`; `collect()` only reads that
+ *    variable — zero synchronous spawn cost per sample. (An earlier
+ *    spawnSync-per-sample design measured ~2.5s of blocking per call, which
+ *    froze the TUI.) The child is killed on `session_shutdown`; a crashed
+ *    child is lazily restarted on the next `collect()` after a backoff.
+ * 2. `osx-cpu-temp` / `istats`: Intel-only in practice — both hard-code the
+ *    Intel SMC key `TC0P` with `sp78` decoding, and on Apple Silicon that key
+ *    simply doesn't exist, so they print `0.0°C` (lavoiesl/osx-cpu-temp#38,
+ *    Chris911/iStats#107, both open). Kept for Intel Macs.
  */
+let macmonChild: ChildProcessByStdio<null, Readable, Readable> | undefined;
+let macmonTemp = 0;
+let macmonBuf = "";
+/** `-Infinity` = "never started": the backoff below must not gate the FIRST
+ *  spawn (performance.now() starts near 0 in a fresh process, so a 0 initial
+ *  value would delay the first macmon start by a full MACMON_RESTART_MS). */
+let macmonLastStart = -Infinity;
+/** Restart backoff: after a crash, wait before respawning so a broken macmon
+ *  installation can't turn every `collect()` into a fork bomb. */
+const MACMON_RESTART_MS = 10_000;
+
 function readCpuTempDarwin(): number {
+	// 1) macmon (Apple Silicon): the resident child updates `macmonTemp`.
+	if (
+		macmonChild === undefined &&
+		performance.now() - macmonLastStart > MACMON_RESTART_MS
+	) {
+		macmonLastStart = performance.now();
+		try {
+			// Not `--interval 1000`: a shorter cadence keeps the reading fresh
+			// without any idle cost — the process is resident, nobody polls it.
+			macmonChild = spawn("macmon", ["pipe", "--interval", "1000"], {
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			macmonBuf = "";
+			macmonChild.stdout.setEncoding("utf8");
+			macmonChild.stdout.on("data", (chunk: string) => {
+				macmonBuf += chunk;
+				// macmon flushes whole JSON lines; split on '\n' and keep the
+				// (possibly empty) remainder.
+				const lines = macmonBuf.split("\n");
+				macmonBuf = lines.pop() ?? "";
+				for (const line of lines) {
+					const c = parseMacmonCpuTemp(line);
+					if (c > 0) macmonTemp = c;
+				}
+			});
+			// EPIPE/exit: remember the last reading (a slow variable) and let the
+			// backoff-gated respawn above refresh it.
+			macmonChild.on("exit", () => {
+				macmonChild = undefined;
+			});
+			// spawn() itself can throw synchronously (ENOENT when macmon isn't
+			// installed) — fall through to the Intel helpers.
+			macmonChild.on("error", () => {
+				macmonChild = undefined;
+			});
+		} catch {
+			macmonChild = undefined;
+		}
+	}
+	if (macmonTemp > 0) return macmonTemp;
+	// The first reading lands ~1s after the child starts; before that (and on
+	// Intel Macs / macmon-less machines) fall back to the synchronous helpers.
+	// 2) Intel Mac helpers.
 	for (const [file, args] of [
 		["osx-cpu-temp", []],
 		["istats", ["cpu", "temperature"]],
@@ -304,6 +394,16 @@ function readCpuTempDarwin(): number {
 		if (c > 0) return c;
 	}
 	return 0;
+}
+
+/** Kill the resident macmon child. Called on `session_shutdown` so the
+ *  streaming process never outlives the session (pi exits, the child would
+ *  otherwise be reparented and keep running). */
+export function stopCpuTempDarwin(): void {
+	macmonChild?.kill();
+	macmonChild = undefined;
+	macmonTemp = 0;
+	macmonBuf = "";
 }
 
 export interface Collector {

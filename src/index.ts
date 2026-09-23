@@ -44,7 +44,11 @@ import {
 	type Placement,
 } from "./blocks.ts";
 import { createTpsMeter, hitRate } from "./tokens.ts";
-import { createCollector, type Snapshot } from "./metrics.ts";
+import {
+	createCollector,
+	stopCpuTempDarwin,
+	type Snapshot,
+} from "./metrics.ts";
 import {
 	lastSessionEnabled,
 	mergeCfg,
@@ -1189,6 +1193,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		stop();
 		activeMode = undefined;
+		// Kill the resident macmon temperature child (darwin): it streams forever
+		// and would otherwise outlive the session as a reparented orphan.
+		stopCpuTempDarwin();
 		// Drop the remembered ctx with the session: its getContextUsage() reads the
 		// dying session's entries, and keeping it would freeze the last reading
 		// (or worse, resurrect it) in whatever session mounts the monitor next.

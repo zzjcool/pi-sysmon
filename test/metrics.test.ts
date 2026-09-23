@@ -24,8 +24,10 @@ import {
 	parseCpuTempText,
 	parseIoreg,
 	parseIostat,
+	parseMacmonCpuTemp,
 	parseNetstatIb,
 	parseVmStat,
+	stopCpuTempDarwin,
 	vmStatUsedBytes,
 } from "../src/metrics.ts";
 
@@ -321,6 +323,59 @@ test("parseCpuTempText: takes the FIRST number (helpers print the reading first)
 });
 
 /* ------------------------------------------------------------------ */
+/* 5c. parseMacmonCpuTemp — macmon `pipe` JSON line (pure, offline)    */
+/* ------------------------------------------------------------------ */
+
+// One real (trimmed) macmon 0.8.x line, reduced to the fields the parser
+// reads — locks the schema shape `temp.cpu_temp_avg` against drift.
+const MACMON_LINE = JSON.stringify({
+	cpu_power: 0.67,
+	temp: { cpu_temp_avg: 44.11, gpu_temp_avg: 43.26 },
+	timestamp: "2026-09-22T23:49:02.862598+00:00",
+});
+
+test("parseMacmonCpuTemp: well-formed line → cpu_temp_avg", () => {
+	assert.equal(parseMacmonCpuTemp(MACMON_LINE), 44.11);
+});
+
+test("parseMacmonCpuTemp: truncated line (timeout mid-flush) → 0", () => {
+	assert.equal(parseMacmonCpuTemp(MACMON_LINE.slice(0, 40)), 0);
+});
+
+test("parseMacmonCpuTemp: missing temp field / empty line → 0", () => {
+	assert.equal(parseMacmonCpuTemp(JSON.stringify({ cpu_power: 1 })), 0);
+	assert.equal(parseMacmonCpuTemp(""), 0);
+});
+
+test("parseMacmonCpuTemp: 0 (unknown) and out-of-window readings → 0", () => {
+	assert.equal(
+		parseMacmonCpuTemp(JSON.stringify({ temp: { cpu_temp_avg: 0 } })),
+		0,
+	);
+	assert.equal(
+		parseMacmonCpuTemp(JSON.stringify({ temp: { cpu_temp_avg: 151 } })),
+		0,
+	);
+});
+
+test("parseMacmonCpuTemp: schema drift (string value) → 0, never NaN", () => {
+	assert.equal(
+		parseMacmonCpuTemp(
+			JSON.stringify({ temp: { cpu_temp_avg: "44.1" } }),
+		),
+		0,
+	);
+	assert.equal(
+		parseMacmonCpuTemp(JSON.stringify({ temp: { cpu_temp_avg: NaN } })),
+		0,
+	);
+});
+
+test("parseMacmonCpuTemp: junk/banner line → 0", () => {
+	assert.equal(parseMacmonCpuTemp("macmon v0.8.2"), 0);
+});
+
+/* ------------------------------------------------------------------ */
 /* 6. Live smoke tests (darwin only)                                    */
 /* ------------------------------------------------------------------ */
 
@@ -415,4 +470,28 @@ test("darwin: os.cpus() counters and iostat's 2nd sample agree", { skip: !isDarw
 		Math.abs(osPct - iostatPct) < 15,
 		`os.cpus ${osPct.toFixed(1)}% vs iostat ${iostatPct.toFixed(1)}%`,
 	);
+});
+
+test("darwin: a collector's cpuTemp comes from the resident macmon child", {
+	skip: !isDarwin,
+}, async () => {
+	// The resident-child design (spawn + line parser) means the FIRST collect()
+	// starts macmon but reads 0 (the first line lands ~1s later) — the ramp-up
+	// is part of the contract this test pins. collect() must stay cheap
+	// throughout (the spawnSync design it replaced blocked ~2.5s per call).
+	stopCpuTempDarwin(); // a previous test may have left a child + cached reading
+	const c = createCollector();
+	const t0 = performance.now();
+	const s0 = c.collect();
+	const firstMs = performance.now() - t0;
+	assert.ok(s0.cpuTemp === 0, `first read should be unknown, got ${s0.cpuTemp}`);
+	assert.ok(firstMs < 500, `first collect took ${firstMs}ms (must not block)`);
+	// ≥1 line flushed by now; also proves the reading survives later collects.
+	await sleep(2500);
+	const s1 = c.collect();
+	assert.ok(s1.cpuTemp > 0, `cpuTemp after ramp-up ${s1.cpuTemp}`);
+	assert.ok(s1.cpuTemp < 150, `cpuTemp out of window ${s1.cpuTemp}`);
+	// teardown: the session-shutdown path must kill the child — a leaked
+	// macmon would keep streaming forever after the process is "done".
+	stopCpuTempDarwin();
 });

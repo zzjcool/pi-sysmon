@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Apple Silicon Macs could not read CPU temperature (`0.0°C`, so the temperature curve silently
+  disappeared).** macOS has no unprivileged CPU-temperature API, and the helpers the darwin reader
+  probed — `osx-cpu-temp` and `istats` — both hard-code the **Intel** SMC key `TC0P` with `sp78`
+  decoding; that key does not exist on ARM, so both just print `0.0°C` (lavoiesl/osx-cpu-temp#38,
+  Chris911/iStats#107, both still open upstream). `macmon pipe --interval 1000` (brew core) is the
+  only path that works on Apple Silicon today, and it **streams one JSON line per interval
+  forever**:
+  - It runs as a single **resident** async child whose stdout is split into lines and parsed by the
+    new pure, offline-tested `parseMacmonCpuTemp` (schema `temp.cpu_temp_avg`; truncated, drifted
+    and out-of-window lines all read as unknown); `collect()` only reads the cached variable, so
+    sampling stays non-blocking — the spawnSync-per-sample probe it replaced blocked ~2.5 s per call
+    and froze the TUI.
+  - A crashed child is lazily respawned on the next `collect()` after a 10 s backoff (a broken
+    macmon install can't turn every sample into a fork bomb), and the new `stopCpuTempDarwin()` is
+    called on `session_shutdown` so the streaming process never outlives pi as a reparented orphan.
+  - `osx-cpu-temp` / `istats` stay as the Intel fallback, and "unknown" still degrades to the plain
+    single-curve CPU block — never a red line glued to 0°C.
+  - The single-file bundle's hand-written header re-declares the new `spawn` import it strips from
+    sources (same silent-`ReferenceError` class as the v0.5.0 `execFileSync` fix, eb46925).
+
 ## [0.6.0] — 2026-09-23
 
 ### Added

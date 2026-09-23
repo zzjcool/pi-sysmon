@@ -1617,6 +1617,89 @@ test("renderBlock: the `100°` secondary label lands at the plot area's top-righ
 		);
 });
 
+test("renderBlock: y-tick colors are bound to the curves (left = series[0], right = the last series)", () => {
+	// Uniform grey ticks gave no clue which scale belonged to which line once a
+	// block carried two curves (CPU% + temp, TPS + hit rate): `100%` and `100°`
+	// looked like one and the same axis. The rule pinned here:
+	//   · the LEFT tick column wears the **primary** curve's effective color
+	//     (`series[0].color`, else the block's main color);
+	//   · the RIGHT axis label wears the **last** curve's effective color;
+	//   · the neutral `muted` survives only as the no-series fallback and for the
+	//     x-axis time labels (they belong to no curve).
+	const h = fakeHist(50);
+	const cpu = buildBlocks(h, fakeSnap(), { points: 30 }).find((b) => b.name === "CPU");
+	assert.ok(cpu);
+	// The CPU block's own color wiring is the premise of this test, so pin it
+	// here: series[0] = CPU% (no color ⇒ inherits the block's `success`),
+	// series[1] = package temperature with an explicit `error`.
+	assert.equal(cpu.series[0]?.color, undefined, "CPU% inherits the block color");
+	assert.equal(cpu.series[1]?.color, "error", "temp carries an explicit red");
+	assert.equal(cpu.color, "success");
+	const W = 50;
+	const plotRows = 6;
+	const layout = {
+		cols: 1,
+		bands: 1,
+		widths: [W],
+		plotRows,
+		totalRows: plotRows + BLOCK_CHROME_ROWS,
+	};
+	const lines = renderPanel(ansiTheme, [cpu], W, layout, 60);
+	const top = lines[1] ?? "";
+	// Position is unchanged (existing tests pin `│100%…100°│`); only the color moved.
+	assert.ok(top.startsWith("\x1b[90m│\x1b[0m\x1b[32m100%\x1b[0m"), `left tick must wear the CPU% color (success/green): ${JSON.stringify(top)}`);
+	assert.ok(
+		top.includes("\x1b[31m100°\x1b[0m\x1b[90m│\x1b[0m"),
+		`right label must wear the temp color (error/red): ${JSON.stringify(top)}`,
+	);
+	// The x-axis time labels are NOT bound to a curve: they stay neutral.
+	const bottom = lines.at(-1) ?? "";
+	assert.ok(
+		bottom.includes("\x1b[90m60s\x1b[0m") && bottom.includes("\x1b[90m0s\x1b[0m"),
+		`time labels stay muted: ${JSON.stringify(bottom)}`,
+	);
+
+	// Generic rule on synthetic blocks (the CPU case alone can't tell "last
+	// series' color" apart from "series[1]"): series[0] has its own color, the
+	// right label follows the LAST series — not series[0], not the block color.
+	const vals = Array.from({ length: 30 }, (_, i) => 40 + 20 * Math.sin(i / 3));
+	const mk = (over: Partial<MetricBlock>): MetricBlock => ({
+		name: "X",
+		color: "warning",
+		series: [
+			{ values: vals, color: "accent" },
+			{ values: vals, color: "text", excludeFromScale: true },
+		],
+		rightAxisLabel: "100°",
+		axis: () => percentAxis(),
+		...over,
+	});
+	const synth = (over: Partial<MetricBlock>): string =>
+		renderPanel(ansiTheme, [mk(over)], W, layout, 60)[1] ?? "";
+	const explicit = synth({});
+	assert.ok(
+		explicit.includes("\x1b[36m100%\x1b[0m") && explicit.includes("\x1b[37m100°\x1b[0m"),
+		`series colors win over the block color on both ends: ${JSON.stringify(explicit)}`,
+	);
+	// No per-series color anywhere ⇒ both ends fall back to the block's main color.
+	const inherited = synth({
+		series: [
+			{ values: vals },
+			{ values: vals, excludeFromScale: true },
+		],
+	});
+	assert.ok(
+		inherited.includes("\x1b[33m100%\x1b[0m") && inherited.includes("\x1b[33m100°\x1b[0m"),
+		`both ends inherit the block color when the series have none: ${JSON.stringify(inherited)}`,
+	);
+	// No series at all (a data-less block): keep the neutral tick color.
+	const bare = synth({ series: [] });
+	assert.ok(
+		bare.includes("\x1b[90m100%\x1b[0m") && bare.includes("\x1b[90m100°\x1b[0m"),
+		`no series ⇒ neutral ticks: ${JSON.stringify(bare)}`,
+	);
+});
+
 test("renderBlock: the `100°` label dodges the floating legend box instead of hiding under it", () => {
 	// labelMode=box: the floating box is painted over the plot area's top-right
 	// corner — the exact spot the `100°` label wants. The label must hug the

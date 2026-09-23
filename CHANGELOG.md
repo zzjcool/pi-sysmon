@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The single-file bundle's hand-written header re-declares the new `spawn` import it strips from
     sources (same silent-`ReferenceError` class as the v0.5.0 `execFileSync` fix, eb46925).
 
+### Changed
+
+- **Y-axis tick labels now wear the color of the curve they belong to** — with two fixed scales
+  on one plot (CPU% + temperature, TPS + cache hit rate) uniformly grey ticks gave no clue which
+  number went with which line. The left tick column takes the **primary** series' effective color
+  (`series[0].color`, else the block's main color — so CPU's `100%` is now green), and the
+  right-hand scale label takes the **last** series' color (CPU's `100°` is red, the temperature
+  curve's own color). The x-axis time labels (`60s` / `0s`) stay neutral: they belong to no curve.
+
 ## [0.6.0] — 2026-09-23
 
 ### Added

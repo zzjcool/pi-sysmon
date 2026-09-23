@@ -835,6 +835,18 @@ export function renderBlock(
 	// the "tell charts apart at a glance" ability without color spam.
 	const edge: ThemeColor = "borderMuted";
 	const axis: ThemeColor = "muted";
+	// ── y-tick colors follow the curves ──
+	// The left tick column belongs to the **primary** curve (`series[0]`; same
+	// precedence as the braille collision rule) and the right axis label to the
+	// **last** curve — for CPU that's the error-red temperature, for Tokens the
+	// warning-yellow hit rate. Each falls back to the block's main color when
+	// the series carries no color of its own, and to the neutral `axis` when
+	// there is no series at all. The bottom border's time labels stay `axis`:
+	// they belong to the x axis, not to any curve.
+	const primary = block.series[0];
+	const last = block.series.at(-1);
+	const leftTickColor: ThemeColor = primary ? (primary.color ?? color) : axis;
+	const rightTickColor: ThemeColor = last ? (last.color ?? color) : axis;
 
 	// ── Top border + title (bottom's title_top effect) ──
 	// Border body in neutral color, name in the metric color — this is the key to
@@ -1007,7 +1019,15 @@ export function renderBlock(
 		if (showAxis) {
 			const label = tickAt.get(r);
 			if (label) {
-				const cells = segsToRow([{ text: label, color: axis }]);
+				// Tick color is **bound to the primary curve's color**, not to the
+				// neutral `muted` it used to be: with two scales on screen (CPU% +
+				// temp, TPS + hit rate) a uniform grey tick column gives no clue
+				// which number belongs to which line. `series[0]` is the primary
+				// curve (collision resolution in `renderChartGlyphs` also favours
+				// the lowest index), so its effective color — its own, else the
+				// block's main color — is exactly what the reader needs.
+				// No series at all (a data-less block): keep the neutral `axis`.
+				const cells = segsToRow([{ text: label, color: leftTickColor }]);
 				overlay(row, 1, cells);
 			}
 		}
@@ -1111,7 +1131,11 @@ export function renderBlock(
 			overlay(
 				lines[plotTop] ?? [],
 				rightEdge - labW,
-				segsToRow([{ text: block.rightAxisLabel, color: axis }]),
+				// Same color binding as the left ticks, on the far end of the legend:
+				// the right label is the **last** series' scale (CPU temp / hit rate),
+				// so it takes that series' effective color — its own, else the block's
+				// main color (the generic rule: right axis ⇄ the last curve).
+				segsToRow([{ text: block.rightAxisLabel, color: rightTickColor }]),
 			);
 		}
 	}

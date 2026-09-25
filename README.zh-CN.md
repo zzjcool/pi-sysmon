@@ -162,6 +162,38 @@ cp -r pi-sysmon ~/.pi/agent/extensions/pi-sysmon
 pi -e npm:pi-sysmon
 ```
 
+## 环境要求与平台支持
+
+下表中除特别标注外**均无需任何手动安装** —— 图表工作不依赖任何可选依赖；
+某个数据源缺失只会隐藏它自己那条曲线，并收到一次性启动提示
+（见下方「启动依赖预检」）。
+
+| 图表 | Linux | macOS | Windows |
+|---|---|---|---|
+| CPU | ✅ `/proc/stat` | ✅ `os.cpus()` | ❌ 读数全 0 |
+| 内存 | ✅ `/proc/meminfo` | ✅ `sysctl` + `vm_stat` | ❌ 读数全 0 |
+| 网络 | ✅ `/proc/net/dev` | ✅ `netstat -ib` | ❌ 读数全 0 |
+| 磁盘 | ✅ `/proc/diskstats` | ✅ `ioreg` | ❌ 读数全 0 |
+| CPU 温度 | ✅ `/sys/class/hwmon` + `/sys/class/thermal`¹ | ⚠️ 需装 `macmon`² | ❌ 读数全 0 |
+| Tokens（LLM t/s） | ✅ 与平台无关（来自 pi 自身的流事件） | ✅ | ✅ |
+
+¹ 物理机基本都有传感器；**容器和 VM 不通过 sysfs 透传宿主传感器**，温度读 0
+属于环境限制而非缺依赖，其余图表不受影响。
+
+² macOS 没有免 root 的 CPU 温度 API。Apple Silicon 装
+[`macmon`](https://github.com/vladkens/macmon)（`brew install macmon`）；
+Intel Mac 也可以用 `osx-cpu-temp` 或 `istats`。没装时 CPU 图退回单曲线形态，
+其他一切照常。
+
+需要 Node ≥ 22.19（npm 会强制检查 `engines` 字段）。
+
+### 启动依赖预检
+
+每个 pi 进程首次挂载监控时，pi-sysmon 会探测各指标组在当前平台是否真的可读，
+读不到就发**一次**警告（附对应平台的安装指引或「平台不支持」提示），
+而不是让你过了几个会话才发现曲线一直是平的。同一 pi 进程内的 `/new` 和 `/resume`
+不会重复触发。
+
 ## 使用
 
 ```text

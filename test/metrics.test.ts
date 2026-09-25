@@ -21,12 +21,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createCollector,
+	hasCpuTempSource,
 	parseCpuTempText,
 	parseIoreg,
 	parseIostat,
 	parseMacmonCpuTemp,
 	parseNetstatIb,
 	parseVmStat,
+	preflightMetrics,
 	stopCpuTempDarwin,
 	vmStatUsedBytes,
 } from "../src/metrics.ts";
@@ -340,6 +342,39 @@ test("parseMacmonCpuTemp: well-formed line → cpu_temp_avg", () => {
 
 test("parseMacmonCpuTemp: truncated line (timeout mid-flush) → 0", () => {
 	assert.equal(parseMacmonCpuTemp(MACMON_LINE.slice(0, 40)), 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* 5d. preflight — startup dependency / platform check                 */
+/* ------------------------------------------------------------------ */
+
+// Contract tests (environment-dependent by design):
+// 1. neither probe ever throws — the preflight must not crash session_start;
+// 2. on this dev machine (darwin + macmon installed) both groups must be true.
+// A false negative on a machine WITH a source would spam a wrong warning at
+// startup, so the true-cases are the ones worth pinning here.
+test("preflightMetrics: never throws; both groups true on a healthy darwin host", () => {
+	let r: ReturnType<typeof preflightMetrics>;
+	assert.doesNotThrow(() => {
+		r = preflightMetrics();
+	});
+	if (isDarwin && process.env.PI_SYSMON_TEST_HAS_MACMON !== "0") {
+		assert.equal(r!.core, true);
+		assert.equal(r!.temp, true);
+	}
+});
+
+test("hasCpuTempSource: back-compat alias tracks preflightMetrics().temp", () => {
+	// Same-process consistency: the alias must never disagree with the group
+	// probe it wraps (a divergence would mean two different warnings paths).
+	assert.equal(hasCpuTempSource(), preflightMetrics().temp);
+});
+
+test("preflightMetrics: shape contract — exactly the two documented groups", () => {
+	const r = preflightMetrics();
+	assert.deepEqual(Object.keys(r).sort(), ["core", "temp"]);
+	assert.equal(typeof r.core, "boolean");
+	assert.equal(typeof r.temp, "boolean");
 });
 
 test("parseMacmonCpuTemp: missing temp field / empty line → 0", () => {

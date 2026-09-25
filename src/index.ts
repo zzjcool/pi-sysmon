@@ -46,6 +46,7 @@ import {
 import { createTpsMeter, hitRate } from "./tokens.ts";
 import {
 	createCollector,
+	preflightMetrics,
 	stopCpuTempDarwin,
 	type Snapshot,
 } from "./metrics.ts";
@@ -430,6 +431,10 @@ export default function (pi: ExtensionAPI) {
 	// session's choice leak into the next.
 	let enabled = false;
 	let activeMode: Mode | undefined;
+	/** One-shot dependency-preflight warning latch (module scope in effect: this
+	 * closure lives for the whole pi process, and `/new`/`/resume` re-fire
+	 * `session_start` — without the latch every session would re-warn). */
+	let preflightWarned = false;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let snap: Snapshot | undefined;
 	/**
@@ -1188,6 +1193,35 @@ export default function (pi: ExtensionAPI) {
 		disable(ctx);
 		enabled = false;
 		if (want) enabled = enable(ctx);
+
+		// ── Dependency preflight: warn ONCE per process about unreadable groups ──
+		// Runs only when the monitor is actually mounted, and only on the first
+		// session (module-level latch): the probe spawns a couple of `which`
+		// calls, so `/new` / `/resume` within the same process shouldn't repeat
+		// the warning the user already saw. Deferred to the next tick so the
+		// very first paint isn't blocked by the PATH/sysfs probing.
+		if (want && !preflightWarned) {
+			preflightWarned = true;
+			setImmediate(() => {
+				const r = preflightMetrics();
+				if (!r.core) {
+					// Whole platform unsupported (e.g. Windows): every chart would
+					// render zeros — say so up front rather than let the user find
+					// flat lines and file "broken" issues.
+					ctx.ui.notify(
+						`pi-sysmon: ${process.platform} is not supported — CPU/memory/network/disk charts will all read 0 (supported: macOS, Linux). Disable with /sysmon global off.`,
+						"warning",
+					);
+				} else if (!r.temp) {
+					ctx.ui.notify(
+						process.platform === "darwin"
+							? "pi-sysmon: CPU temperature unavailable — install macmon (brew install macmon, Apple Silicon) or osx-cpu-temp (Intel). Other charts work normally."
+							: "pi-sysmon: CPU temperature unavailable — no CPU sensor found under /sys/class/hwmon or /sys/class/thermal. Other charts work normally.",
+						"warning",
+					);
+				}
+			});
+		}
 	});
 
 	pi.on("session_shutdown", () => {

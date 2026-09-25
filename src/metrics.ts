@@ -33,6 +33,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 
 const IS_DARWIN = process.platform === "darwin";
+const IS_LINUX = process.platform === "linux";
 /** Every child process is bounded: a wedged command must not hang the collector. */
 const EXEC_TIMEOUT_MS = 5000;
 
@@ -404,6 +405,116 @@ export function stopCpuTempDarwin(): void {
 	macmonChild = undefined;
 	macmonTemp = 0;
 	macmonBuf = "";
+}
+
+/**
+ * One-shot dependency preflight: can each metric group be read on this
+ * platform? Returns a per-group verdict so the caller can warn precisely
+ * ("temperature unavailable" vs "this platform isn't supported at all").
+ *
+ * **Why a separate probe instead of reusing the readers**: the resident
+ * macmon child only produces its first reading ~1s after spawn, and the
+ * /proc readers degrade to zeros rather than throwing, so sampling right
+ * after mount can't distinguish "missing source" from "first sample not
+ * in yet". This check instead asks "could any source ever answer?" per
+ * metric, letting the caller warn the user **at startup** instead of
+ * leaving silently flat charts to be discovered sessions later.
+ *
+ * Pure probing (no resident state, never throws); exported for testing.
+ *
+ * Group semantics:
+ * - `core` — CPU/mem/net/disk charts. True on macOS (system tools) and
+ *   Linux (/proc). False on any other platform (Windows: every chart reads 0).
+ * - `temp` — CPU temperature: needs macmon / osx-cpu-temp / istats on macOS,
+ *   a CPU-ish hwmon/thermal_zone sensor on Linux.
+ */
+export interface MetricsPreflight {
+	/** CPU / memory / network / disk charts are readable. */
+	core: boolean;
+	/** CPU temperature is readable (its own group: optional helper on macOS). */
+	temp: boolean;
+}
+
+export function preflightMetrics(): MetricsPreflight {
+	if (IS_DARWIN) {
+		// Core: sysctl / vm_stat / netstat / ioreg ship with macOS itself — if
+		// one is somehow missing the reader degrades, but that's a broken OS;
+		// probing all four is noise. One representative (sysctl) is enough.
+		const core = whichSync("sysctl");
+		// Temp: macmon (Apple Silicon), osx-cpu-temp / istats (Intel).
+		let temp = false;
+		for (const file of ["macmon", "osx-cpu-temp", "istats"]) {
+			if (whichSync(file)) {
+				temp = true;
+				break;
+			}
+		}
+		return { core, temp };
+	}
+	if (IS_LINUX) {
+		// Core: /proc must be readable. /proc/net/dev is representative (on a
+		// sane system stat/meminfo/diskstats live or die with it).
+		let core = false;
+		try {
+			readFileSync("/proc/net/dev", "utf8");
+			core = true;
+		} catch {
+			/* unreadable /proc: core stays false */
+		}
+		return { core, temp: linuxCpuTempSensorExists() };
+	}
+	// Other platforms (Windows, FreeBSD…): every reader degrades to zeros —
+	// declare both groups dead so the user hears it once at startup.
+	return { core: false, temp: false };
+}
+
+/** Back-compat alias for the original single-group question. */
+export function hasCpuTempSource(): boolean {
+	return preflightMetrics().temp;
+}
+
+/**
+ * Linux: does any CPU-ish temperature sensor exist? Mirrors readCpuTempLinux()'s
+ * own sources (hwmon labels, then thermal_zone types) — exists == readable.
+ */
+function linuxCpuTempSensorExists(): boolean {
+	try {
+		for (const cls of ["hwmon", "thermal"]) {
+			for (const d of readdirSync(`/sys/class/${cls}`)) {
+				const base = `/sys/class/${cls}/${d}`;
+				if (cls === "hwmon") {
+					for (let i = 1; i <= 12; i++) {
+						const label = readTextFile(`${base}/temp${i}_label`);
+						if (label && CPU_TEMP_LABEL_RE.test(label)) {
+							const raw = readTextFile(`${base}/temp${i}_input`);
+							if (raw && Number.isFinite(Number(raw))) return true;
+						}
+					}
+				}
+			}
+		}
+	} catch {
+		/* /sys unreadable */
+	}
+	try {
+		for (const d of readdirSync("/sys/class/thermal")) {
+			if (!d.startsWith("thermal_zone")) continue;
+			const type = readTextFile(`/sys/class/thermal/${d}/type`);
+			if (type && CPU_TEMP_LABEL_RE.test(type)) {
+				const raw = readTextFile(`/sys/class/thermal/${d}/temp`);
+				if (raw && Number.isFinite(Number(raw))) return true;
+			}
+		}
+	} catch {
+		/* fall through */
+	}
+	return false;
+}
+
+/** `which <cmd>` — is an executable on PATH? */
+function whichSync(cmd: string): boolean {
+	const out = execText("which", [cmd]);
+	return out !== null && out.trim() !== "";
 }
 
 export interface Collector {

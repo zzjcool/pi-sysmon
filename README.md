@@ -177,6 +177,40 @@ cp -r pi-sysmon ~/.pi/agent/extensions/pi-sysmon
 pi -e npm:pi-sysmon
 ```
 
+## Requirements & Platform Support
+
+Everything below needs **zero manual setup** unless marked otherwise — no optional
+dependency is required for the charts to work; a missing source only hides its own
+curve and gets a one-time startup notice (see *Startup dependency preflight* below).
+
+| Chart | Linux | macOS | Windows |
+|---|---|---|---|
+| CPU | ✅ `/proc/stat` | ✅ `os.cpus()` | ❌ reads 0 |
+| Memory | ✅ `/proc/meminfo` | ✅ `sysctl` + `vm_stat` | ❌ reads 0 |
+| Network | ✅ `/proc/net/dev` | ✅ `netstat -ib` | ❌ reads 0 |
+| Disk | ✅ `/proc/diskstats` | ✅ `ioreg` | ❌ reads 0 |
+| CPU temperature | ✅ `/sys/class/hwmon` + `/sys/class/thermal`¹ | ⚠️ needs `macmon`² | ❌ reads 0 |
+| Tokens (LLM t/s) | ✅ platform-independent (streams from pi itself) | ✅ | ✅ |
+
+¹ Present on virtually all physical machines; **containers and VMs don't expose host
+sensors through sysfs**, so temperature reads 0 there — that's the environment, not a
+missing dependency, and the other charts work normally.
+
+² macOS has no unprivileged CPU-temperature API. On Apple Silicon install
+[`macmon`](https://github.com/vladkens/macmon) (`brew install macmon`); on Intel Macs
+`osx-cpu-temp` or `istats` also work. Without one, the CPU chart simply drops back to
+the single-curve form and everything else is unaffected.
+
+Node ≥ 22.19 required (`engines` field is enforced by npm).
+
+### Startup dependency preflight
+
+On first mount per process, pi-sysmon probes whether each metric group is actually
+readable on the current platform and, if not, fires a **single** warning with the fix
+(per-platform install hint or "not supported here" notice) instead of letting you
+discover silently flat curves sessions later. `/new` and `/resume` never re-trigger
+it within the same pi process.
+
 ## Usage
 
 ```text

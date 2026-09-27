@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] — 2026-09-28
+
+### Fixed
+
+- **Linux CPU temperature always read 0 — the sanity window was checked on milli-°C before
+  conversion.** sysfs `temp*_input` / `thermal_zone*/temp` are milli-°C, but both Linux paths
+  applied the 0..150°C plausibility window **before** dividing by 1000, so every real reading
+  (e.g. k10temp `Tctl` 71875 milli-°C = 71.9°C) failed the `< 150` check and returned 0 — on any
+  Linux host with a readable sensor the temperature curve never appeared, while the preflight
+  still said a sensor existed. Convert first, window second, in both the hwmon and thermal_zone
+  paths. Caught on an Omarchy/k10temp machine; verified end-to-end there after the fix
+  (`readCpuTempLinux()` 72.8°C, `collect()` 70.9°C).
+- Regression tests added: milli-°C arithmetic (real readings convert, garbage rejects) plus a
+  Linux-only integration test against the real `/sys` when a sensor exists. `readCpuTempLinux()`
+  is now exported for testing.
+
 ## [0.7.1] — 2026-09-25
 
 ### Added

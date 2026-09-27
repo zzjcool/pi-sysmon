@@ -227,7 +227,7 @@ function readTextFile(path: string): string | null {
 const CPU_TEMP_LABEL_RE =
 	/(?:^|[_ -])(?:cpu|package|pkg|soc|core|tdie|tctl)(?:[_ -]|$)/i;
 
-function readCpuTempLinux(): number {
+export function readCpuTempLinux(): number {
 	// 1) hwmon: prefer a sensor whose label names the CPU. Matches both
 	//    `coretemp` (label "Package id 0" / "Core 0") and ARM SoCs
 	//    (`k10temp` / `scpi_sensors`: label "Tdie" / "SoC temperature").
@@ -242,8 +242,13 @@ function readCpuTempLinux(): number {
 						const label = readTextFile(`${base}/temp${i}_label`);
 						if (label && CPU_TEMP_LABEL_RE.test(label)) {
 							const raw = readTextFile(`${base}/temp${i}_input`);
-							const c = Number(raw);
-							if (Number.isFinite(c) && c > 0 && c < 150) return c / 1000;
+							// sysfs temps are milli-°C: convert FIRST, then apply the
+							// 0..150°C sanity window. Checking the window on the raw
+							// milli-value (71875 for a 71.9°C CPU) rejected every real
+							// reading — v0.7.x shipped that bug and Linux temperature
+							// never displayed (caught on a k10temp host, Tctl 71.9°C).
+							const c = Number(raw) / 1000;
+							if (Number.isFinite(c) && c > 0 && c < 150) return c;
 						}
 					}
 				}
@@ -260,8 +265,9 @@ function readCpuTempLinux(): number {
 			const type = readTextFile(`/sys/class/thermal/${d}/type`);
 			if (type && CPU_TEMP_LABEL_RE.test(type)) {
 				const raw = readTextFile(`/sys/class/thermal/${d}/temp`);
-				const c = Number(raw);
-				if (Number.isFinite(c) && c > 0 && c < 150) return c / 1000;
+				// Same milli-°C conversion-first rule as the hwmon path above.
+				const c = Number(raw) / 1000;
+				if (Number.isFinite(c) && c > 0 && c < 150) return c;
 			}
 		}
 	} catch {

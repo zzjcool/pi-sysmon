@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] — 2026-09-25
+
+### Added
+
+- **Startup dependency preflight** — a machine without the optional helpers used to show
+  silently flat charts with no explanation; now, on the first mount per pi process, pi-sysmon
+  probes whether each metric group is actually readable and fires **one** warning with the fix:
+  - New `preflightMetrics()` in metrics.ts returns `{ core, temp }`: `core` = system tools /
+    `/proc` readable (dead on Windows — every chart would read 0), `temp` = `macmon` /
+    `osx-cpu-temp` / `istats` on macOS, a CPU-ish `hwmon` / `thermal_zone` sensor on Linux.
+  - `session_start` reports async (via `setImmediate`, never blocking the first paint) and
+    with a process-lifetime latch, so `/new` and `/resume` never re-warn within one pi run.
+  - The temp hint is per-platform ("brew install macmon" on macOS, sysfs paths on Linux);
+    the core failure says the platform is unsupported and points at `/sysmon global off`.
+  - `hasCpuTempSource()` (introduced in the unreleased preflight work) is kept as a
+    back-compat alias for `preflightMetrics().temp`.
+- **Requirements & Platform Support section** in README (and the zh-CN edition): a per-chart
+  × per-platform source matrix, the container/VM temperature caveat (host sensors are not
+  exposed through sysfs there), the Node ≥ 22.19 requirement, and a preflight explanation.
+
+### Verified
+
+- Full suite (219 tests + typecheck) on macOS and inside linux/arm64 and linux/amd64
+  containers; the probe answers `core:true/temp:false` on sensor-less containers (correct) and
+  `core:false/temp:false` on a simulated `win32` platform.
+
 ## [0.7.0] — 2026-09-23
 
 ### Fixed

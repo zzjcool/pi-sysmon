@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-09-29
+
+### Changed
+
+- **Default title-bar orders reworked to the user's requested reading order** (chart + line modes,
+  no new settings — this **is** the default behavior now):
+  - **CPU**: usage → **temperature** → load averages. The `°C` reading moved from last to right
+    after the usage percent, matching the block's second (red) temperature curve; the load
+    averages now yield first on narrow blocks.
+  - **Network**: the cumulative `Σ↓X ↑Y` unit is now **atomic** — download and upload totals appear
+    **together or not at all**. Previously the pieces dropped one by one, so a width that fit the
+    2-column `Σ` marker but not its values showed a dangling `Σ` reading like a rendering bug.
+    Implemented via a new `Seg.atomic` flag: consecutive atomic segments are welded into one
+    keep-or-drop unit in `renderBlock`'s title-bar accumulator.
+  - **Tokens**: rate → `◔N%` context usage → `·N%` instantaneous hit rate → `⌀N%` cumulative hit
+    rate → (footer mode: `↑ ↓ R`). Context usage moved up to the second slot, so on narrowing
+    blocks the hit rates now yield before it.
+
 ## [0.7.2] — 2026-09-28
 
 ### Fixed
@@ -228,7 +246,10 @@ installable with `pi install npm:pi-sysmon`.
   existing file that only carries the older `enabled: false` field is read as "global default off".
 - `chart` and `line` share one widget, so both follow `above`/`below` placement.
 
-[Unreleased]: https://github.com/zzjcool/pi-sysmon/compare/v0.5.0...HEAD
+[0.8.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/zzjcool/pi-sysmon/compare/v0.7.1...v0.7.2
+[0.8.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/zzjcool/pi-sysmon/compare/v0.7.1...v0.7.2
 [0.5.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.2.0...v0.3.0

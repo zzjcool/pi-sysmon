@@ -14,7 +14,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fsyncSync, openSync, closeSync, unlinkSync, writeSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { tmpdir } from "node:os";
@@ -480,8 +480,12 @@ exec sleep 300
 
 test("execText: SIGTERM-ignoring wedged child returns null within the timeout (SIGKILL, not SIGTERM)", { skip: !WEDGED_HELPER, timeout: 15_000 }, async () => {
 	const helper = join(tmpdir(), `pi-sysmon-wedged-${process.pid}.sh`);
-	writeSync(openSync(helper, "w", 0o755), WEDGED_HELPER);
+	// writeFileSync (not writeSync+openSync): the fd must be closed before the
+	// spawn below — Linux refuses to execute a file with an open write fd
+	// (ETXTBSY); macOS allows it, so the old form only broke in the ubuntu CI.
+	writeFileSync(helper, WEDGED_HELPER, { mode: 0o755 });
 	try {
+		// The public contract under test — same options as execText's own call:
 		const t0 = performance.now();
 		const out = execText(helper, [], 1200);
 		const ms = performance.now() - t0;
@@ -491,17 +495,30 @@ test("execText: SIGTERM-ignoring wedged child returns null within the timeout (S
 		// SIGTERM regression this test would otherwise hang the whole suite.)
 		assert.equal(out, null, "wedged child must degrade to null");
 		assert.ok(ms < 4000, `wedged child took ${ms.toFixed(0)}ms — hard kill failed`);
-		// And no leaked process survives into later samples. The fixture uses
-		// `exec sleep` (no grandchild), so this check covers the whole tree.
+		// And no leaked process survives into later samples: run the SAME wedged
+		// child again but keep the spawnSync result, whose `pid` lets the leak
+		// probe ask the kernel directly (signal 0; ESRCH = reaped) — NOT
+		// `pgrep -f`: on Ubuntu 24.04 / procps 5.x the pgrep checker matches its
+		// own wrapper shell (phantom leak on a clean tree), and after
+		// `exec sleep 300` the child's cmdline no longer contains the script
+		// path (real leaks invisible). Both were the pre-existing red CI v0.8.1.
+		// The fixture uses `exec sleep` (no grandchild): the pid IS the tree.
+		const wedgedResult = spawnSync(helper, [], {
+			encoding: "utf8",
+			timeout: 1200,
+			killSignal: "SIGKILL",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 		await sleep(300);
-		const leftover = spawn("sh", [
-			"-c",
-			`pgrep -f ${JSON.stringify(helper)} || true`,
-		]).stdout;
-		let leftoverOut = "";
-		leftover.on("data", (d: Buffer) => (leftoverOut += d));
-		await new Promise((r) => leftover.on("close", r));
-		assert.equal(leftoverOut.trim(), "", `wedged child leaked: ${leftoverOut}`);
+		const pid = wedgedResult.pid;
+		let alive = false;
+		try {
+			if (pid) process.kill(pid, 0);
+			alive = pid !== undefined;
+		} catch (e) {
+			alive = (e as NodeJS.ErrnoException).code === "EPERM";
+		}
+		assert.ok(!alive, `wedged child ${pid} survived its SIGKILL`);
 	} finally {
 		unlinkSync(helper);
 	}

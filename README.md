@@ -81,7 +81,7 @@ each), making the curves unreadable.
 ### The two directions of the Tokens chart
 
 ```
-┌ Tokens ─ ~58t/s ·92% ⌀87% ◔42% ─┐
+┌ Tokens ─ ~58t/s ◔42% ·92% ⌀87% ─┐
 ```
 
 The readings deliberately avoid duplicating pi's own status bar: in widget modes (chart / line)
@@ -95,8 +95,8 @@ A few details:
   about 516:1), so plotting them on the same axis would flatten downstream to 0.2% of the height.
 - **`~` only appears on the rate** — it's estimated from streaming deltas; the cumulative figures
   come from the provider's exact `usage`, so they carry no `~`. Which number to trust is obvious at a glance.
-- As the block narrows, segments are dropped by importance: rate → instantaneous hit → cumulative
-  hit → context usage → (footer mode: upstream → downstream → cache reads).
+- As the block narrows, segments are dropped by importance: rate → context usage → instantaneous hit → cumulative
+  hit → (footer mode: upstream → downstream → cache reads).
 
 ### Context usage: `◔N%`
 
@@ -442,9 +442,13 @@ widths (the `┌ CPU ─ 1.91 1.80 2.17 ───┐` kind). For example:
    (`legendW <= plotW`) and at least one curve row remains below the box (`legendH < rows`)" —
    the latter avoids the box's bottom border fusing with the plot's 0% baseline into a double line.
 
-3. **Readings are tiered segments**, dropped from the tail as the block narrows. For example,
-   Network's order is `instantaneous rate → cumulative traffic`; on narrow blocks the cumulative
-   figure is dropped first, preserving the more important instantaneous rate.
+3. **Readings are tiered segments**, dropped from the tail as the block narrows — with one
+   refinement over plain segmentation: a run of segments marked `Seg.atomic` (Network's
+   `Σ↓X ↑Y` cumulative unit) is welded into **one keep-or-drop unit**, so download and upload
+   totals always appear together or not at all (a width that fits the `Σ` marker but not its
+   values must show nothing, never a dangling `Σ`). Network's order is `instantaneous rate →
+   cumulative traffic`; on narrow blocks the cumulative figure is dropped first, preserving
+   the more important instantaneous rate.
 
 ## Testing
 

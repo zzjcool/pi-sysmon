@@ -404,8 +404,8 @@ export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
 		]);
 	}
 
-	// Token group: same convention as chart mode's `Tokens` block (current rate +
-	// hit rates + session cumulative).
+	// Token group: same convention as chart mode's `Tokens` block (current rate →
+	// context usage → hit rates → session cumulative).
 	// Emitted **even without a snapshot** — TPS doesn't depend on /proc; it's the
 	// only metric that still means anything on non-Linux.
 	//
@@ -426,20 +426,20 @@ export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
 	// truth — the same numbers the chart draws.
 	const seenCache = tokR > 0;
 	const cumHit = hitRate(tokR, tokIn);
+	// Same order and colors as the chart title bar (user-requested default):
+	// rate → ◔ context usage → · instantaneous hit → ⌀ cumulative hit.
 	const tokSegs: StyledLine = [
 		seg("TOK ", "muted"),
 		seg(`~${fmtTps(tps)}`, "accent"),
 	];
-	// Same order and colors as the chart title bar: instantaneous (`·`, success)
-	// then cumulative (`⌀`, warning — the color of the curve it corresponds to).
-	if (seenCache && opts.hitNow !== undefined && Number.isFinite(opts.hitNow))
-		tokSegs.push(seg(` ·${fmtHitPct(opts.hitNow)}`, "success"));
-	if (seenCache) tokSegs.push(seg(` ⌀${fmtHitPct(cumHit)}`, "warning"));
 	// Context-window usage — same segment, same colors, same position in the
 	// sequence as the chart title bar (see the comment there), so the two modes
 	// stay cross-checkable.
 	const ctx = ctxSeg(opts.ctxPct);
 	if (ctx) tokSegs.push(ctx);
+	if (seenCache && opts.hitNow !== undefined && Number.isFinite(opts.hitNow))
+		tokSegs.push(seg(` ·${fmtHitPct(opts.hitNow)}`, "success"));
+	if (seenCache) tokSegs.push(seg(` ⌀${fmtHitPct(cumHit)}`, "warning"));
 	// Cumulative `↑`/`↓`/`R` — footer mode only (same reasoning as the chart
 	// path: pi's own footer already carries these in widget modes).
 	if (opts.showTokenTotals) {
@@ -689,30 +689,33 @@ if (hasTemp) {
 			// Name matches bottom's border title
 			name: "CPU",
 			color: "success",
-			// Title-bar readouts (descending importance; dropped from the tail on narrow blocks):
-			// current usage → 1/5/15 min load averages (the latter formatted like bottom's `CPU ─ 1.52 1.71 2.26`) → temperature.
-			// The temperature segment carries **two** leading spaces so it visually
-			// separates from the load averages, and drops first when the block is
-			// narrow — a load-average user loses nothing vs before this feature.
+			// Title-bar readouts (descending importance; dropped from the tail on narrow blocks).
+			// Default order (user-requested): current usage → **temperature** → 1/5/15 min
+			// load averages. The temperature is the reading that pairs with this block's
+			// second (red) curve, so it outranks the load averages — on a narrow block the
+			// load segment is dropped first, matching "the chart's own subject matter first"
+			// rule used by every other block (rate before Σ, TPS before the % readouts).
+			// A load-average user on a narrow block loses nothing vs the rate/Σ ordering
+			// philosophy — the tail is always background info.
 			titleInfo: at(
 				snap
 					? [
 							{ text: `${snap.cpuPct.toFixed(0)}%`, color: "success" },
-							{
-								text: `  ${snap.load1.toFixed(2)} ${snap.load5.toFixed(2)} ${snap.load15.toFixed(2)}`,
-								color: "muted",
-							},
 							...(snap.cpuTemp > 0
 								? ([
-										{ text: "  ", color: "muted" },
+										{ text: " ", color: "muted" },
 										{
 											text: `${snap.cpuTemp.toFixed(0)}°`,
 											color: tempColor(snap.cpuTemp),
 										},
 									] as Seg[])
 								: []),
+							{
+								text: `  ${snap.load1.toFixed(2)} ${snap.load5.toFixed(2)} ${snap.load15.toFixed(2)}`,
+								color: "muted",
+							},
 						]
-						: undefined,
+					: undefined,
 			),
 		series: cpuSeries,
 		// The `100°` secondary-scale label (drawn by renderBlock at the plot
@@ -775,20 +778,21 @@ if (hasTemp) {
 							{ text: `↓${fmtRate(snap.rxBps)}`, color: "accent" },
 							{ text: " ", color: "muted" },
 							{ text: `↑${fmtRate(snap.txBps)}`, color: "warning" },
-							// The Σ part is **split into three small segments** instead of one big block.
+							// The Σ part is **one atomic unit**: all its pieces carry `atomic: true`,
+							// so `renderBlock` welds them and keeps-or-drops them **whole**.
 							//
-							// Why: the title bar is "accumulate segment by segment, break when
-							// it doesn't fit", so **segment granularity decides whether partial
-							// display is possible**. The old `  Σ↓79G ↑128G` was one 14-char
-							// segment — all in or all out. After the four-chart rework each
-							// block got narrower (only 38 cols at 150 columns, roomForInfo≈23),
-							// and the whole Σ was dropped (measured: Σ only reappeared at 164
-							// columns, while the three-chart layout managed at 124). Split
-							// apart, 150 columns can keep `Σ↓79G` — the info is no longer
-							// all-or-nothing.
-							{ text: "  Σ", color: "muted" },
-							{ text: `↓${fmtBytes(snap.rxTotal)}`, color: "accent" },
-							{ text: ` ↑${fmtBytes(snap.txTotal)}`, color: "warning" },
+							// Why: the pieces exist only as a set — `Σ↓79G ↑128G` is one reading
+							// with two values. Dropping the pieces one by one produced the measured
+							// "dangling `Σ`" bug: a width that fit the 2-column marker but not the
+							// values showed a lone `Σ` glued to the rates, reading like a rendering
+							// glitch (user report). Atomic = the reading degrades all-or-nothing:
+							// whole `Σ↓130G ↑179G` when it fits, nothing at all when it doesn't.
+							//
+							// It still sits after the rate segments, so the tail-drop order is
+							// unchanged: cumulative traffic yields first, rate survives at any width.
+							{ text: "  Σ", color: "muted", atomic: true },
+							{ text: `↓${fmtBytes(snap.rxTotal)}`, color: "accent", atomic: true },
+							{ text: ` ↑${fmtBytes(snap.txTotal)}`, color: "warning", atomic: true },
 						]
 					: undefined,
 			),
@@ -869,29 +873,29 @@ if (hasTemp) {
 		// the distinction itself is information for the user (which number to trust).
 		const curTxt = `~${fmtTps(cur)}`;
 		// Segmented construction: **descending importance**, since the title bar is
-		// accumulated segment by segment and drops from the tail when it runs out of
-		// room. Order: rate → instantaneous hit → cumulative hit → ↑ → ↓ → R.
-		// The two hit-rate readouts sit **right after the rate** because they're the
-		// subject of the second curve; the cumulative token counters are background
-		// info (already exact in pi's own footer) and yield first.
+		// accumulated unit by unit and drops from the tail when it runs out of
+		// room. Default order (user-requested): rate → context usage →
+		// instantaneous hit → cumulative hit → ↑ → ↓ → R.
+		// `◔N%` (context usage) now sits **right after the rate** — the user's
+		// stated reading order for this block — so the two hit-rate readouts
+		// follow it. On a narrowing block the tail still drops first: the
+		// cumulative `⌀` yields while `◔` and `·` survive, and the `↑/↓/R`
+		// counters (already in pi's own footer) are always the first to go.
 		// Leading spaces live inside each segment, so dropping one never glues its
 		// neighbours together (` ·` + `⌀` vs ` ⌀` stays correct either way).
 		// Note the `↑` segment carries **two** leading spaces (`  ↑`, not ` ↑`):
 		// that's the historical format aligned with pi's own footer, kept as-is,
-		// while `·`/`⌀` take a single space — don't "unify" them.
+		// while `·`/`⌀`/`◔` take a single space — don't "unify" them.
 		const infoSegs: StyledLine = [{ text: curTxt, color: "accent" }];
+		// Context-window usage — `◔` reads as "how full the context window is".
+		// Second slot (user's default): right after the rate, before the hit
+		// rates. Same segment/color source as line mode — one helper, no drift.
+		const ctx = ctxSeg(opts.ctxPct);
+		if (ctx) infoSegs.push(ctx);
 		if (seenCache && opts.hitNow !== undefined && Number.isFinite(opts.hitNow))
 			infoSegs.push({ text: ` ·${fmtHitPct(opts.hitNow)}`, color: "success" });
 		if (seenCache)
 			infoSegs.push({ text: ` ⌀${fmtHitPct(cumHit)}`, color: "warning" });
-		// Context-window usage — `◔` reads as "how full the context window is".
-		// Sits after the hit rates, before the cumulative counters: it's the one
-		// number here the user can't recompute from anywhere else on the chart
-		// (pi's own footer aside), so it outranks the `↑`/`↓`/`R` background info
-		// and yields only to the hit rates, whose second curve lives in this
-		// block. Same segment/color source as line mode — one helper, no drift.
-		const ctx = ctxSeg(opts.ctxPct);
-		if (ctx) infoSegs.push(ctx);
 		// Cumulative `↑`/`↓`/`R` — only in footer mode (showTokenTotals): in
 		// widget modes pi's own footer already shows these exact numbers right
 		// below the panel, and duplicating them was pure noise. They stay last in

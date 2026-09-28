@@ -66,6 +66,23 @@ export type ThemeLike = {
 export interface Seg {
 	text: string;
 	color?: ThemeColor;
+	/**
+	 * Weld this segment to its neighbours into one **atomic unit**: a run of
+	 * consecutive `atomic: true` segments is either drawn whole or dropped
+	 * whole when the title bar runs out of width.
+	 *
+	 * Why it exists: some readings only make sense as a set — Network's
+	 * `Σ↓130G ↑179G` is one reading with two values, and a width that fits the
+	 * `Σ` marker but not its values renders a dangling `Σ` that reads like a
+	 * rendering bug. Marking all the pieces `atomic` makes the drop all-or-
+	 * nothing, while each piece keeps its own color.
+	 *
+	 * Runs are welded by **consecutiveness**: a lone `atomic: true` segment (no
+	 * atomic neighbour) degenerates to a plain segment, and two atomic runs
+	 * separated by a non-atomic segment stay independent units. Callers must
+	 * therefore mark **every** piece of a set.
+	 */
+	atomic?: boolean;
 }
 
 /** A line made of several colored segments (used for floating box content) */
@@ -113,6 +130,10 @@ export interface MetricBlock {
 	 * value) goes first and details (load averages, cumulative traffic) go last.
 	 * Split into segments (rather than one long string) precisely so they can be
 	 * dropped piece by piece, instead of "whole thing doesn't fit → show nothing".
+	 *
+	 * A run of consecutive segments marked `atomic: true` (see `Seg`) is one
+	 * exception: it's welded into a single unit that appears whole or not at
+	 * all — for readings whose parts are meaningless alone.
 	 */
 	titleInfo?: StyledLine;
 	/** Content lines of the floating readout box (border not included); hidden when empty or doesn't fit */
@@ -866,11 +887,20 @@ export function renderBlock(
 		const FIXED_WITH_INFO = 7; // ┌␣ + ␣─␣ + space after info + ┐
 		const roomForInfo = Math.max(0, w - nameW - FIXED_WITH_INFO - 1);
 
-		// Accumulate segment by segment, stop when it doesn't fit — so narrow
-		// blocks at least keep the most important reading
-		const infoCells: Row = [];
+		// Accumulate unit by unit, stop when it doesn't fit — so narrow
+		// blocks at least keep the most important reading.
+		// A "unit" is normally one segment, except that a run of consecutive
+		// `atomic` segments is welded together first: such readings (Network's
+		// `Σ↓X ↑Y`) are meaningless in pieces, so they're kept or dropped whole.
+		const units: StyledLine[] = [];
 		for (const seg of block.titleInfo ?? []) {
-			const cells = segsToRow([seg]);
+			const prev = units.at(-1);
+			if (seg.atomic && prev?.at(-1)?.atomic) prev.push(seg);
+			else units.push([seg]);
+		}
+		const infoCells: Row = [];
+		for (const unit of units) {
+			const cells = segsToRow(unit);
 			if (infoCells.length + cells.length > roomForInfo) break;
 			infoCells.push(...cells);
 		}

@@ -735,3 +735,143 @@ test("context usage: chart title shows ◔N% from getContextUsage(), degraded on
 		after.dispose();
 	}
 });
+
+/* ------------------------------------------------------------------ */
+/* Repaint memoization — the render() cache contract                  */
+/* ------------------------------------------------------------------ */
+
+test("memoization: repeated render with unchanged data returns equal rows (fresh array, shared strings)", async () => {
+	const h = await loadExtension();
+	await h.sessionStart();
+	const comp = h.mount("regular");
+	try {
+		const a = comp.render(100);
+		const b = comp.render(100);
+		// Same content, but a different array object: pi owns/truncates the
+		// returned array, so the cache must never hand out its own reference.
+		assert.deepEqual(b, a);
+		assert.notEqual(b, a);
+		// Caller-side mutation must not poison the cached copy.
+		b.push("POISON");
+		b[0] = "POISON";
+		const c = comp.render(100);
+		assert.deepEqual(c, a);
+	} finally {
+		comp.dispose();
+	}
+});
+
+test("memoization: width change recomputes — no stale wide rows (width iron rule)", async () => {
+	const h = await loadExtension();
+	await h.sessionStart();
+	const comp = h.mount("regular");
+	try {
+		comp.render(120); // seed the cache at a wide layout
+		const narrow = comp.render(60);
+		assert.ok(narrow.length > 0);
+		for (const l of narrow) {
+			assert.ok(
+				visibleWidth(l) <= 60,
+				`stale wide row survived a resize: ${JSON.stringify(l)}`,
+			);
+		}
+	} finally {
+		comp.dispose();
+	}
+});
+
+test("memoization: fullscreen flip recomputes (chip row appears, chipRect fresh)", async () => {
+	const h = await loadExtension();
+	await h.sessionStart();
+	const tui = h.makeTui("regular"); // start in regular mode
+	const comp = h.instantiate(h.lastWidget(), tui);
+	try {
+		const reg = comp.render(100);
+		tui.mode = "fullscreen"; // flip AFTER the regular render
+		const fs = comp.render(100);
+		// The chip row exists only in the fullscreen render — the fs rows are
+		// NOT the cached regular rows.
+		assert.ok(fs.length > reg.length, "fullscreen must add the chip row");
+		assert.ok(
+			stripAnsi(fs.at(-1) ?? "").includes("[line]"),
+			"chip row missing in fullscreen render",
+		);
+		assert.ok(
+			!reg.some((l: string) => l.includes("[line]")),
+			"regular rows leaked a chip",
+		);
+		// Round-trip back to regular: content identical to the first render.
+		tui.mode = "regular";
+		const back = comp.render(100);
+		assert.deepEqual(back, reg);
+	} finally {
+		comp.dispose();
+	}
+});
+
+test("memoization: a message_end invalidates the cache (token readouts refresh)", async () => {
+	// The cache key is (dataVersion, width, fs); dataVersion is bumped by
+	// sample() AND addUsage() (message_end). This test pins the second path:
+	// a cached render MUST NOT survive a message_end that changes the token
+	// totals — the stale-cache bug would freeze the `↑/↓/R` readouts until the
+	// next 1s sample, invisible in tests that only render once.
+	//
+	// Built on a private mini-harness (loadExtension doesn't expose the event
+	// handlers) — same stubbed-api pattern, but `on()` is captured so
+	// message_end can be fired explicitly.
+	const events = new Map<string, AnyFn[]>();
+	const ui: string[] = [];
+	let widget: unknown;
+	const factory = (await import("../src/index.ts")).default;
+	factory({
+		registerFlag: () => {},
+		registerCommand: () => {},
+		on: (n: string, h: AnyFn) => events.set(n, [...(events.get(n) ?? []), h]),
+		getFlag: () => false,
+		appendEntry: () => {},
+	} as any);
+	const ctx = {
+		hasUI: true,
+		ui: {
+			notify: (m: string) => ui.push(m),
+			setWidget: (_k: string, w?: unknown) => {
+				widget = w;
+			},
+			setFooter: () => {},
+			setStatus: () => {},
+		},
+		sessionManager: { getEntries: () => [] },
+	} as any;
+	process.env.PI_SYSMON_TEST_HAS_MACMON ??= "0"; // don't spawn macmon here
+	await events.get("session_start")![0]!({}, ctx);
+	const comp = widget as AnyFn;
+	assert.ok(comp, "widget must be mounted");
+	const tui = { requestRender: () => {}, mode: "regular" };
+	const theme = { fg: (_c: string, s: string) => s };
+	const c = comp(tui, theme);
+	try {
+		// First render establishes the cache with zero token totals.
+		const a = c.render(160);
+		// Fire a message_end carrying a real usage payload (assistant role —
+		// user messages are skipped by design).
+		await events.get("message_end")![0]!(
+			{ message: { role: "assistant", usage: { input: 5000, output: 1234, cacheRead: 640 } } },
+			ctx,
+		);
+		const b = c.render(160);
+		// The cache must have been invalidated: the Tokens title readouts now
+		// carry the fresh cumulative numbers. (The cache being stale would
+		// return `a` byte-for-byte — deepEqual would pass and the assertion
+		// below would fail on the unchanged readout.)
+		const titleA = stripAnsi((a as string[]).find((l) => l.includes("Tokens")) ?? "");
+		const titleB = stripAnsi((b as string[]).find((l) => l.includes("Tokens")) ?? "");
+		// Widget mode doesn't show the ↑/↓ totals (pi's own footer has them), but
+		// the cache-hit `⌀N%` readout appears as soon as a cacheRead lands —
+		// that's the visible diff a stale cache would freeze.
+		assert.ok(titleB.includes("⌀"), `title after message_end must show the cumulative hit readout: ${JSON.stringify(titleB)}`);
+		assert.ok(!titleA.includes("⌀"), `title before message_end must not show a hit readout: ${JSON.stringify(titleA)}`);
+		assert.notEqual(titleB, titleA, "message_end must invalidate the render cache");
+	} finally {
+		(c as { dispose(): void }).dispose();
+	}
+});

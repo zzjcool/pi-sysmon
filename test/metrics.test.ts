@@ -14,8 +14,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
-import { fsyncSync, openSync, closeSync, unlinkSync, writeSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { fsyncSync, openSync, closeSync, unlinkSync, writeSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,10 @@ import {
 	parseVmStat,
 	preflightMetrics,
 	readCpuTempLinux,
+	readNetDarwin,
+	resetNetstatForTest,
+	safeRate,
+	setNetstatCommandForTest,
 	stopCpuTempDarwin,
 	vmStatUsedBytes,
 } from "../src/metrics.ts";
@@ -476,8 +480,12 @@ exec sleep 300
 
 test("execText: SIGTERM-ignoring wedged child returns null within the timeout (SIGKILL, not SIGTERM)", { skip: !WEDGED_HELPER, timeout: 15_000 }, async () => {
 	const helper = join(tmpdir(), `pi-sysmon-wedged-${process.pid}.sh`);
-	writeSync(openSync(helper, "w", 0o755), WEDGED_HELPER);
+	// writeFileSync (not writeSync+openSync): the fd must be closed before the
+	// spawn below — Linux refuses to execute a file with an open write fd
+	// (ETXTBSY); macOS allows it, so the old form only broke in the ubuntu CI.
+	writeFileSync(helper, WEDGED_HELPER, { mode: 0o755 });
 	try {
+		// The public contract under test — same options as execText's own call:
 		const t0 = performance.now();
 		const out = execText(helper, [], 1200);
 		const ms = performance.now() - t0;
@@ -487,17 +495,30 @@ test("execText: SIGTERM-ignoring wedged child returns null within the timeout (S
 		// SIGTERM regression this test would otherwise hang the whole suite.)
 		assert.equal(out, null, "wedged child must degrade to null");
 		assert.ok(ms < 4000, `wedged child took ${ms.toFixed(0)}ms — hard kill failed`);
-		// And no leaked process survives into later samples. The fixture uses
-		// `exec sleep` (no grandchild), so this check covers the whole tree.
+		// And no leaked process survives into later samples: run the SAME wedged
+		// child again but keep the spawnSync result, whose `pid` lets the leak
+		// probe ask the kernel directly (signal 0; ESRCH = reaped) — NOT
+		// `pgrep -f`: on Ubuntu 24.04 / procps 5.x the pgrep checker matches its
+		// own wrapper shell (phantom leak on a clean tree), and after
+		// `exec sleep 300` the child's cmdline no longer contains the script
+		// path (real leaks invisible). Both were the pre-existing red CI v0.8.1.
+		// The fixture uses `exec sleep` (no grandchild): the pid IS the tree.
+		const wedgedResult = spawnSync(helper, [], {
+			encoding: "utf8",
+			timeout: 1200,
+			killSignal: "SIGKILL",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 		await sleep(300);
-		const leftover = spawn("sh", [
-			"-c",
-			`pgrep -f ${JSON.stringify(helper)} || true`,
-		]).stdout;
-		let leftoverOut = "";
-		leftover.on("data", (d: Buffer) => (leftoverOut += d));
-		await new Promise((r) => leftover.on("close", r));
-		assert.equal(leftoverOut.trim(), "", `wedged child leaked: ${leftoverOut}`);
+		const pid = wedgedResult.pid;
+		let alive = false;
+		try {
+			if (pid) process.kill(pid, 0);
+			alive = pid !== undefined;
+		} catch (e) {
+			alive = (e as NodeJS.ErrnoException).code === "EPERM";
+		}
+		assert.ok(!alive, `wedged child ${pid} survived its SIGKILL`);
 	} finally {
 		unlinkSync(helper);
 	}
@@ -634,4 +655,303 @@ test("darwin: a collector's cpuTemp comes from the resident macmon child", {
 	// teardown: the session-shutdown path must kill the child — a leaked
 	// macmon would keep streaming forever after the process is "done".
 	stopCpuTempDarwin();
+});
+
+/* ------------------------------------------------------------------ */
+/* 7. safeRate — first-real-counter spike guard (nan0 incident)         */
+/* ------------------------------------------------------------------ */
+
+test("safeRate: a 0 baseline (first reading landing) records 0, never a whole-boot-traffic spike", () => {
+	// The exact nan0 shape: netstat returns nothing for a few ticks (0,0), then
+	// the first cumulative reading lands (GBs since boot). Naive (cur-0)/dt
+	// produced ~162GB/s; the contract now is a flat 0 for that landing tick.
+	assert.equal(safeRate(0, 51_277_090_577, 1), 0);
+	assert.equal(safeRate(0, 1e12, 0.25), 0);
+	// Both counters independently: tx still computes while rx's baseline is 0.
+	assert.equal(safeRate(16_701_331_635, 16_701_331_635 + 2_500, 1), 2_500);
+});
+
+test("safeRate: normal rates, counter resets, and degenerate dt behave as before", () => {
+	// Ordinary differential (2500B over 0.25s → 10kB/s).
+	assert.equal(safeRate(1_000, 3_500, 0.25), 10_000);
+	// Counter reset (interface reconfig / disk eject): clamped at 0, not negative.
+	assert.equal(safeRate(9_000, 1_000, 1), 0);
+	// dt must not be trusted to be > 0 (guards div-by-zero, same as the old Math.max).
+	assert.equal(safeRate(1_000, 2_000, 0), 0);
+	assert.ok(Number.isFinite(safeRate(1_000, 2_000, 1)));
+});
+
+test("createCollector: on darwin the first collect()s report 0 net rate while the async netstat ramps up", {
+	skip: !isDarwin,
+}, async () => {
+	// End-to-end pin of the two fixes working together: the async sampler means
+	// the first collect() has net baseline {0,0}, and the first real reading
+	// landing must NOT become a one-tick spike. Before both fixes this exact
+	// sequence rendered a ~162GB/s phantom in the chart.
+	stopCpuTempDarwin();
+	resetNetstatForTest();
+	setNetstatCommandForTest(); // the REAL netstat (macOS only test)
+	try {
+		const c = createCollector();
+		const t0 = performance.now();
+		c.collect(); // starts the async child, returns {0,0} for net
+		const firstMs = performance.now() - t0;
+		// The whole point of the fix: a wedged/slow netstat must never block the
+		// sampler. 200ms is generous (healthy: ~10ms; pre-fix nan0: 5003ms).
+		assert.ok(firstMs < 200, `first collect blocked ${firstMs}ms`);
+		let spikeSeen = false;
+		let landed = false;
+		for (let i = 0; i < 30; i++) {
+			await sleep(250);
+			const s = c.collect();
+			if (s.rxTotal > 0) landed = true;
+			// Any plausible home-network rate is < 10GB/s; the pre-fix phantom
+			// was ~162GB/s. This trips only on the bug it pins.
+			if (s.rxBps > 10e9 || s.txBps > 10e9) spikeSeen = true;
+		}
+		assert.ok(landed, "the real netstat reading never landed within 7.5s");
+		assert.ok(!spikeSeen, "a first-tick rate spike leaked through safeRate");
+	} finally {
+		stopCpuTempDarwin();
+		setNetstatCommandForTest();
+	}
+});
+
+/* ------------------------------------------------------------------ */
+/* 8. readNetDarwin — async sampler: busy-gating, no-blocking, SIGKILL   */
+/*    ceiling, good-output-only updates (all via the command seam, so    */
+/*    these contracts run on Linux CI too)                               */
+/* ------------------------------------------------------------------ */
+
+/** Write an executable helper script to the tmpdir and return its path.
+ *  `writeFileSync` (not writeSync+openSync): the fd must be CLOSED before
+ *  the script is spawned — on Linux, executing a file whose write fd is still
+ *  open fails with ETXTBSY (macOS allows it, so this only showed up in CI). */
+function shHelper(body: string): string {
+	const p = join(
+		tmpdir(),
+		`pi-sysmon-net-${process.pid}-${Math.random().toString(36).slice(2)}.sh`,
+	);
+	writeFileSync(p, body, { mode: 0o755 });
+	return p;
+}
+
+test("readNetDarwin: never blocks while a wedged netstat holds the slot, then recovers", async () => {
+	// Stand-in for the nan0-wedged netstat: prints nothing, sleeps, ignores
+	// TERM. The sampler must keep returning instantly the whole time.
+	const wedged = shHelper(`#!/bin/sh
+trap '' TERM
+exec sleep 300
+`);
+	try {
+		stopCpuTempDarwin();
+		resetNetstatForTest();
+		setNetstatCommandForTest({ file: wedged, args: [], timeoutMs: 1_000 });
+		const t0 = performance.now();
+		const r0 = readNetDarwin(); // kicks off the wedged child
+		const ms0 = performance.now() - t0;
+		assert.deepEqual(r0, { rx: 0, tx: 0 }, "no reading yet");
+		assert.ok(ms0 < 100, `first call took ${ms0}ms (must not block)`);
+		// 15 collect()-paced calls while the child is wedged: every one must
+		// return instantly (the pre-fix spawnSync blocked 5003ms here), and none
+		// may spawn a second child (busy gate).
+		for (let i = 0; i < 15; i++) {
+			const t = performance.now();
+			readNetDarwin();
+			const ms = performance.now() - t;
+			assert.ok(ms < 100, `call ${i} blocked ${ms}ms`);
+			await sleep(100);
+		}
+		// …and a wedged child must die at its SIGKILL ceiling and release the
+		// slot for the next good reading (here: a fast fixture echo).
+		await sleep(1_500); // past the 1s SIGKILL ceiling + close-event drain
+		const good = goodHelper();
+		setNetstatCommandForTest({ file: good, args: [] });
+		readNetDarwin();
+		await waitFor(() => readNetDarwin().rx === FIXTURE_RX, 5_000, "good fixture reading to land");
+		const r2 = readNetDarwin();
+		// Sum of the fixture's counted interfaces (en0 + awdl0 + utun1).
+		assert.equal(r2.rx, FIXTURE_RX, "good fixture reading did not land");
+		assert.equal(r2.tx, FIXTURE_TX, "good fixture reading did not land");
+	} finally {
+		stopCpuTempDarwin();
+		setNetstatCommandForTest();
+		unlinkSync(wedged);
+	}
+});
+
+/** `netstat -ib` fixture printer: byte-accurate sample output, used by the
+ *  seam tests below via setNetstatCommandForTest. */
+/** Poll until cond() is true (bounded by `budgetMs`, checked every 50ms).
+ *  Plain `sleep(N)` is not enough on machines with slow process creation
+ *  (measured here: endpoint-security software delays child start by ~450ms),
+ *  and an under-waited assertion then fails for environmental reasons — the
+ *  exact flakiness this helper exists to prevent. */
+async function waitFor(cond: () => boolean, budgetMs = 5_000, what = "condition"): Promise<void> {
+	for (let waited = 0; waited < budgetMs; waited += 50) {
+		if (cond()) return;
+		await sleep(50);
+	}
+	assert.ok(false, `${what} did not happen within ${budgetMs}ms`);
+}
+
+/** rx/tx the fixture sums to (en0 + awdl0 + utun1): rx 51277090577 + 627369265
+ *  + 0, tx 16701331635 + 107570014 + 29703870. */
+const FIXTURE_RX = 51_904_459_842;
+const FIXTURE_TX = 16_838_605_519;
+
+const goodHelper = () =>
+	shHelper(`#!/bin/sh
+cat <<'EOF'
+${NETSTAT_IB}
+EOF
+`);
+
+/** A stand-in that appends one line to a counter file after a short delay:
+ *  "in flight" is guaranteed for back-to-back calls, and the file's line
+ *  count is the exact spawn count. */
+const slowCounterHelper = (counterPath: string) =>
+	shHelper(`#!/bin/sh
+sleep 0.3
+printf 'en9 1500 <Link#9> aa:bb:cc:dd:ee:ff 1 0 1 1 0 1 0\n' >> "${counterPath}"
+`);
+
+test("readNetDarwin: busy gate — exactly one child per sample, back-to-back calls spawn nothing extra", async () => {
+	// Three calls land inside the first child's ~300ms flight window: calls 2
+	// and 3 must be spawn no-ops (busy gate). After it completes, exactly one
+	// more spawn may run — 2 lines in the counter file, not 4.
+	const counterPath = join(tmpdir(), `pi-sysmon-net-counter-${process.pid}`);
+	const slowCounter = slowCounterHelper(counterPath);
+	try {
+		stopCpuTempDarwin();
+		resetNetstatForTest();
+		setNetstatCommandForTest({ file: slowCounter, args: [] });
+		readNetDarwin(); // spawn #1, in flight for ~300ms
+		readNetDarwin(); // must be a no-op: busy
+		readNetDarwin(); // must be a no-op: busy
+		// Wait for spawn #1 to complete (the counter line IS its completion
+		// signal — slow process creation can delay the child, so poll).
+		await waitFor(
+			() => existsSync(counterPath),
+			5_000,
+			"first counter spawn to complete",
+		);
+		// Retry the next call until spawn #2 lands: between the counter line
+		// appearing and the child's close event draining, the slot is still
+		// legitimately busy and the call is a no-op — retrying is exactly the
+		// production cadence (one call per tick). The final line count is the
+		// assertion: 2 lines = zero extra spawns during the busy window.
+		const lineCount = () =>
+			existsSync(counterPath)
+				? readFileSync(counterPath, "utf8").trim().split("\n").length
+				: 0;
+		await waitFor(() => {
+			readNetDarwin(); // spawn #2 once the slot is free (no-op while busy)
+			return lineCount() >= 2;
+		}, 5_000, "second counter spawn to complete");
+		const lines = readFileSync(counterPath, "utf8").trim().split("\n");
+		assert.equal(lines.length, 2, `busy gate failed: ${lines.length} spawns`);
+	} finally {
+		stopCpuTempDarwin();
+		setNetstatCommandForTest();
+		unlinkSync(slowCounter);
+		try {
+			unlinkSync(counterPath);
+		} catch {
+			/* already gone */
+		}
+	}
+});
+
+test("readNetDarwin: a wedged child's empty output does not zero the last good reading", async () => {
+	// Sequence: good reading lands → wedged child times out at its ceiling →
+	// the cached counters must survive (killed netstat stdout is empty, and an
+	// empty parse would zero them — exactly the "update only when plausible"
+	// contract).
+	const good = goodHelper();
+	const wedged = shHelper(`#!/bin/sh
+trap '' TERM
+exec sleep 300
+`);
+	try {
+		stopCpuTempDarwin();
+		resetNetstatForTest();
+		setNetstatCommandForTest({ file: good, args: [] });
+		readNetDarwin();
+		await waitFor(() => readNetDarwin().rx === FIXTURE_RX, 5_000, "fixture to land");
+		// Now wedge the slot with a child that dies at its 700ms SIGKILL ceiling
+		// having printed nothing.
+		setNetstatCommandForTest({ file: wedged, args: [], timeoutMs: 700 });
+		readNetDarwin();
+		await sleep(1_000); // past the 700ms ceiling + close-event drain
+		const r2 = readNetDarwin();
+		assert.equal(r2.rx, FIXTURE_RX, "empty output zeroed the last good reading");
+		assert.equal(r2.tx, FIXTURE_TX, "empty output zeroed the last good reading");
+	} finally {
+		stopCpuTempDarwin();
+		setNetstatCommandForTest();
+		unlinkSync(good);
+		unlinkSync(wedged);
+	}
+});
+
+test("readNetDarwin: a missing command degrades to the last reading without wedging the slot", async () => {
+	// ENOENT: spawn emits error+close; finish must release the busy slot (a
+	// stuck-busy sampler would never read netstat again) and keep old values.
+	const good = goodHelper();
+	try {
+		stopCpuTempDarwin();
+		resetNetstatForTest();
+		setNetstatCommandForTest({ file: good, args: [] });
+		readNetDarwin();
+		await waitFor(() => readNetDarwin().rx === FIXTURE_RX, 5_000, "fixture to land");
+		setNetstatCommandForTest({
+			file: "pi-sysmon-no-such-netstat-xyz",
+			args: [],
+		});
+		readNetDarwin(); // ENOENT child
+		await sleep(300); // error+close both drained
+		// The slot must be free again — proven by a good reading landing after it.
+		setNetstatCommandForTest({ file: good, args: [] });
+		const r = readNetDarwin();
+		assert.equal(r.rx, FIXTURE_RX, "ENOENT zeroed/cleared the last reading");
+		await waitFor(() => readNetDarwin().rx === FIXTURE_RX, 5_000, "post-ENOENT respawn to land");
+		const r2 = readNetDarwin();
+		assert.ok(r2.rx > 0, "slot stayed busy after ENOENT (sampler wedged)");
+	} finally {
+		stopCpuTempDarwin();
+		setNetstatCommandForTest();
+		unlinkSync(good);
+	}
+});
+
+test("readNetDarwin: stopCpuTempDarwin reaps an in-flight netstat child and the slot is reusable immediately", async () => {
+	// The shutdown path: TERM (ignored by the wedged fixture) → SIGKILL 500ms
+	// later → slot free. And the respawn after stop must not be eaten by the
+	// dead child's late close event (the child-identity guard).
+	const wedged = shHelper(`#!/bin/sh
+trap '' TERM
+exec sleep 300
+`);
+	const good = goodHelper();
+	try {
+		stopCpuTempDarwin();
+		resetNetstatForTest();
+		setNetstatCommandForTest({ file: wedged, args: [] });
+		readNetDarwin(); // wedged child in flight
+		stopCpuTempDarwin(); // shutdown: TERM + (500ms later) SIGKILL
+		// Immediate respawn with the good fixture: must land, proving both that
+		// the slot was released synchronously and that the wedged child's late
+		// finish didn't eat it.
+		setNetstatCommandForTest({ file: good, args: [] });
+		readNetDarwin();
+		await waitFor(() => readNetDarwin().rx === FIXTURE_RX, 5_000, "post-stop respawn to land");
+		const r = readNetDarwin();
+		assert.equal(r.rx, FIXTURE_RX, "slot not reusable after stop");
+	} finally {
+		stopCpuTempDarwin();
+		setNetstatCommandForTest();
+		unlinkSync(wedged);
+		unlinkSync(good);
+	}
 });

@@ -19,6 +19,17 @@
  *          `Bytes (Read)`/`Bytes (Write)` counters *and* the read/write split
  *          that iostat's MB/s column lacks, at ~20ms per call. This is what
  *          keeps collect()'s counter+differential logic untouched.
+ *
+ * Why macOS does not run `netstat` synchronously either (2026-09-28 nan0
+ * incident): Tencent YunDun/iOA's network extension `NGNAppProxyExtension`
+ * creates a virtual interface `nan0` that wedges any `netstat` touching it
+ * (measured: `netstat -ib` 5.06s, `netstat -I nan0 -b` 5.03s, all other
+ * interfaces ≤15ms). A `spawnSync` in the 1s sampler therefore blocked the
+ * JS thread 5003ms (until SIGKILL, stdout empty) once per tick — pi's TUI
+ * hung ~5s out of every ~6s. `netstat -ib` is instead a **resident
+ * asynchronous** child (see readNetDarwin): collect() only kicks off a spawn
+ * and returns the last completed reading; disk `ioreg` is genuinely fast
+ * (~20ms, synchronous is fine).
  * `parseIostat` stays implemented (and tested): it is the CPU fallback should
  * os.cpus() ever be unusable, and its tested agreement with os.cpus() is the
  * executable evidence for the architecture decision above.
@@ -36,6 +47,10 @@ const IS_DARWIN = process.platform === "darwin";
 const IS_LINUX = process.platform === "linux";
 /** Every child process is bounded: a wedged command must not hang the collector. */
 const EXEC_TIMEOUT_MS = 5000;
+/** Hard ceiling for the async `netstat -ib` child. Generously above a healthy
+ *  netstat (~15ms) but bounded: a wedged nan0-style read must not pin a slot
+ *  forever (and the SIGKILL means a wedged child can't outlive the session). */
+const NETSTAT_TIMEOUT_MS = 15_000;
 
 /** Run a command and return stdout as text; null when it is missing/fails/times out.
  *
@@ -457,9 +472,10 @@ function readCpuTempDarwin(): number {
 	return 0;
 }
 
-/** Kill the resident macmon child. Called on `session_shutdown` so the
- *  streaming process never outlives the session (pi exits, the child would
- *  otherwise be reparented and keep running). */
+/** Kill the resident macmon child (and the netstat sampler's in-flight
+ *  child). Called on `session_shutdown` so a spawned process never outlives
+ *  the session (pi exits, the child would otherwise be reparented and keep
+ *  running). */
 export function stopCpuTempDarwin(): void {
 	// TERM first (lets macmon flush/exit cleanly), then a detached KILL follow-up:
 	// a macmon build that traps TERM must not outlive the session as an orphan.
@@ -470,6 +486,16 @@ export function stopCpuTempDarwin(): void {
 	macmonChild = undefined;
 	macmonTemp = 0;
 	macmonBuf = "";
+	// The netstat sampler's in-flight child gets the identical escalation — its
+	// own 15s SIGKILL ceiling is unref'd, but a shutdown must not wait even that
+	// long. The busy slot is released here directly; the dying child's finish
+	// handler is child-identity-guarded (see readNetDarwin), so it can never
+	// clobber the slot of a newer child spawned after this call.
+	const net = netstatChild;
+	net?.kill();
+	if (net) setTimeout(() => net.kill("SIGKILL"), 500).unref();
+	netstatChild = undefined;
+	netstatBusy = false;
 }
 
 /**
@@ -845,10 +871,125 @@ function readMemDarwin(): { used: number; total: number } {
 	return { used: vmStatUsedBytes(vm, vm.pageSize, total), total };
 }
 
-function readNetDarwin(): { rx: number; tx: number } {
-	const txt = execText("netstat", ["-ib"]);
-	if (txt === null) return { rx: 0, tx: 0 };
-	return parseNetstatIb(txt);
+/** In-flight state for the asynchronous `netstat -ib` sample (see the file
+ *  header for why netstat may never run synchronously). One child at a time:
+ *  `netstatBusy` is the re-entrancy gate — collect() runs every 1s, and a
+ *  wedged read holds the slot until its SIGKILL ceiling instead of piling up
+ *  children. `netLastRx/Tx` hold the most recent COMPLETED reading. */
+let netstatChild: ChildProcessByStdio<null, Readable, Readable> | undefined;
+let netstatBusy = false;
+let netLastRx = 0;
+let netLastTx = 0;
+
+/** Stand-in command for tests of the netstat sampler (see
+ *  setNetstatCommandForTest). Production always runs the real `netstat -ib`. */
+export interface NetstatCommandForTest {
+	file: string;
+	args: string[];
+	/** Test-only override of the 15s hard-kill ceiling, so the SIGKILL
+	 *  contract can be pinned in well under 15s. */
+	timeoutMs?: number;
+}
+let netstatCmdOverride: NetstatCommandForTest | undefined;
+
+/** Test seam: point the netstat sampler at a stand-in command — a script that
+ *  prints a `netstat -ib` fixture (reading-lands contract), a counter+sleeper
+ *  (busy-gating contract), or a TERM-ignoring wedged helper (SIGKILL-ceiling
+ *  contract). No argument restores the real `netstat -ib`. Pure state swap:
+ *  never spawns anything itself; pair with stopCpuTempDarwin() to reset any
+ *  in-flight sample. */
+export function setNetstatCommandForTest(cmd?: NetstatCommandForTest): void {
+	netstatCmdOverride = cmd;
+}
+
+/** Test seam: reset the cached last reading to {0,0}. The sampler's module
+ *  state is shared process-wide, so without this a live-smoke test that ran
+ *  first (real netstat, real counters) would leak its reading into every
+ *  seam test's "fresh start" assertions. Production never calls this. */
+export function resetNetstatForTest(): void {
+	netLastRx = 0;
+	netLastTx = 0;
+}
+
+/** darwin network counters — asynchronous, never blocking.
+ *
+ * Kicks off one `netstat -ib` child when the slot is free and immediately
+ * returns the last COMPLETED reading ({0,0} before the first one lands).
+ * The counters are cumulative since boot, so one tick of staleness is
+ * harmless — unlike a blocked JS thread, which is the whole bug (see the file
+ * header: a wedged 5s netstat used to freeze the TUI ~5s out of every ~6s).
+ * Exported so the async contracts can be tested on any platform via the
+ * command seam above. */
+export function readNetDarwin(): { rx: number; tx: number } {
+	const override = netstatCmdOverride;
+	const file = override?.file ?? "netstat";
+	const args = override?.args ?? ["-ib"];
+	const timeoutMs = override?.timeoutMs ?? NETSTAT_TIMEOUT_MS;
+	if (!netstatBusy) {
+		netstatBusy = true;
+		const startChild = (): ChildProcessByStdio<null, Readable, Readable> => {
+			try {
+				return spawn(file, args, {
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+			} catch (e) {
+				// Linux can transiently refuse a just-written executable with
+				// ETXTBSY (the writer's fd is technically still open). One immediate
+				// retry resolves it; anything else (ENOENT etc.) is a real error.
+				if ((e as NodeJS.ErrnoException)?.code !== "ETXTBSY") throw e;
+				return spawn(file, args, { stdio: ["ignore", "pipe", "pipe"] });
+			}
+		};
+		try {
+			const child = startChild();
+			netstatChild = child;
+			// Per-child buffer: a stopped child's late data events must not
+			// pollute the next child's sample.
+			let stdout = "";
+			child.stdout.setEncoding("utf8");
+			child.stdout.on("data", (chunk: string) => {
+				stdout += chunk;
+			});
+			// Hard ceiling, the same lesson as execText: a netstat wedged on a
+			// hostile virtual interface may never see (or may trap) TERM — only
+			// SIGKILL is guaranteed. unref'd so a stuck child cannot keep the
+			// session alive either.
+			const killTimer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+			killTimer.unref();
+			let finished = false;
+			// Both `error` (a failed spawn emits error AND close) and `close` drain
+			// here. Idempotence via `finished`; the child-identity check keeps a
+			// stale finish from touching state a NEWER child now owns (a
+			// stopCpuTempDarwin() followed by an immediate respawn): the old
+			// child's partial output can't clobber netLast* and its finish can't
+			// release the new child's busy slot.
+			const finish = () => {
+				if (finished) return;
+				finished = true;
+				clearTimeout(killTimer);
+				if (netstatChild === child) {
+					netstatChild = undefined;
+					netstatBusy = false;
+				const { rx, tx } = parseNetstatIb(stdout);
+				// Update only on a plausible reading: a killed/timed-out child
+				// leaves stdout empty or partial, and writing that would zero or
+				// under-count the last good cumulative counters.
+					if (rx > 0 || tx > 0) {
+					netLastRx = rx;
+						netLastTx = tx;
+					}
+				}
+			};
+			child.on("error", finish);
+			child.on("close", finish);
+		} catch {
+			// spawn threw synchronously (rare): release the slot and degrade to
+			// the last reading — the same contract as every other missing tool.
+			netstatChild = undefined;
+			netstatBusy = false;
+		}
+	}
+	return { rx: netLastRx, tx: netLastTx };
 }
 
 function readDiskDarwin(): { read: number; write: number } {
@@ -863,6 +1004,23 @@ function readDiskDarwin(): { read: number; write: number } {
 	]);
 	if (txt === null) return { read: 0, write: 0 };
 	return parseIoreg(txt);
+}
+
+/**
+ * Rate between two cumulative counter samples, spike-guarded.
+ *
+ * When the previous baseline is 0 — on darwin that is every tick before the
+ * async netstat child's first reading lands (see readNetDarwin) — the naive
+ * `(cur - 0) / dt` would report the machine's *entire boot-time traffic* as
+ * one tick's rate (measured phantom from the nan0 incident: ~162GB/s).
+ * Counters only ever cross 0 once, so recording 0 for the landing tick is
+ * honest, and the caller's baseline update makes the very next tick normal.
+ * The Math.max clamp keeps counter resets (interface reconfig, disk eject)
+ * at 0 instead of negative.
+ */
+export function safeRate(prev: number, cur: number, dt: number): number {
+	if (prev <= 0 || dt <= 0) return 0;
+	return Math.max(0, (cur - prev) / dt);
 }
 
 export function createCollector(): Collector {
@@ -890,10 +1048,13 @@ export function createCollector(): Collector {
 
 		const net = readNet();
 		const disk = readDisk();
-		const rxBps = Math.max(0, (net.rx - lastNet.rx) / dt);
-		const txBps = Math.max(0, (net.tx - lastNet.tx) / dt);
-		const readBps = Math.max(0, (disk.read - lastDisk.read) / dt);
-		const writeBps = Math.max(0, (disk.write - lastDisk.write) / dt);
+		// safeRate: a 0 baseline (the async netstat reading not landed yet, or a
+		// source unreadable at startup) must not turn the first real counter
+		// into a one-tick whole-boot-traffic spike.
+		const rxBps = safeRate(lastNet.rx, net.rx, dt);
+		const txBps = safeRate(lastNet.tx, net.tx, dt);
+		const readBps = safeRate(lastDisk.read, disk.read, dt);
+		const writeBps = safeRate(lastDisk.write, disk.write, dt);
 
 		const { used, total } = readMem();
 		const cpuTemp = IS_DARWIN ? readCpuTempDarwin() : readCpuTempLinux();

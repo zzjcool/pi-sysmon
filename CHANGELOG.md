@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> Merges with [0.8.2]'s netstat fix below: this branch generalizes that
+> netstat-only async sampler to all four darwin externals (netstat / ioreg /
+> vm_stat / sysctl) on one shared `fireText` primitive, keeping 0.8.2's test
+> seams, plausible-output guard and shutdown reaping — `readNetDarwin()`, the
+> `safeRate` spike guard and all of its seam tests survive on the new layer.
+
 ### Changed
 
 - **Chart mode no longer blocks the main thread on every sample (macOS) — the biggest
@@ -71,6 +77,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single GC pauses.
 - Top-level `after()` teardown in metrics tests kills the resident macmon child, so
   name-filtered runs (`--test-name-pattern`) no longer hang forever.
+
+## [0.8.2] — 2026-09-29
+
+### Fixed
+
+- **pi's TUI froze ~5 seconds out of every ~6 on macOS machines running Tencent
+  YunDun/iOA (腾讯云盾).** The security suite's network extension
+  (`NGNAppProxyExtension`) creates a virtual interface (`nan0`) that wedges any
+  `netstat` touching it — measured on the affected host: `netstat -ib` took
+  **5.06s** (a single `netstat -I nan0 -b` took 5.03s; every other interface
+  answered in ≤15ms). The collector ran exactly that command **synchronously
+  (`spawnSync`) on the JS thread every 1-second sample**, so the sampler blocked
+  **5003ms** until the 5s timeout SIGKILLed it — with stdout empty, so the data
+  wasn't even collected. Result: a frozen TUI ~5s out of every ~6s, plus a
+  ~162GB/s phantom network spike on the first tick the counters finally landed.
+  The fix makes the macOS network source **asynchronous**: `readNetDarwin()` now
+  kicks off a resident `spawn(netstat -ib)` child and immediately returns the
+  last completed reading (cumulative counters, so one tick of staleness is
+  harmless). Details:
+  - One child at a time (`netstatBusy` re-entrancy gate): a slow read holds the
+       slot until it finishes instead of piling up children; each child has a 15s
+    `SIGKILL` hard ceiling (`setTimeout` + `unref` — same lesson as `execText`:
+    a wedged child may never see TERM).
+  - Both `error` and `close` drain into the same `finish` cleanup; the reading
+    updates only when the parsed output is plausible (`rx/tx > 0`), so a
+    killed/empty child can't zero the last good counters.
+  - `stopCpuTempDarwin()` (the `session_shutdown` path) reaps the in-flight
+    netstat child with the same TERM → SIGKILL escalation as the macmon child.
+  - `createCollector`'s rate math is now spike-guarded via `safeRate`: a 0
+    baseline (the async reading not landed yet) records 0 for that tick instead
+    of dividing the whole boot-time traffic by one interval — the exact source
+    of the 162GB/s phantom.
+  - Regression tests cover the parser (unchanged), the spike guard, and the
+    sampler contracts (busy-gating, no-blocking, SIGKILL ceiling, good-output-only
+    updates, shutdown reap) — the sampler ones run on any platform via a test
+    command seam, so Linux CI exercises them too.
+  - `scripts/verify-no-block.ts`: a ~10s live proof (40 collects at 250ms) that
+    no single `collect()` blocks ≥100ms; on the nan0-affected host it measures
+    max ~33ms (pre-fix: 5003ms).
 
 ## [0.8.1] — 2026-09-29
 

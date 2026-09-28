@@ -19,6 +19,17 @@
  *          `Bytes (Read)`/`Bytes (Write)` counters *and* the read/write split
  *          that iostat's MB/s column lacks, at ~20ms per call. This is what
  *          keeps collect()'s counter+differential logic untouched.
+ *
+ * Why macOS does not run `netstat` synchronously either (2026-09-28 nan0
+ * incident): Tencent YunDun/iOA's network extension `NGNAppProxyExtension`
+ * creates a virtual interface `nan0` that wedges any `netstat` touching it
+ * (measured: `netstat -ib` 5.06s, `netstat -I nan0 -b` 5.03s, all other
+ * interfaces ≤15ms). A `spawnSync` in the 1s sampler therefore blocked the
+ * JS thread 5003ms (until SIGKILL, stdout empty) once per tick — pi's TUI
+ * hung ~5s out of every ~6s. `netstat -ib` is instead a **resident
+ * asynchronous** child (see readNetDarwin): collect() only kicks off a spawn
+ * and returns the last completed reading; disk `ioreg` is genuinely fast
+ * (~20ms, synchronous is fine).
  * `parseIostat` stays implemented (and tested): it is the CPU fallback should
  * os.cpus() ever be unusable, and its tested agreement with os.cpus() is the
  * executable evidence for the architecture decision above.
@@ -50,6 +61,10 @@ const IS_DARWIN = process.platform === "darwin";
 const IS_LINUX = process.platform === "linux";
 /** Every child process is bounded: a wedged command must not hang the collector. */
 const EXEC_TIMEOUT_MS = 5000;
+/** Hard ceiling for the async `netstat -ib` child. Generously above a healthy
+ *  netstat (~15ms) but bounded: a wedged nan0-style read must not pin a slot
+ *  forever (and the SIGKILL means a wedged child can't outlive the session). */
+const NETSTAT_TIMEOUT_MS = 15_000;
 
 /** Run a command and return stdout as text; null when it is missing/fails/times out.
  *
@@ -471,9 +486,10 @@ function readCpuTempDarwin(): number {
 	return 0;
 }
 
-/** Kill the resident macmon child. Called on `session_shutdown` so the
- *  streaming process never outlives the session (pi exits, the child would
- *  otherwise be reparented and keep running). */
+/** Kill the resident macmon child (and the netstat sampler's in-flight
+ *  child). Called on `session_shutdown` so a spawned process never outlives
+ *  the session (pi exits, the child would otherwise be reparented and keep
+ *  running). */
 export function stopCpuTempDarwin(): void {
 	// TERM first (lets macmon flush/exit cleanly), then a detached KILL follow-up:
 	// a macmon build that traps TERM must not outlive the session as an orphan.
@@ -484,6 +500,22 @@ export function stopCpuTempDarwin(): void {
 	macmonChild = undefined;
 	macmonTemp = 0;
 	macmonBuf = "";
+	// The async samplers' in-flight children get the same escalation. Their
+	// own SIGKILL ceilings are unref'd, but a shutdown must not wait even that
+	// long. `detach()` first — a dying child's late close callback must not
+	// touch the reading cells a post-stop respawn now owns (the child-identity
+	// guard PR #1 had on its netstat sampler, generalized to every slot).
+	for (const detach of activeDetachable) {
+		const child = detach();
+		child?.kill();
+		if (child) setTimeout(() => child.kill("SIGKILL"), 500).unref();
+	}
+	activeDetachable.clear();
+	// Release every refresh slot: a post-stop collect/respawn must be able to
+	// spawn immediately (pinned by the stop-reap seam test).
+	inflight.mem = false;
+	inflight.net = false;
+	inflight.disk = false;
 }
 
 /**
@@ -907,28 +939,50 @@ interface AsyncReading<T> {
 
 /** Fire-and-forget `spawn`, stdout delivered through `onDone` (exactly once,
  *  always — see the `settled` guard). Never blocks, never throws; a failed/
- *  killed child yields `null` (caller keeps the previous reading). Tests observe
+ *  killed child yields `null` (caller keeps the previous reading). The returned
+ *  handle exposes `detach()` — after it, the child still dies at its SIGKILL
+ *  ceiling but its callback is a no-op (slot-replacement safety). Tests observe
  *  quiescence via `__waitDarwinReadings()`. */
+export interface ChildTextHandle {
+	/** Neutralize this child's callback. Returns the child so the caller may
+	 *  also kill it; killing is the caller's choice (shutdown paths do
+	 *  TERM→KILL escalation, samplers let the ceiling handle it). */
+	detach(): ReturnType<typeof spawn> | undefined;
+}
 export function fireText(
 	file: string,
 	args: string[],
 	timeoutMs: number,
 	onDone: (text: string | null) => void,
-): void {
+): ChildTextHandle {
 	// onDone must fire **exactly once** and must fire **always** (even when the
 	// child never emits `close` — e.g. an ENOENT `error` on platforms where the
 	// close event is not guaranteed to follow). A dropped callback would pin the
 	// caller's `inflight` flag forever and freeze that reading slot.
+	// The generation token gives callers a **detachment** primitive: after
+	// `handle.detach()`, the child still dies at its SIGKILL ceiling but its
+	// callback becomes a no-op — a slot owner that was replaced (shutdown, then
+	// immediate respawn) can't have its state clobbered by the dying child's
+	// late close (the child-identity guard PR #1 had on its netstat sampler).
 	let settled = false;
+	let detached = false;
 	const done = (text: string | null): void => {
-		if (settled) return; // error+close can both fire on the same child
+		if (settled || detached) return; // error+close can both fire; detach kills the callback
 		settled = true;
 		onDone(text);
 	};
+	const handle: ChildTextHandle = {
+		detach: () => {
+			detached = true;
+			return childRef;
+		},
+	};
+	let childRef: ReturnType<typeof spawn> | undefined;
 	try {
 		const child = spawn(file, args, {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		childRef = child;
 		// Hard-kill backstop, same contract as execText's SIGKILL: a wedged
 		// command must never pin a reader slot forever. Timer is unref'd so it
 		// can't keep the event loop alive at shutdown.
@@ -966,8 +1020,10 @@ export function fireText(
 			if (signal === "SIGKILL" || code !== 0) done(null);
 			else done(out);
 		});
+		return handle;
 	} catch {
 		done(null); // spawn threw synchronously (rare): degrade
+		return handle;
 	}
 }
 
@@ -983,6 +1039,7 @@ const darwinDisk: AsyncReading<{ read: number; write: number }> = {
 	value: undefined,
 	at: 0,
 };
+
 /** `hw.memsize` never changes at runtime — captured once, then only `vm_stat` is
  *  refreshed per tick (one spawn saved per second vs re-running sysctl).
  *  `0` = not probed yet; `> 0` = captured bytes; `-1` = probe failed
@@ -994,6 +1051,82 @@ let darwinMemTotal = 0;
 
 /** True while a refresh for the given slot is in flight (prevents overlap). */
 const inflight = { mem: false, net: false, disk: false };
+
+/** Detach hooks for every live sampler child (shutdown reaping — see
+ *  stopCpuTempDarwin). Each refresh registers its child's `detach()` here and
+ *  removes it on settle; the set is what lets a session shutdown escalate
+ *  TERM→SIGKILL on ALL in-flight children, not just macmon/netstat. */
+const activeDetachable = new Set<() => ReturnType<typeof spawn> | undefined>();
+
+/** Stand-in command for tests of the netstat sampler (see
+ *  setNetstatCommandForTest). Production always runs the real `netstat -ib`. */
+export interface NetstatCommandForTest {
+	file: string;
+	args: string[];
+	/** Test-only override of the hard-kill ceiling, so the SIGKILL
+	 *  contract can be pinned in well under 15s. */
+	timeoutMs?: number;
+}
+let netstatCmdOverride: NetstatCommandForTest | undefined;
+
+/** Test seam: point the netstat sampler at a stand-in command — a script that
+ *  prints a `netstat -ib` fixture (reading-lands contract), a counter+sleeper
+ *  (busy-gating contract), or a TERM-ignoring wedged helper (SIGKILL-ceiling
+ *  contract). No argument restores the real `netstat -ib`. Pure state swap:
+ *  never spawns anything itself; pair with stopCpuTempDarwin() to reset any
+ *  in-flight sample. */
+export function setNetstatCommandForTest(cmd?: NetstatCommandForTest): void {
+	netstatCmdOverride = cmd;
+}
+
+/** Test seam: reset the cached net reading to "no reading yet". The sampler's
+ *  module state is shared process-wide, so without this a live-smoke test that
+ *  ran first (real netstat, real counters) would leak its reading into every
+ *  seam test's "fresh start" assertions. Production never calls this. */
+export function resetNetstatForTest(): void {
+	darwinNet.value = undefined;
+	darwinNet.at = 0;
+}
+
+/**
+ * darwin network counters — asynchronous, never blocking (PR #1's nan0 fix,
+ * unified onto the shared async cell): kicks off one `netstat -ib` refresh when
+ * the slot is free and immediately returns the last COMPLETED reading
+ * ({0,0} before the first one lands). The counters are cumulative since boot,
+ * so one tick of staleness is harmless — unlike a blocked JS thread, which is
+ * the whole bug (a nan0-wedged netstat froze the TUI ~5s of every ~6s).
+ *
+ * The reading update applies the **plausible-output guard** from PR #1: a
+ * killed/timed-out child leaves stdout empty or partial, and writing that
+ * would zero or under-count the last good cumulative counters.
+ */
+export function readNetDarwin(): { rx: number; tx: number } {
+	const override = netstatCmdOverride;
+	if (override) {
+		// Test seam: run the stand-in through the SAME machinery (busy gate,
+		// SIGKILL ceiling, plausible-output guard) so the contracts the seam
+		// tests pin are the production ones.
+		if (!inflight.net) {
+			inflight.net = true;
+			fireText(override.file, override.args, override.timeoutMs ?? NETSTAT_TIMEOUT_MS, (txt) => {
+				inflight.net = false;
+				if (txt === null) return; // keep the previous reading
+				const v = parseNetstatIb(txt);
+				if (v.rx > 0 || v.tx > 0) {
+					// plausible output only: a partial/empty parse must not
+					// zero the last good cumulative counters
+					darwinNet.value = v;
+					darwinNet.at = performance.now();
+				}
+			});
+		}
+	} else {
+		refreshNet();
+	}
+	const n = darwinNet.value;
+	return n ? { rx: n.rx, tx: n.tx } : { rx: 0, tx: 0 };
+}
+
 
 /**
  * Refresh the memory reading asynchronously.
@@ -1036,30 +1169,42 @@ function refreshMem(): void {
 function refreshNet(): void {
 	if (inflight.net) return;
 	inflight.net = true;
-	fireText("netstat", ["-ib"], EXEC_TIMEOUT_MS, (txt) => {
+	const h = fireText("netstat", ["-ib"], NETSTAT_TIMEOUT_MS, (txt) => {
 		inflight.net = false;
+		activeDetachable.delete(h.detach);
 		if (txt === null) return; // keep the previous reading
 		const v = parseNetstatIb(txt);
-		darwinNet.value = v;
-		darwinNet.at = performance.now();
+		// Plausible-output guard (PR #1): a killed/timed-out child leaves stdout
+		// empty or partial — writing that would zero the last good counters.
+		if (v.rx > 0 || v.tx > 0) {
+			darwinNet.value = v;
+			darwinNet.at = performance.now();
+		}
 	});
+	activeDetachable.add(h.detach);
 }
 
 function refreshDisk(): void {
 	if (inflight.disk) return;
 	inflight.disk = true;
-	fireText(
+	const h = fireText(
 		"ioreg",
 		["-r", "-c", "IOBlockStorageDriver", "-k", "Statistics", "-d", "1"],
 		EXEC_TIMEOUT_MS,
 		(txt) => {
 			inflight.disk = false;
+			activeDetachable.delete(h.detach);
 			if (txt === null) return; // keep the previous reading
 			const v = parseIoreg(txt);
-			darwinDisk.value = v;
-			darwinDisk.at = performance.now();
+			// Same plausible-output guard as net (an empty parse must not zero
+			// the last good cumulative disk counters).
+			if (v.read > 0 || v.write > 0) {
+				darwinDisk.value = v;
+				darwinDisk.at = performance.now();
+			}
 		},
 	);
+	activeDetachable.add(h.detach);
 }
 
 /** Kick off one async refresh round (cheap: at most 4 spawns, none awaited). */
@@ -1082,6 +1227,23 @@ export async function __waitDarwinReadings(): Promise<void> {
 	while ((inflight.mem || inflight.net || inflight.disk) && performance.now() < deadline) {
 		await new Promise((r) => setTimeout(r, 10));
 	}
+}
+
+/**
+ * Rate between two cumulative counter samples, spike-guarded.
+ *
+ * When the previous baseline is 0 — on darwin that is every tick before the
+ * async netstat child's first reading lands (see readNetDarwin) — the naive
+ * `(cur - 0) / dt` would report the machine's *entire boot-time traffic* as
+ * one tick's rate (measured phantom from the nan0 incident: ~162GB/s).
+ * Counters only ever cross 0 once, so recording 0 for the landing tick is
+ * honest, and the caller's baseline update makes the very next tick normal.
+ * The Math.max clamp keeps counter resets (interface reconfig, disk eject)
+ * at 0 instead of negative.
+ */
+export function safeRate(prev: number, cur: number, dt: number): number {
+	if (prev <= 0 || dt <= 0) return 0;
+	return Math.max(0, (cur - prev) / dt);
 }
 
 export function createCollector(): Collector {
@@ -1182,11 +1344,15 @@ export function createCollector(): Collector {
 			net = readNet();
 			disk = readDisk();
 		}
+		// Linux/sync path: PR #1's safeRate (0-baseline spike guard) — a 0
+		// baseline (source unreadable at startup) must not turn the first real
+		// counter into a one-tick whole-boot-traffic spike. The darwin branch
+		// above has the equivalent guard structurally (lastNetAt === 0).
 		const dtSync = Math.max(1, now - lastTime) / 1000;
-		const rxBps = IS_DARWIN ? netRxBps : Math.max(0, (net.rx - lastNet.rx) / dtSync);
-		const txBps = IS_DARWIN ? netTxBps : Math.max(0, (net.tx - lastNet.tx) / dtSync);
-		const readBps = IS_DARWIN ? diskRBps : Math.max(0, (disk.read - lastDisk.read) / dtSync);
-		const writeBps = IS_DARWIN ? diskWBps : Math.max(0, (disk.write - lastDisk.write) / dtSync);
+		const rxBps = IS_DARWIN ? netRxBps : safeRate(lastNet.rx, net.rx, dtSync);
+		const txBps = IS_DARWIN ? netTxBps : safeRate(lastNet.tx, net.tx, dtSync);
+		const readBps = IS_DARWIN ? diskRBps : safeRate(lastDisk.read, disk.read, dtSync);
+		const writeBps = IS_DARWIN ? diskWBps : safeRate(lastDisk.write, disk.write, dtSync);
 		const { used, total } = IS_DARWIN ? mem : readMem();
 		const cpuTemp = IS_DARWIN ? readCpuTempDarwin() : readCpuTempLinux();
 

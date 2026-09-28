@@ -4,6 +4,74 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Chart mode no longer blocks the main thread on every sample (macOS) — the biggest
+  performance rework since the resident-macmon fix.** Measured on an M1 (arm64, 32GB):
+  - **Per-tick main-thread blocking dropped from ~43ms to ~4ms (10×).** Every 1-second
+    sample used to run `netstat -ib` + `ioreg` + `sysctl`/`vm_stat` through synchronous
+    `spawnSync` (netstat ≈ 17ms, ioreg ≈ 17ms, sysctl+vm_stat ≈ 5ms) — in a TUI that
+    re-renders on every keystroke and streaming delta, that was visible jank and ~4% CPU
+    burned forever. These four darwin externals now follow the same pattern the macmon
+    temperature child already established: fire-and-forget `spawn` + parse in the
+    completion callback into module-level readings; `collect()` only reads the cached
+    values. Rates are computed between reading **capture timestamps** (not the tick
+    clock), so an asynchronously-late refresh can't distort them; a failed refresh keeps
+    the previous reading (at most one tick stale — invisible on a 60s window).
+  - **Extension registration is ~45ms cheaper.** `createCollector()` used to establish
+    its baselines with synchronous netstat+ioreg spawns at import/registration time;
+    it now only kicks the first async refresh round (~5ms) and captures rate baselines
+    on first refresh completion instead.
+  - `hw.memsize` is captured once (it is a boot constant) — subsequent ticks refresh
+    `vm_stat` only, one spawn saved per second.
+  - Every async child keeps the SIGKILL hard-kill contract (`fireText`): a wedged
+    command is still bounded by the 5s timeout, output is buffer-capped at 4MiB, and
+    in-flight refreshes never overlap (one live child per command max).
+  - **stderr is drained** (`resume()`): an un-read stderr pipe fills its ~64KB buffer
+    and a chatty child then blocks until the SIGKILL backstop — measured with a
+    6.4MB-stderr helper: never exits without the drain, ~160ms with it.
+  - **A refresh that hasn't landed keeps the previous rate.** Recomputing a rate over
+    an unchanged counter injected a fake 0 B/s dip into the chart (measured 187 → 0 →
+    back); the rate ledger now only advances when a new reading actually landed.
+  - **A permanently failed `sysctl` probe stops retrying** (`-1` sentinel): a
+    missing/broken sysctl used to make every tick a 2-spawn retry storm (measured 10
+    spawns in 5s); the memory total falls back to `os.totalmem()` permanently.
+- **Repaint memoization in the widget render path.** pi re-renders widgets on every
+  keystroke and streaming delta, but the panel's inputs only move at the sampling
+  cadence (1 Hz) and on `message_end`. The component now caches its body keyed by
+  `(dataVersion, width, fullscreen)` — unchanged data returns the cached rows
+  (measured: ~1µs vs ~1-2ms per frame at 150 cols; during token streaming this was
+  pure waste on every frame). Width/fullscreen are part of the key, so a resize or
+  mode switch can never serve stale rows (the width-overflow iron rule).
+- **Startup preflight no longer delays the first paint.** The dependency probe
+  (`which sysctl/macmon/…`, ~12ms of synchronous spawns) now runs fully async
+  (`preflightMetricsAsync`); the warning notify lands whenever the probes finish
+  instead of blocking inside the first `session_start`.
+
+### Added
+
+- Test hook `__waitDarwinReadings()` (exported from metrics.ts): resolves once every
+  in-flight async refresh has landed, so darwin live tests await deterministically
+  instead of sleeping fixed amounts.
+- `fireText` is exported (async twin of `execText`) and covered by regression tests:
+  a chatty-stderr child must exit promptly (drain contract), and a TERM-ignoring wedged
+  child must settle `null` via SIGKILL with the `onDone` callback firing exactly once.
+- Regression tests pinning the render-memoization contract: repeated renders with
+  unchanged data return equal rows in a fresh array (caller-side mutation can't poison
+  the cache), a width change recomputes (no stale wide rows — the width iron rule), a
+  fullscreen flip recomputes (chip row appears, content round-trips), and a
+  `message_end` invalidates the cache (the token readouts refresh — mutation-verified:
+  deleting the `dataVersion++` fails the test).
+- Regression test pinning the rate-hold contract on stalled refreshes (no fake zero-dip).
+- `preflightMetricsAsync()` must agree with `preflightMetrics()` on every platform.
+- The collect() budget test now measures the **real** 1Hz cadence (waiting for refresh
+  quiescence between timed collects) and asserts the median, not the max — immune to
+  single GC pauses.
+- Top-level `after()` teardown in metrics tests kills the resident macmon child, so
+  name-filtered runs (`--test-name-pattern`) no longer hang forever.
+
 ## [0.8.1] — 2026-09-29
 
 ### Fixed

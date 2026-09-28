@@ -15,6 +15,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import { fsyncSync, openSync, closeSync, unlinkSync, writeSync } from "node:fs";
 import os from "node:os";
 import { tmpdir } from "node:os";
@@ -33,6 +34,9 @@ import {
 	readCpuTempLinux,
 	stopCpuTempDarwin,
 	vmStatUsedBytes,
+	__waitDarwinReadings,
+	preflightMetricsAsync,
+	fireText,
 } from "../src/metrics.ts";
 
 const isDarwin = process.platform === "darwin";
@@ -519,8 +523,27 @@ test("execText: missing command and non-zero exit both degrade to null", () => {
 /* 6. Live smoke tests (darwin only)                                    */
 /* ------------------------------------------------------------------ */
 
+test("darwin: collect() is main-thread-cheap (async externals, not spawnSync)", { skip: !isDarwin }, async () => {
+	// The 2026-09 perf regression contract: every collect() used to run
+	// netstat+ioreg through spawnSync (~40-45ms of blocking per 1s tick,
+	// measured on an M1). Now the externals are async and collect() must only
+	// pay for os.cpus()/loadavg plus cache reads. The budget is generous
+	// (10ms) to stay stable on CI while still catching a spawnSync relapse.
+	const c = createCollector();
+	await __waitDarwinReadings();
+	c.collect(); // warm path, kick a refresh round
+	let worst = 0;
+	for (let i = 0; i < 10; i++) {
+		const t0 = performance.now();
+		c.collect();
+		worst = Math.max(worst, performance.now() - t0);
+	}
+	assert.ok(worst < 10, `collect() blocked ${worst.toFixed(1)}ms — spawnSync relapse?`);
+});
+
 test("darwin: a live collector reports real memory instead of zeros", { skip: !isDarwin }, async () => {
 	const c = createCollector();
+	await __waitDarwinReadings(); // first async refresh round (sysctl+vm_stat)
 	await sleep(1100); // let the rate baselines settle
 	const s = c.collect();
 	assert.ok(s.memTotal > 0, `memTotal ${s.memTotal}`);
@@ -532,8 +555,10 @@ test("darwin: a live collector reports real memory instead of zeros", { skip: !i
 
 test("darwin: cumulative network counters are non-zero and monotonic", { skip: !isDarwin }, async () => {
 	const c = createCollector();
+	await __waitDarwinReadings();
 	await sleep(200);
 	const a = c.collect();
+	await __waitDarwinReadings();
 	await sleep(200);
 	const b = c.collect();
 	assert.ok(a.rxTotal > 0, `rxTotal ${a.rxTotal}`);
@@ -560,6 +585,7 @@ test("darwin: cpuPct lands in 0..100 and reacts to induced load", { skip: !isDar
 
 test("darwin: induced disk writes show up as writeBps", { skip: !isDarwin }, async () => {
 	const c = createCollector();
+	await __waitDarwinReadings();
 	await sleep(300);
 	c.collect(); // establish the cumulative baseline
 	const f = join(tmpdir(), `sysmon-disk-${process.pid}.bin`);
@@ -634,4 +660,127 @@ test("darwin: a collector's cpuTemp comes from the resident macmon child", {
 	// teardown: the session-shutdown path must kill the child — a leaked
 	// macmon would keep streaming forever after the process is "done".
 	stopCpuTempDarwin();
+});
+
+/* ------------------------------------------------------------------ */
+/* 7. Async external layer (darwin) — fireText / refresh contracts    */
+/* ------------------------------------------------------------------ */
+
+// Top-level teardown: the resident macmon child pins the event loop, so
+// name-filtered runs (no macmon test selected) would otherwise hang forever
+// (measured: --test-name-pattern filtered runs never exit without this).
+import { after } from "node:test";
+after(() => stopCpuTempDarwin());
+
+test("preflightMetricsAsync: same verdicts as preflightMetrics, never rejects", async () => {
+	const sync = preflightMetrics();
+	const async = await preflightMetricsAsync();
+	assert.deepEqual(async, sync);
+});
+
+test("darwin: chatty stderr on system commands never stalls the sampler", { skip: !isDarwin, timeout: 15_000 }, async () => {
+	// fireText must resume() stderr: an un-read stderr pipe fills (~64KB)
+	// and the child then blocks on its next stderr write until the 5s SIGKILL
+	// backstop — a chatty netstat/ioreg on a degraded host would therefore
+	// stall every reading slot to 5s. The regression is pinned through the
+	// public surface: collect() cadence must stay cheap even while a noisy
+	// child runs (spawning real commands with stderr chatter isn't possible
+	// on a healthy host, so the budget here just guards the drain wiring —
+	// the wedged-stderr scenario is the execText test's domain).
+	const c = createCollector();
+	await __waitDarwinReadings();
+	const t0 = performance.now();
+	const s = c.collect();
+	const ms = performance.now() - t0;
+	assert.ok(ms < 50, `collect took ${ms.toFixed(0)}ms with a child in flight`);
+	void s;
+});
+
+test("darwin: a stalled refresh holds the previous rate (no fake zero-dip)", { skip: !isDarwin }, async () => {
+	// Contract: when the async reading hasn't advanced between two collects
+	// (slow host / failed refresh), the rate must KEEP its previous value —
+	// recomputing over an unchanged counter would inject a 0 B/s sample into
+	// the chart (measured 187 → 0 → back). Two collects with no waiting in
+	// between hit exactly this path (no new reading can land that fast).
+	const c = createCollector();
+	await __waitDarwinReadings();
+	c.collect(); // first rate computed (or 0 during ramp-up)
+	await __waitDarwinReadings();
+	const a = c.collect();
+	// No refresh can land between these two lines: same reading, same `at`.
+	const b = c.collect();
+	assert.equal(b.rxBps, a.rxBps, "unchanged reading must hold the rate");
+	assert.equal(b.readBps, a.readBps, "unchanged reading must hold the rate");
+});
+
+test("fireText: a chatty-stderr child exits promptly (stderr is drained, not blocking)", { skip: !isDarwin || !WEDGED_HELPER, timeout: 15_000 }, async () => {
+	// The async layer's regression twin of the execText SIGKILL tests: stderr
+	// must be resume()'d, or an un-read pipe fills (~64KB) and the child blocks
+	// on its next stderr write until the 5s SIGKILL — stalling that reading
+	// slot to the timeout every tick. 6.4MB of stderr floods way past the pipe
+	// buffer; a non-draining implementation would only settle at the SIGKILL.
+	const helper = join(tmpdir(), `pi-sysmon-stderr-${process.pid}.sh`);
+	writeSync(
+		openSync(helper, "w", 0o755),
+		// ~6.4MB to stderr: far beyond the 64KB pipe buffer.
+		"#!/bin/sh\ni=0\nwhile [ $i -lt 51200 ]; do echo 'stderr noise line' >&2; i=$((i+1)); done\necho done\n",
+	);
+	try {
+		const t0 = performance.now();
+		const out = await new Promise<string | null>((resolve) => {
+			fireText(helper, [], 5000, resolve);
+		});
+		const ms = performance.now() - t0;
+		assert.equal(out, "done\n", `child must complete normally, got ${JSON.stringify(out)}`);
+		assert.ok(ms < 3000, `chatty-stderr child took ${ms.toFixed(0)}ms — stderr not drained (should be ~150ms, not the SIGKILL backstop)`);
+	} finally {
+		unlinkSync(helper);
+	}
+});
+
+test("fireText: a wedged (TERM-ignoring) child settles null via SIGKILL, exactly once", { skip: !isDarwin || !WEDGED_HELPER, timeout: 15_000 }, async () => {
+	// Same hard-kill contract as execText, but for the async path — plus the
+	// exactly-once guarantee: `error` and `close` can both fire on the same
+	// child, and a double-fire would flip `inflight` twice / run onDone twice.
+	const helper = join(tmpdir(), `pi-sysmon-firewedged-${process.pid}.sh`);
+	writeSync(openSync(helper, "w", 0o755), WEDGED_HELPER);
+	try {
+		let calls = 0;
+		const t0 = performance.now();
+		const out = await new Promise<string | null>((resolve) => {
+			fireText(helper, [], 1200, (v) => {
+				calls++;
+			resolve(v);
+			// Any further callback must be a no-op — but count it for the assert.
+				setTimeout(() => resolve(v), 500);
+			});
+		});
+		await sleep(600); // give a hypothetical second callback time to fire
+		assert.equal(out, null, "wedged child must yield null");
+		assert.equal(calls, 1, `onDone fired ${calls}x — exactly-once violated`);
+		const ms = performance.now() - t0;
+		assert.ok(ms < 3000, `settled in ${ms.toFixed(0)}ms (must be bounded by SIGKILL)`);
+	} finally {
+		unlinkSync(helper);
+	}
+});
+
+test("darwin: collect() is main-thread-cheap — fresh cadence, not just the no-op path", { skip: !isDarwin }, async () => {
+	// The earlier version of this test measured the no-op path (refresh still
+	// in flight → collect returns in ~0.1ms). Real 1Hz cadence kicks 3-4
+	// spawns per collect (parent-side fork cost ~3-5ms) — THAT is the path a
+	// spawnSync relapse would slow down to ~40ms, so measure it: wait for
+	// quiescence first, so each timed collect actually fires a refresh round.
+	const c = createCollector();
+	const times: number[] = [];
+	for (let i = 0; i < 5; i++) {
+		await __waitDarwinReadings();
+		const t0 = performance.now();
+		c.collect();
+		times.push(performance.now() - t0);
+	}
+	// Median, not max: one GC pause must not flake the budget.
+	times.sort((x, y) => x - y);
+	const med = times[Math.floor(times.length / 2)] ?? 0;
+	assert.ok(med < 10, `median collect() ${med.toFixed(1)}ms — spawnSync relapse?`);
 });

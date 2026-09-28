@@ -46,7 +46,7 @@ import {
 import { createTpsMeter, hitRate } from "./tokens.ts";
 import {
 	createCollector,
-	preflightMetrics,
+	preflightMetricsAsync,
 	stopCpuTempDarwin,
 	type Snapshot,
 } from "./metrics.ts";
@@ -410,11 +410,13 @@ export default function (pi: ExtensionAPI) {
 		// session totals: the instantaneous rate must come from **this** turn's
 		// `usage`, not from the running sums (a cumulative ratio would barely
 		// move and would hide a cache-missing turn for a long time).
-		const inNow = n(o.input);
+			const inNow = n(o.input);
 		const rNow = n(o.cacheRead);
 		tokIn += inNow;
 		tokOut += n(o.output);
 		tokCacheRead += rNow;
+		// Token totals feed the title readouts → panel output changed.
+		dataVersion++;
 		// Only overwrite when this turn actually carried prompt tokens: a message
 		// with no measurable prompt (e.g. a continuation that only streams output)
 		// tells us nothing about the current hit rate, so the previous turn's
@@ -437,6 +439,16 @@ export default function (pi: ExtensionAPI) {
 	let preflightWarned = false;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let snap: Snapshot | undefined;
+	/** Render-data version: bumped by everything that changes panel output —
+	 * sample() (hist/snap/ctxPct), addUsage() (token totals + hit rate). The
+	 * component render() compares it to know whether the cached panel can be
+	 * reused: pi re-renders widgets on EVERY keystroke and streaming delta, but
+	 * the underlying data only moves at the sampling cadence (1 Hz), so
+	 * repaints between samples used to re-run the whole braille pipeline
+	 * (measured ~1-2ms per frame at 150 cols — pure waste during streaming).
+	 * NOT bumped by mode/placement switches: those go through enable(), which
+	 * swaps the component (fresh cache) anyway. */
+	let dataVersion = 0;
 	/**
 	 * The host the panel is currently mounted on, remembered so a chip click
 	 * can re-run the exact same switch path as `/sysmon chart|line` without
@@ -448,6 +460,7 @@ export default function (pi: ExtensionAPI) {
 
 	function sample() {
 		try {
+			dataVersion++; // every sample potentially changes curves + readouts
 			// Context usage first: pi recomputes it per call, and it's O(entries) —
 			// reading it once per sample (1 Hz by default) is exactly the sampling
 			// cadence this block already runs at. Wrapped defensively: a throwing
@@ -727,6 +740,15 @@ export default function (pi: ExtensionAPI) {
 				tui.requestRender();
 			}, intervalMs);
 			timer = localTimer;
+			// Repaint memoization cell — see the render() body below. Per component
+			// instance (per factory call), so a mode/placement switch that swaps
+			// the component naturally starts with a cold cache.
+			const cache: {
+				v: number;
+				w: number;
+				fs: boolean;
+				lines: string[];
+			} = { v: -1, w: 0, fs: false, lines: [] };
 			return {
 				// dispose must be idempotent and **only clear its own timer**: pi calls
 				// dispose when replacing/removing a widget (by then the module-level
@@ -757,9 +779,30 @@ export default function (pi: ExtensionAPI) {
 					// component object (the factory is not re-run). Reading `tui.mode`
 					// here sees the *current* mode every frame.
 				const fs = tui.mode === "fullscreen";
-				const lines = render(theme, width, fs);
+				// ── Repaint memoization ──
+				// pi re-renders widgets on EVERY keystroke and streaming delta, but
+				// the panel's inputs only move at the sampling cadence (1 Hz) plus
+				// message_end. Re-running the braille pipeline for an unchanged
+				// dataset is pure CPU waste during token streaming (measured
+				// ~1-2ms per frame at 150 cols, × every frame), so the body is
+				// cached keyed by (dataVersion, width, fs) and reused when nothing
+				// moved. width/fs live in the key because a resize or mode switch
+				// changes the layout — returning stale wide rows would overflow the
+				// width budget (the iron rule). Fresh arrays on both paths: pi
+				// owns/truncates the returned array. A non-finite width (broken
+				// PTY, odd SSH client) normalizes to 0 — NaN !== NaN would otherwise
+				// make every render a cache miss (harmless but pure overhead).
+				const w = Number.isFinite(width) ? width : 0;
+				if (
+					cache.v === dataVersion &&
+					cache.w === w &&
+					cache.fs === fs
+				) {
+					return [...cache.lines];
+				}
+				const lines = render(theme, w, fs);
 				if (fs && extraRow) {
-					const row = extraRow(theme, width, fs);
+					const row = extraRow(theme, w, fs);
 					// A chart-mode extra row (y=-1 sentinel from chipRow) is appended
 					// below the panel, so its local y is the body row count; a
 					// line-mode extra row IS the body (fs body returns []), and its
@@ -769,6 +812,10 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					chipRect = undefined;
 				}
+				cache.v = dataVersion;
+				cache.w = w;
+				cache.fs = fs;
+				cache.lines = [...lines];
 				return lines;
 			},
 				// Returning `undefined` in regular mode (or for hits outside the
@@ -1198,12 +1245,12 @@ export default function (pi: ExtensionAPI) {
 		// Runs only when the monitor is actually mounted, and only on the first
 		// session (module-level latch): the probe spawns a couple of `which`
 		// calls, so `/new` / `/resume` within the same process shouldn't repeat
-		// the warning the user already saw. Deferred to the next tick so the
-		// very first paint isn't blocked by the PATH/sysfs probing.
+		// the warning the user already saw. The async probe (~12ms of `which`
+		// spawns measured) never blocks the first paint — the notify lands
+		// whenever the probes finish.
 		if (want && !preflightWarned) {
 			preflightWarned = true;
-			setImmediate(() => {
-				const r = preflightMetrics();
+			preflightMetricsAsync().then((r) => {
 				if (!r.core) {
 					// Whole platform unsupported (e.g. Windows): every chart would
 					// render zeros — say so up front rather than let the user find

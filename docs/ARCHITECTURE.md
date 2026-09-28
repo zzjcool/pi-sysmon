@@ -141,9 +141,24 @@ sequences**.
 ### 7. Timer refresh via `setInterval` + `tui.requestRender()`
 
 pi's TUI renders differentially, and `requestRender()` is throttled/deduplicated
-internally, so calling it once per second is cheap. The component itself is stateless (it
-only reads the `snap` captured in its closure) and computes at render time — no cache
-invalidation logic needed.
+internally, so calling it once per second is cheap. The component itself is stateless
+(it only reads the `snap` captured in its closure) and computes at render time —
+**with one memoization layer**: pi re-renders widgets on every keystroke and streaming
+delta, but the panel's inputs only move at the sampling cadence (1 Hz) and on
+`message_end`, so `render(width)` caches its body keyed by `(dataVersion, width,
+fullscreen)` and returns the cached rows unchanged (measured ~1ms → ~1µs per frame
+at 150 cols; width/fs are part of the key, so a resize or mode switch can never serve
+stale rows — the width-overflow iron rule).
+
+On the sampling side, the darwin externals (`netstat` / `ioreg` / `vm_stat`) are
+refreshed **asynchronously** (fire-and-forget `spawn` + callback-parsed into
+module-level readings; `collect()` only reads the cache). Measured on an M1:
+per-tick main-thread blocking dropped from ~43ms (synchronous `spawnSync` chain)
+to ~4ms, and extension registration no longer pays ~45ms of synchronous baseline
+spawns — the same pattern the resident macmon temperature child established. Rates
+are computed between reading **capture timestamps**, so an asynchronously-late
+refresh can't distort them, and a failed refresh keeps the previous reading (at
+most one tick stale — invisible on a 60s window).
 
 ### 8. Single-file bundle self-checks (learned the hard way)
 

@@ -121,7 +121,18 @@ bottom 用右对齐是因为它始终有完整的 10 分钟历史。而扩展刚
 ### 7. 定时刷新用 `setInterval` + `tui.requestRender()`
 
 pi 的 TUI 是差分渲染的，`requestRender()` 内部有节流去重，所以每秒调用没有压力。
-组件本身是无状态的（只读闭包里的 `snap`），渲染时现算，不需要缓存失效逻辑。
+组件本身是无状态的（只读闭包里的 `snap`），渲染时现算 —— 但带**一层记忆化**：
+pi 在每次按键/流式 delta 都会重渲染 widget，而面板的输入只在采样节奏（1 Hz）和
+`message_end` 时才变，所以 `render(width)` 以 `(dataVersion, width, fullscreen)` 为
+键缓存主体，数据没变就直接返回缓存行（实测 150 列下每帧 ~1ms → ~1µs；width/fs
+在键里，resize/模式切换绝不会返回过期行 —— 宽度溢出铁律）。
+
+采样侧，darwin 的外部命令（`netstat` / `ioreg` / `vm_stat`）改为**异步刷新**
+（fire-and-forget `spawn` + 回调解析进模块级读数，`collect()` 只读缓存）。
+M1 实测：每 tick 主线程阻塞从 ~43ms（同步 `spawnSync` 链）降到 ~4ms，扩展注册
+也不再付 ~45ms 的同步基线 spawn —— 与常驻 macmon 温度子进程同一模式。速率按
+读数的**捕获时间戳**差分，异步迟到不会扭曲速率；刷新失败则保留上次读数
+（最多旧一个 tick —— 在 60s 窗口上不可见）。
 
 ### 8. 单文件打包的自检（血泪教训）
 

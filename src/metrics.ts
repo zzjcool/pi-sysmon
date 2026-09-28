@@ -22,6 +22,20 @@
  * `parseIostat` stays implemented (and tested): it is the CPU fallback should
  * os.cpus() ever be unusable, and its tested agreement with os.cpus() is the
  * executable evidence for the architecture decision above.
+ *
+ * Why the darwin externals (netstat / ioreg / vm_stat) are refreshed
+ * **asynchronously** (see `fireText` + the refresh functions near
+ * `createCollector`): every `collect()` used to run them through synchronous
+ * `spawnSync`, measured at ~40-45ms of main-thread blocking per 1-second tick
+ * (netstat ~17ms, ioreg ~17ms, sysctl+vm_stat ~5ms) — in a TUI that re-renders
+ * on every keystroke and streaming delta, that is both visible jank and real
+ * CPU waste. The fix is the same pattern this file already uses for the
+ * resident macmon temperature child: spawn without waiting, parse in the
+ * completion callback into module-level readings, and let `collect()` only
+ * read the cached values (measured after: ~1-2ms of main-thread time per
+ * tick). Rates are computed between reading **completion timestamps**, so an
+ * asynchronously-late reading can't distort them; readings are at most one
+ * tick stale, which is invisible on a 60s chart window.
  */
 import {
 	spawn,
@@ -151,8 +165,8 @@ function readCpuTimes(): { total: number; busy: number } {
 	}
 }
 
+/** Linux /proc/meminfo reader (macOS memory comes from the async external layer below). */
 function readMem(): { used: number; total: number } {
-	if (IS_DARWIN) return readMemDarwin();
 	try {
 		const txt = readFileSync("/proc/meminfo", "utf8");
 		// Fixed-key lookup table, avoiding dynamically built regexes
@@ -175,8 +189,8 @@ function readMem(): { used: number; total: number } {
 	}
 }
 
+/** Linux /proc/net/dev reader (macOS network counters come from the async external layer below). */
 function readNet(): { rx: number; tx: number } {
-	if (IS_DARWIN) return readNetDarwin();
 	let rx = 0;
 	let tx = 0;
 	try {
@@ -202,8 +216,8 @@ function readNet(): { rx: number; tx: number } {
 	return { rx, tx };
 }
 
+/** Linux /proc/diskstats reader (macOS disk counters come from the async external layer below). */
 function readDisk(): { read: number; write: number } {
-	if (IS_DARWIN) return readDiskDarwin();
 	let read = 0;
 	let write = 0;
 	try {
@@ -582,6 +596,40 @@ function whichSync(cmd: string): boolean {
 	return out !== null && out.trim() !== "";
 }
 
+/**
+ * Async variant of the same probe — the startup path must not pay the ~12ms
+ * of synchronous `which` spawns before the first frame. Used by
+ * `preflightMetricsAsync`; the sync `preflightMetrics` stays for tests and
+ * one-shot CLI use, where blocking is fine.
+ */
+async function whichAsync(cmd: string): Promise<boolean> {
+	return new Promise((resolve) => {
+		fireText("which", [cmd], EXEC_TIMEOUT_MS, (out) => {
+			resolve(out !== null && out.trim() !== "");
+		});
+	});
+}
+
+/** Async preflight — same verdicts as `preflightMetrics()`, zero main-thread
+ *  blocking (all probes are fire-and-forget spawns). The startup notify path
+ *  uses this so the first paint isn't delayed by PATH probing (~12ms measured). */
+export async function preflightMetricsAsync(): Promise<MetricsPreflight> {
+	if (IS_DARWIN) {
+		const [core, macmon, osxCpuTemp, istats] = await Promise.all([
+			whichAsync("sysctl"),
+			whichAsync("macmon"),
+			whichAsync("osx-cpu-temp"),
+			whichAsync("istats"),
+		]);
+		return { core, temp: macmon || osxCpuTemp || istats };
+	}
+	if (IS_LINUX) {
+		// /proc readability is a synchronous fs stat — sub-millisecond, keep it.
+		return preflightMetrics();
+	}
+	return { core: false, temp: false };
+}
+
 export interface Collector {
 	collect(): Snapshot;
 }
@@ -826,6 +874,8 @@ function readCpuTimesDarwin(): { total: number; busy: number } {
 		}
 		if (total > 0) return { total, busy };
 	}
+	// Sync fallback, cost paid at most once (iostat is only reached when
+	// os.cpus() reports nothing, which never happens on a healthy host).
 	const txt = execText("iostat", ["-c", "2"]);
 	if (txt === null) return { total: 0, busy: 0 };
 	const c = parseIostat(txt);
@@ -835,37 +885,229 @@ function readCpuTimesDarwin(): { total: number; busy: number } {
 	return { total, busy: c.us + c.ni + c.sy };
 }
 
-function readMemDarwin(): { used: number; total: number } {
-	const totalRaw = execText("sysctl", ["-n", "hw.memsize"]);
-	const total = totalRaw === null ? 0 : Number(totalRaw.trim());
-	if (!Number.isFinite(total) || total <= 0) return { used: 0, total: os.totalmem() };
-	const vmText = execText("vm_stat", []);
-	if (vmText === null) return { used: 0, total };
-	const vm = parseVmStat(vmText);
-	return { used: vmStatUsedBytes(vm, vm.pageSize, total), total };
+/* ------------------------------------------------------------------ */
+/* macOS (darwin) async external layer                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The module-level "latest reading" cells the async refreshers write and
+ * `collect()` reads (the same pattern as `macmonTemp`).
+ *
+ * Staleness contract: a reading is at most `intervalMs` + one refresh
+ * lag old — invisible on a 60s chart window — and `undefined` means "the
+ * first refresh hasn't landed yet", which the collector treats as
+ * "no data yet" (rate 0, matching the macmon ramp-up semantics tests pin).
+ */
+interface AsyncReading<T> {
+	value: T | undefined;
+	/** Monotonic time (ms) of when this reading was *captured* — used for rate
+	 *  denominators so an asynchronously-late reading can't skew rates. */
+	at: number;
 }
 
-function readNetDarwin(): { rx: number; tx: number } {
-	const txt = execText("netstat", ["-ib"]);
-	if (txt === null) return { rx: 0, tx: 0 };
-	return parseNetstatIb(txt);
+/** Fire-and-forget `spawn`, stdout delivered through `onDone` (exactly once,
+ *  always — see the `settled` guard). Never blocks, never throws; a failed/
+ *  killed child yields `null` (caller keeps the previous reading). Tests observe
+ *  quiescence via `__waitDarwinReadings()`. */
+export function fireText(
+	file: string,
+	args: string[],
+	timeoutMs: number,
+	onDone: (text: string | null) => void,
+): void {
+	// onDone must fire **exactly once** and must fire **always** (even when the
+	// child never emits `close` — e.g. an ENOENT `error` on platforms where the
+	// close event is not guaranteed to follow). A dropped callback would pin the
+	// caller's `inflight` flag forever and freeze that reading slot.
+	let settled = false;
+	const done = (text: string | null): void => {
+		if (settled) return; // error+close can both fire on the same child
+		settled = true;
+		onDone(text);
+	};
+	try {
+		const child = spawn(file, args, {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		// Hard-kill backstop, same contract as execText's SIGKILL: a wedged
+		// command must never pin a reader slot forever. Timer is unref'd so it
+		// can't keep the event loop alive at shutdown.
+		const killer = setTimeout(() => {
+			child.kill("SIGKILL");
+		}, timeoutMs);
+		killer.unref?.();
+		// Belt-and-braces: even a child whose close event somehow never lands
+		// (a pathological host) must not pin the slot — settle on the timer too.
+		const settle = setTimeout(() => done(null), timeoutMs + 250);
+		settle.unref?.();
+		let out = "";
+		child.stdout?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk: string) => {
+			out += chunk;
+			// Bound the buffer: a pathological child spewing output must not
+			// grow memory without limit. 4 MiB is ~1000× netstat's real output.
+			if (out.length > 4 * 1024 * 1024) child.kill("SIGKILL");
+		});
+		// stderr must be drained, not just opened: an un-read pipe fills its
+		// ~64KB buffer and the child then blocks forever on its next stderr
+		// write — until the SIGKILL backstop (measured: a child writing 6.4MB
+		// to stderr never exits without this; with resume() it exits normally).
+		// Discarded: stderr is never part of any reading.
+		child.stderr?.resume();
+		child.on("error", () => {
+			clearTimeout(killer);
+			clearTimeout(settle);
+			done(null); // ENOENT etc.: keep the previous reading
+		});
+		child.on("close", (code, signal) => {
+			clearTimeout(killer);
+			clearTimeout(settle);
+			// Same verdicts as execText: non-zero / killed / empty → null
+			if (signal === "SIGKILL" || code !== 0) done(null);
+			else done(out);
+		});
+	} catch {
+		done(null); // spawn threw synchronously (rare): degrade
+	}
 }
 
-function readDiskDarwin(): { read: number; write: number } {
-	const txt = execText("ioreg", [
-		"-r",
-		"-c",
-		"IOBlockStorageDriver",
-		"-k",
-		"Statistics",
-		"-d",
-		"1",
-	]);
-	if (txt === null) return { read: 0, write: 0 };
-	return parseIoreg(txt);
+/** Latest memory reading (used+total, bytes) captured from `vm_stat`. */
+const darwinMem: AsyncReading<{ used: number; total: number }> = {
+	value: undefined,
+	at: 0,
+};
+/** Latest cumulative network counters from `netstat -ib`. */
+const darwinNet: AsyncReading<{ rx: number; tx: number }> = { value: undefined, at: 0 };
+/** Latest cumulative disk counters from `ioreg`. */
+const darwinDisk: AsyncReading<{ read: number; write: number }> = {
+	value: undefined,
+	at: 0,
+};
+/** `hw.memsize` never changes at runtime — captured once, then only `vm_stat` is
+ *  refreshed per tick (one spawn saved per second vs re-running sysctl).
+ *  `0` = not probed yet; `> 0` = captured bytes; `-1` = probe failed
+ *  permanently — stop re-spawning sysctl every tick (a missing/broken sysctl
+ *  would otherwise turn each tick into a 2-spawn retry storm, measured 10
+ *  spawns in 5s) and fall back to os.totalmem(), which on darwin reads the
+ *  very same sysctl anyway. */
+let darwinMemTotal = 0;
+
+/** True while a refresh for the given slot is in flight (prevents overlap). */
+const inflight = { mem: false, net: false, disk: false };
+
+/**
+ * Refresh the memory reading asynchronously.
+ *
+ * First round (or after a failed one): `sysctl -n hw.memsize` + `vm_stat`.
+ * Every later round: `vm_stat` only — memsize is a boot constant.
+ * A failed vm_stat keeps the previous reading (one stale tick at most).
+ */
+function refreshMem(): void {
+	if (inflight.mem) return;
+	inflight.mem = true;
+	// Both stages settle the flag — the sysctl stage's callback chains straight
+	// into the vm_stat stage, so the flag only clears when the final stage's
+	// onDone runs (fireText guarantees exactly-once).
+	const applyVm = (vmText: string | null): void => {
+		inflight.mem = false;
+		if (vmText === null) return; // keep the previous reading
+		const vm = parseVmStat(vmText);
+		const total = darwinMemTotal > 0 ? darwinMemTotal : os.totalmem();
+		darwinMem.value = {
+			used: vmStatUsedBytes(vm, vm.pageSize, total),
+			total,
+		};
+		darwinMem.at = performance.now();
+	};
+	// Known (captured or permanently failed): vm_stat only. `!== 0` (not `> 0`)
+	// is the guard — `-1` (failed probe) must also skip the sysctl spawn.
+	if (darwinMemTotal !== 0) {
+		fireText("vm_stat", [], EXEC_TIMEOUT_MS, applyVm);
+		return;
+	}
+	fireText("sysctl", ["-n", "hw.memsize"], EXEC_TIMEOUT_MS, (totalRaw) => {
+		const total = totalRaw === null ? 0 : Number(totalRaw.trim());
+		if (Number.isFinite(total) && total > 0) darwinMemTotal = total;
+		else darwinMemTotal = -1; // permanent failure: never re-probe sysctl
+		fireText("vm_stat", [], EXEC_TIMEOUT_MS, applyVm);
+	});
+}
+
+function refreshNet(): void {
+	if (inflight.net) return;
+	inflight.net = true;
+	fireText("netstat", ["-ib"], EXEC_TIMEOUT_MS, (txt) => {
+		inflight.net = false;
+		if (txt === null) return; // keep the previous reading
+		const v = parseNetstatIb(txt);
+		darwinNet.value = v;
+		darwinNet.at = performance.now();
+	});
+}
+
+function refreshDisk(): void {
+	if (inflight.disk) return;
+	inflight.disk = true;
+	fireText(
+		"ioreg",
+		["-r", "-c", "IOBlockStorageDriver", "-k", "Statistics", "-d", "1"],
+		EXEC_TIMEOUT_MS,
+		(txt) => {
+			inflight.disk = false;
+			if (txt === null) return; // keep the previous reading
+			const v = parseIoreg(txt);
+			darwinDisk.value = v;
+			darwinDisk.at = performance.now();
+		},
+	);
+}
+
+/** Kick off one async refresh round (cheap: at most 4 spawns, none awaited). */
+function refreshDarwinReadings(): void {
+	refreshMem();
+	refreshNet();
+	refreshDisk();
+}
+
+/** Test hook: resolve once every in-flight refresh has landed (bounded: the
+ *  first memory round chains TWO spawns — sysctl, then vm_stat — each guarded
+ *  by its own SIGKILL timeout, so the deadline covers both, plus slack).
+ *  Semantics: resolves when nothing is in flight OR the deadline passes — it
+ *  does NOT guarantee values landed (a missing command settles in milliseconds
+ *  with `undefined` readings); assert on the values themselves when a test
+ *  needs them. Exported so tests can await deterministically instead of
+ *  sleeping a fixed amount. */
+export async function __waitDarwinReadings(): Promise<void> {
+	const deadline = performance.now() + 2 * EXEC_TIMEOUT_MS + 750;
+	while ((inflight.mem || inflight.net || inflight.disk) && performance.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 10));
+	}
 }
 
 export function createCollector(): Collector {
+	// darwin rate ledgers: rates are computed between reading **capture
+	// timestamps** (see collect), so an asynchronously-late refresh can't skew
+	// the denominator. A `lastXAt === 0` means "no baseline yet" → rate 0,
+	// same ramp-up semantics as the macmon temperature child.
+	let netRxBps = 0;
+	let netTxBps = 0;
+	let lastNetRx = 0;
+	let lastNetTx = 0;
+	let lastNetAt = 0;
+	let diskRBps = 0;
+	let diskWBps = 0;
+	let lastDiskRead = 0;
+	let lastDiskWrite = 0;
+	let lastDiskAt = 0;
+
+	// Baselines: on Linux these are two cheap synchronous /proc reads. On macOS
+	// the counters come from the async layer, so the *baseline* is captured on
+	// the first refresh completion (see the `lastNetAt` guard in collect()),
+	// NOT synchronously here — `createCollector()` used to spawn netstat+ioreg
+	// synchronously at extension-load time (~45ms of startup jank before a
+	// single frame was drawn). The first refresh round is kicked from here so
+	// readings start landing immediately, but nothing waits for them.
+	if (IS_DARWIN) refreshDarwinReadings();
 	let lastCpu = readCpuTimes();
 	let lastNet = readNet();
 	let lastDisk = readDisk();
@@ -876,8 +1118,10 @@ export function createCollector(): Collector {
 	let lastTime = performance.now();
 
 	const collect = (): Snapshot => {
+		// macOS: kick the next async refresh round (no-op if still in flight).
+		// This is what keeps the cached readings ticking at the sample cadence.
+		if (IS_DARWIN) refreshDarwinReadings();
 		const now = performance.now();
-		const dt = Math.max(1, now - lastTime) / 1000;
 
 		const cpu = readCpuTimes();
 		const cpuDelta = cpu.total - lastCpu.total;
@@ -888,19 +1132,69 @@ export function createCollector(): Collector {
 			cpuPct = Math.min(100, Math.max(0, (100 * busyDelta) / cpuDelta));
 		}
 
-		const net = readNet();
-		const disk = readDisk();
-		const rxBps = Math.max(0, (net.rx - lastNet.rx) / dt);
-		const txBps = Math.max(0, (net.tx - lastNet.tx) / dt);
-		const readBps = Math.max(0, (disk.read - lastDisk.read) / dt);
-		const writeBps = Math.max(0, (disk.write - lastDisk.write) / dt);
-
-		const { used, total } = readMem();
+		// macOS: read the async-captured counters. Rates are computed over the
+		// readings' own capture timestamps (`at`), NOT the tick clock — a
+		// refresh that landed late would otherwise stretch or compress the rate
+		// denominator. First tick after a (re)start has no previous reading yet:
+		// report 0, exactly like the macmon ramp-up. A refresh that **hasn't
+		// landed since the last tick** (slow host / failure) keeps the previous
+		// rate — recomputing it over an unchanged counter would inject a fake
+		// zero-dip into the chart (measured: 187 B/s → 0 for one tick, then
+		// back). Cumulative totals still come from the cached reading.
+		let net = { rx: 0, tx: 0 };
+		let disk = { read: 0, write: 0 };
+		let mem = { used: 0, total: 0 };
+		if (IS_DARWIN) {
+			const n = darwinNet.value;
+			if (n) {
+				net = n;
+				// Only advance the rate ledger when a NEW reading landed (at moved):
+				// an unchanged reading means the refresh hasn't returned yet — hold
+				// the last rate rather than fabricating a zero.
+				if (darwinNet.at > lastNetAt) {
+					if (lastNetAt > 0) {
+						const dt = Math.max(1e-3, (darwinNet.at - lastNetAt) / 1000);
+						netRxBps = Math.max(0, (n.rx - lastNetRx) / dt);
+						netTxBps = Math.max(0, (n.tx - lastNetTx) / dt);
+					}
+					lastNetRx = n.rx;
+					lastNetTx = n.tx;
+					lastNetAt = darwinNet.at;
+				}
+			}
+			const d = darwinDisk.value;
+			if (d) {
+				disk = d;
+				// Same "hold the rate on a stale reading" rule as net above.
+				if (darwinDisk.at > lastDiskAt) {
+					if (lastDiskAt > 0) {
+						const dt = Math.max(1e-3, (darwinDisk.at - lastDiskAt) / 1000);
+						diskRBps = Math.max(0, (d.read - lastDiskRead) / dt);
+						diskWBps = Math.max(0, (d.write - lastDiskWrite) / dt);
+					}
+					lastDiskRead = d.read;
+					lastDiskWrite = d.write;
+					lastDiskAt = darwinDisk.at;
+				}
+			}
+			mem = darwinMem.value ?? mem;
+		} else {
+			net = readNet();
+			disk = readDisk();
+		}
+		const dtSync = Math.max(1, now - lastTime) / 1000;
+		const rxBps = IS_DARWIN ? netRxBps : Math.max(0, (net.rx - lastNet.rx) / dtSync);
+		const txBps = IS_DARWIN ? netTxBps : Math.max(0, (net.tx - lastNet.tx) / dtSync);
+		const readBps = IS_DARWIN ? diskRBps : Math.max(0, (disk.read - lastDisk.read) / dtSync);
+		const writeBps = IS_DARWIN ? diskWBps : Math.max(0, (disk.write - lastDisk.write) / dtSync);
+		const { used, total } = IS_DARWIN ? mem : readMem();
 		const cpuTemp = IS_DARWIN ? readCpuTempDarwin() : readCpuTempLinux();
 
 		lastCpu = cpu;
-		lastNet = net;
-		lastDisk = disk;
+		if (!IS_DARWIN) {
+			lastNet = net;
+			lastDisk = disk;
+		}
 		lastTime = now;
 
 		const [l1 = 0, l5 = 0, l15 = 0] = os.loadavg();

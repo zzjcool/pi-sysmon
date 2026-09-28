@@ -4,13 +4,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] — 2026-09-29
 
-> Merges with [0.8.2]'s netstat fix below: this branch generalizes that
-> netstat-only async sampler to all four darwin externals (netstat / ioreg /
-> vm_stat / sysctl) on one shared `fireText` primitive, keeping 0.8.2's test
-> seams, plausible-output guard and shutdown reaping — `readNetDarwin()`, the
-> `safeRate` spike guard and all of its seam tests survive on the new layer.
+> **Publishing note**: the `0.8.2` entry below was written but never shipped
+> (no tag, no npm publish — PR #1 merged after the entry was drafted). It is
+> part of THIS release; the async layer below generalizes that netstat-only
+> fix to all four darwin externals on one shared `fireText` primitive, keeping
+> its test seams, plausible-output guard and shutdown reaping — `readNetDarwin()`,
+> the `safeRate` spike guard and all of its seam tests survive on the new layer.
 
 ### Changed
 
@@ -33,17 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `hw.memsize` is captured once (it is a boot constant) — subsequent ticks refresh
     `vm_stat` only, one spawn saved per second.
   - Every async child keeps the SIGKILL hard-kill contract (`fireText`): a wedged
-    command is still bounded by the 5s timeout, output is buffer-capped at 4MiB, and
-    in-flight refreshes never overlap (one live child per command max).
+    command is still bounded by the 5s timeout (netstat: its own 15s ceiling), output
+    is buffer-capped at 4MiB, and in-flight refreshes never overlap (one live child
+    per command max).
+  - `fireText` children expose a `detach()` handle (the child-identity guard): a
+    shutdown-replaced child's late close can never clobber a respawn's reading.
   - **stderr is drained** (`resume()`): an un-read stderr pipe fills its ~64KB buffer
     and a chatty child then blocks until the SIGKILL backstop — measured with a
     6.4MB-stderr helper: never exits without the drain, ~160ms with it.
   - **A refresh that hasn't landed keeps the previous rate.** Recomputing a rate over
     an unchanged counter injected a fake 0 B/s dip into the chart (measured 187 → 0 →
     back); the rate ledger now only advances when a new reading actually landed.
+    The Linux/sync path gains the same spike protection via `safeRate` (PR #1).
   - **A permanently failed `sysctl` probe stops retrying** (`-1` sentinel): a
     missing/broken sysctl used to make every tick a 2-spawn retry storm (measured 10
     spawns in 5s); the memory total falls back to `os.totalmem()` permanently.
+- **`stopCpuTempDarwin()` (the `session_shutdown` path) reaps ALL in-flight sampler
+  children**, not just macmon + netstat — every refresh slot registers a detach hook
+  and gets the same TERM → SIGKILL escalation, with the slots released synchronously.
 - **Repaint memoization in the widget render path.** pi re-renders widgets on every
   keystroke and streaming delta, but the panel's inputs only move at the sampling
   cadence (1 Hz) and on `message_end`. The component now caches its body keyed by
@@ -78,7 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Top-level `after()` teardown in metrics tests kills the resident macmon child, so
   name-filtered runs (`--test-name-pattern`) no longer hang forever.
 
-## [0.8.2] — 2026-09-29
+## [0.8.2] — 2026-09-29 *(never published separately — shipped inside [0.9.0])*
 
 ### Fixed
 

@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createCollector,
+	execText,
 	hasCpuTempSource,
 	parseCpuTempText,
 	parseIoreg,
@@ -456,6 +457,62 @@ test("parseMacmonCpuTemp: schema drift (string value) → 0, never NaN", () => {
 
 test("parseMacmonCpuTemp: junk/banner line → 0", () => {
 	assert.equal(parseMacmonCpuTemp("macmon v0.8.2"), 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* 5b. execText hard-kill contract (the 2026-09-28 M1 startup freeze)    */
+/* ------------------------------------------------------------------ */
+
+/** A child that ignores SIGTERM and never exits — the exact shape of the
+ *  wedged brew `osx-cpu-temp` that froze pi at startup on an M1. `exec sleep`
+ *  replaces the shell with sleep, so the fixture is a single direct child
+ *  (like the real single-binary helper) and SIGKILL leaves no grandchild. */
+const WEDGED_HELPER = isDarwin || isLinux
+	? `#!/bin/sh
+trap '' TERM
+exec sleep 300
+`
+	: "";
+
+test("execText: SIGTERM-ignoring wedged child returns null within the timeout (SIGKILL, not SIGTERM)", { skip: !WEDGED_HELPER, timeout: 15_000 }, async () => {
+	const helper = join(tmpdir(), `pi-sysmon-wedged-${process.pid}.sh`);
+	writeSync(openSync(helper, "w", 0o755), WEDGED_HELPER);
+	try {
+		const t0 = performance.now();
+		const out = execText(helper, [], 1200);
+		const ms = performance.now() - t0;
+		// The 2026-09-28 incident: execFileSync's soft SIGTERM timeout never
+		// returned at all here. The contract now is null + a bounded wall time.
+		// (The test-level timeout above is the fail-fast backstop: with a soft
+		// SIGTERM regression this test would otherwise hang the whole suite.)
+		assert.equal(out, null, "wedged child must degrade to null");
+		assert.ok(ms < 4000, `wedged child took ${ms.toFixed(0)}ms — hard kill failed`);
+		// And no leaked process survives into later samples. The fixture uses
+		// `exec sleep` (no grandchild), so this check covers the whole tree.
+		await sleep(300);
+		const leftover = spawn("sh", [
+			"-c",
+			`pgrep -f ${JSON.stringify(helper)} || true`,
+		]).stdout;
+		let leftoverOut = "";
+		leftover.on("data", (d: Buffer) => (leftoverOut += d));
+		await new Promise((r) => leftover.on("close", r));
+		assert.equal(leftoverOut.trim(), "", `wedged child leaked: ${leftoverOut}`);
+	} finally {
+		unlinkSync(helper);
+	}
+});
+
+test("execText: normal commands still succeed (exit 0 / stdout passthrough)", () => {
+	// A quick command with args and output — the hot path (sysctl/vm_stat/
+	// netstat/ioreg all look like this on a healthy machine).
+	const echo = execText("sh", ["-c", "printf ok"], 2000);
+	assert.equal(echo, "ok");
+});
+
+test("execText: missing command and non-zero exit both degrade to null", () => {
+	assert.equal(execText("pi-sysmon-no-such-cmd-xyz", [], 1000), null);
+	assert.equal(execText("sh", ["-c", "exit 3"], 1000), null);
 });
 
 /* ------------------------------------------------------------------ */

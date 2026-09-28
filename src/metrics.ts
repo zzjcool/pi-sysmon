@@ -24,8 +24,8 @@
  * executable evidence for the architecture decision above.
  */
 import {
-	execFileSync,
 	spawn,
+	spawnSync,
 	type ChildProcessByStdio,
 } from "node:child_process";
 import type { Readable } from "node:stream";
@@ -37,16 +37,37 @@ const IS_LINUX = process.platform === "linux";
 /** Every child process is bounded: a wedged command must not hang the collector. */
 const EXEC_TIMEOUT_MS = 5000;
 
-/** Run a command and return stdout as text; null when it is missing/fails/times out. */
-function execText(file: string, args: string[]): string | null {
+/** Run a command and return stdout as text; null when it is missing/fails/times out.
+ *
+ * `spawnSync` with `killSignal: "SIGKILL"` is load-bearing, not style: Node's
+ * soft `timeout` (default SIGTERM) **does not return at all** when the child
+ * traps/ignores TERM — reproduced with `bash -c 'trap "" TERM; sleep 300'`:
+ * `execFileSync(..., { timeout: 1200 })` never threw, the caller hung until
+ * killed from outside. A brew `osx-cpu-temp` wedged in an uninterruptible SMC
+ * call behaves exactly like that (2026-09-28 incident: pi froze at startup on
+ * an M1 with the extension enabled). SIGKILL cannot be trapped, so the sampler
+ * is bounded by the timeout no matter what the child does.
+ *
+ * Exported (with a configurable timeout) so tests can pin the hard-kill
+ * contract with a short budget instead of waiting 5s. */
+export function execText(
+	file: string,
+	args: string[],
+	timeoutMs: number = EXEC_TIMEOUT_MS,
+): string | null {
 	try {
-		return execFileSync(file, args, {
+		const r = spawnSync(file, args, {
 			encoding: "utf8",
-			timeout: EXEC_TIMEOUT_MS,
+			timeout: timeoutMs,
+			killSignal: "SIGKILL",
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		if (r.error) return null; // ENOENT etc.: command absent, caller degrades
+		if (r.signal === "SIGKILL") return null; // timed out and was hard-killed
+		if (r.status !== 0) return null; // non-zero exit: caller degrades
+		return r.stdout;
 	} catch {
-		return null; // command absent / non-zero exit / timeout: caller degrades
+		return null; // spawn threw synchronously (rare): caller degrades
 	}
 }
 
@@ -335,6 +356,22 @@ export function parseMacmonCpuTemp(line: string): number {
  *    Intel SMC key `TC0P` with `sp78` decoding, and on Apple Silicon that key
  *    simply doesn't exist, so they print `0.0°C` (lavoiesl/osx-cpu-temp#38,
  *    Chris911/iStats#107, both open). Kept for Intel Macs.
+ *
+ * **Fallback circuit breaker (2026-09-28 incident)**: the synchronous Intel
+ * helpers run **inside every `collect()`** while `macmonTemp === 0` — on a
+ * macmon-less machine that is once per second, forever. Worse, a wedged
+ * helper (an `osx-cpu-temp` build that hangs in an uninterruptible SMC call
+ * and ignores SIGTERM — `execFileSync`'s `timeout` only *sends* the signal,
+ * it does not hard-kill) blocks the JS thread indefinitely: measured on an
+ * M1 with brew `osx-cpu-temp`, pi froze at startup with the whole TUI dead.
+ * The fixes, both required:
+ *   · **Hard kill after the soft timeout** — the child gets SIGKILL shortly
+ *     after SIGTERM, so nothing can wedge the sampler forever.
+ *   · **Cooldown on failure** — a helper that produced no usable reading
+ *     recently is skipped for HELPER_COOLDOWN_MS instead of being retried
+ *     every tick. A one-off wedge then costs a single skipped sample, not a
+ *     frozen loop; a permanently wedged helper is probed at most once a
+ *     minute instead of once a second.
  */
 let macmonChild: ChildProcessByStdio<null, Readable, Readable> | undefined;
 let macmonTemp = 0;
@@ -346,6 +383,15 @@ let macmonLastStart = -Infinity;
 /** Restart backoff: after a crash, wait before respawning so a broken macmon
  *  installation can't turn every `collect()` into a fork bomb. */
 const MACMON_RESTART_MS = 10_000;
+/** How long a sync helper that failed/wedged/returned 0 is skipped before
+ *  being retried. 60s: enough that a permanently broken helper costs one
+ *  bounded probe per minute, short enough that installing/fixing it picks
+ *  up within a minute without a session restart. */
+const HELPER_COOLDOWN_MS = 60_000;
+/** Per-helper cooldown ledger (name → monotonic time of the last attempt).
+ *  Module-level like the macmon state: one collector per process, and a
+ *  second `createCollector()` (tests) must not reset the other's cooldown. */
+const helperLastTry = new Map<string, number>();
 
 function readCpuTempDarwin(): number {
 	// 1) macmon (Apple Silicon): the resident child updates `macmonTemp`.
@@ -390,15 +436,23 @@ function readCpuTempDarwin(): number {
 	if (macmonTemp > 0) return macmonTemp;
 	// The first reading lands ~1s after the child starts; before that (and on
 	// Intel Macs / macmon-less machines) fall back to the synchronous helpers.
-	// 2) Intel Mac helpers.
+	// 2) Intel Mac helpers — circuit-breaked (see the block comment above):
+	//    skipped for HELPER_COOLDOWN_MS after an unusable attempt, and each run
+	//    is SIGKILL-hardened so a wedged binary can never block collect().
+	const now = performance.now();
 	for (const [file, args] of [
 		["osx-cpu-temp", []],
 		["istats", ["cpu", "temperature"]],
 	] as const) {
+		if (now - (helperLastTry.get(file) ?? -Infinity) < HELPER_COOLDOWN_MS)
+			continue; // recently failed/wedged/zero: skip for the cooldown window
+		helperLastTry.set(file, now);
 		const out = execText(file, [...args]);
 		if (out === null) continue;
 		const c = parseCpuTempText(out);
 		if (c > 0) return c;
+		// "0.0°C" (Apple Silicon SMC key absent) or junk output: same cooldown,
+		// otherwise a macmon-less M1 re-spawns the helper every single tick.
 	}
 	return 0;
 }
@@ -407,7 +461,12 @@ function readCpuTempDarwin(): number {
  *  streaming process never outlives the session (pi exits, the child would
  *  otherwise be reparented and keep running). */
 export function stopCpuTempDarwin(): void {
-	macmonChild?.kill();
+	// TERM first (lets macmon flush/exit cleanly), then a detached KILL follow-up:
+	// a macmon build that traps TERM must not outlive the session as an orphan.
+	// Async + unref — this is a shutdown path, it must never block the caller.
+	const child = macmonChild;
+	child?.kill();
+	if (child) setTimeout(() => child.kill("SIGKILL"), 500).unref();
 	macmonChild = undefined;
 	macmonTemp = 0;
 	macmonBuf = "";

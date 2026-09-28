@@ -85,7 +85,7 @@ const HEADER = `/**
  *   PI_SYSMON_MODE=chart         initial mode
  */
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import type { Readable } from "node:stream";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import os, { homedir } from "node:os";

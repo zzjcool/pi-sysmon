@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-09-29
+
+### Fixed
+
+- **pi froze at startup on machines with a misbehaving CPU-temperature helper (macOS).**
+  On an M1 Mac with a brew-installed `osx-cpu-temp` and no `macmon`, the temperature
+  fallback chain ran that binary **synchronously on every 1-second sample** (the first
+  one inside the `session_start` handler), and when the helper wedged in an
+  uninterruptible SMC call — ignoring the soft-timeout SIGTERM, which is all Node's
+  `execFileSync` `timeout` ever sends — the sampler blocked **forever**: the whole TUI
+  froze at launch, and disabling the extension "fixed" it. Two independent fixes, both
+  required:
+  - `execText` now uses `spawnSync` with `killSignal: "SIGKILL"`: SIGKILL cannot be
+    trapped, so every probe is bounded by the 5s timeout no matter what the child does.
+    (Reproduced locally: `execFileSync(timeout: 1200)` against a TERM-ignoring child
+    never returned — not even an exception.)
+  - The helper fallback is now circuit-broken: a helper that failed, timed out, or
+    produced no usable reading (e.g. `0.0°C` on Apple Silicon, where the Intel SMC key
+    `TC0P` doesn't exist) is skipped for 60s instead of being retried every tick —
+    a `macmon`-less machine no longer re-spawns a dead-end binary once per second.
+  - `stopCpuTempDarwin()` now escalates TERM → SIGKILL (500ms grace) so a wedged
+    resident `macmon` can't outlive the session as an orphan either.
+- Regression tests pin the hard-kill contract: a SIGTERM-ignoring child must degrade
+  to `null` within the timeout (with a test-level fail-fast backstop, because a
+  regression here hangs rather than fails), plus normal-command and ENOENT semantics.
+  `execText` is exported for testing.
+
 ## [0.8.0] — 2026-09-29
 
 ### Changed

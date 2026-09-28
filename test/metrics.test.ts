@@ -15,7 +15,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { fsyncSync, openSync, closeSync, unlinkSync, writeSync, readFileSync, existsSync } from "node:fs";
+import { fsyncSync, openSync, closeSync, unlinkSync, writeSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -706,10 +706,16 @@ test("createCollector: on darwin the first collect()s report 0 net rate while th
 /*    these contracts run on Linux CI too)                               */
 /* ------------------------------------------------------------------ */
 
-/** Write an executable helper script to the tmpdir and return its path. */
+/** Write an executable helper script to the tmpdir and return its path.
+ *  `writeFileSync` (not writeSync+openSync): the fd must be CLOSED before
+ *  the script is spawned — on Linux, executing a file whose write fd is still
+ *  open fails with ETXTBSY (macOS allows it, so this only showed up in CI). */
 function shHelper(body: string): string {
-	const p = join(tmpdir(), `pi-sysmon-net-${process.pid}-${Math.random().toString(36).slice(2)}.sh`);
-	writeSync(openSync(p, "w", 0o755), body);
+	const p = join(
+		tmpdir(),
+		`pi-sysmon-net-${process.pid}-${Math.random().toString(36).slice(2)}.sh`,
+	);
+	writeFileSync(p, body, { mode: 0o755 });
 	return p;
 }
 

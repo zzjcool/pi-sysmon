@@ -927,10 +927,21 @@ export function readNetDarwin(): { rx: number; tx: number } {
 	const timeoutMs = override?.timeoutMs ?? NETSTAT_TIMEOUT_MS;
 	if (!netstatBusy) {
 		netstatBusy = true;
+		const startChild = (): ChildProcessByStdio<null, Readable, Readable> => {
+			try {
+				return spawn(file, args, {
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+			} catch (e) {
+				// Linux can transiently refuse a just-written executable with
+				// ETXTBSY (the writer's fd is technically still open). One immediate
+				// retry resolves it; anything else (ENOENT etc.) is a real error.
+				if ((e as NodeJS.ErrnoException)?.code !== "ETXTBSY") throw e;
+				return spawn(file, args, { stdio: ["ignore", "pipe", "pipe"] });
+			}
+		};
 		try {
-			const child = spawn(file, args, {
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			const child = startChild();
 			netstatChild = child;
 			// Per-child buffer: a stopped child's late data events must not
 			// pollute the next child's sample.

@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Line mode shows the CPU temperature** (`CPU 12% 48°  MEM …`), with the same reading and
+  color thresholds as the CPU chart title (>75°C warning, >90°C error). Omitted when there is
+  no sensor, so non-Linux / sensorless hosts see no bare `°`.
+
 ## [0.9.0] — 2026-09-29
 
 > **Publishing note**: the `0.8.2` entry below was written but never shipped

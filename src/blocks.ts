@@ -396,6 +396,11 @@ export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
 		groups.push([
 			seg("CPU ", "muted"),
 			seg(`${s.cpuPct.toFixed(0)}%`, "success"),
+			// Same reading and color rule as the CPU chart title; omitted when
+			// there is no sensor (reads 0) so there is never a bare `°` stub.
+			...(Number.isFinite(s.cpuTemp) && s.cpuTemp > 0
+				? [seg(` ${s.cpuTemp.toFixed(0)}°`, tempColor(s.cpuTemp))]
+				: []),
 		]);
 		groups.push([
 			seg("MEM ", "muted"),

@@ -2696,6 +2696,26 @@ test("plainLineSegs: includes token readouts (rate + session cumulative), same c
 	assert.equal(colorOf("⌀"), "warning");
 });
 
+test("plainLineSegs: CPU group carries the temperature with the chart's color rule", () => {
+	// Same reading and thresholds as the CPU chart title (`tempColor`), so the
+	// two modes can be cross-checked.
+	const colorOf = (segs: StyledLine, needle: string): string | undefined =>
+		segs.find((s) => s.text.includes(needle))?.color;
+	const warm = plainLineSegs({ snap: fakeSnap({ cpuTemp: 61.4 }) }, 200);
+	assert.match(segsText(warm), /^CPU 37% 61°  MEM /);
+	assert.equal(colorOf(warm, "61°"), "muted");
+	const hot = plainLineSegs({ snap: fakeSnap({ cpuTemp: 80 }) }, 200);
+	assert.equal(colorOf(hot, "80°"), "warning");
+	const burning = plainLineSegs({ snap: fakeSnap({ cpuTemp: 95 }) }, 200);
+	assert.equal(colorOf(burning, "95°"), "error");
+	// No sensor (reads 0) or a non-finite reading: no `°` stub at all.
+	for (const cpuTemp of [0, Number.NaN]) {
+		const text = segsText(plainLineSegs({ snap: fakeSnap({ cpuTemp }) }, 200));
+		assert.match(text, /^CPU 37%  MEM /, `cpuTemp=${cpuTemp}: ${text}`);
+		assert.doesNotMatch(text, /°/);
+	}
+});
+
 test("plainLineSegs: TOK group sits before NET, and NET is the group dropped first", () => {
 	// Group order is CPU → MEM → TOK → NET. Whole groups are dropped from the
 	// tail, so this single ordering decides which of the two survives a narrow

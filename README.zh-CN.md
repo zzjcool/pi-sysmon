@@ -6,7 +6,7 @@
 
 CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史曲线
 
-[![test](https://img.shields.io/badge/tests-167%2F167-brightgreen)](#测试)
+[![test](https://img.shields.io/badge/tests-244-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="四图并排：CPU / Memory / Network / Tokens" width="100%">
@@ -29,7 +29,9 @@ CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史
 - **CPU 温度曲线** —— CPU 图以第二条（红色）曲线绘制温度，自带 0–100°C 刻度与 CPU% 共享绘图区
   （右上角 `100°` 标注副轴刻度，标题栏同步显示当前 `°C` 读数，参照 Tokens 图 TPS/缓存率双轴的实现）。
   Linux 读取 `/sys/class/hwmon` + `/sys/class/thermal`；macOS 无免 root 系统 API，
-  探测用户自装的 `osx-cpu-temp` / `istats` 辅助命令 —— 无可用源时图表安静降级为单曲线原样
+  探测用户自装的辅助命令（Apple Silicon 用
+  [`macmon`](https://github.com/vladkens/macmon)，Intel Mac 用 `osx-cpu-temp` / `istats`）——
+  无可用源时图表安静降级为单曲线原样
 - **带坐标轴** —— y 轴刻度、x 轴线、时间窗标签，复刻 bottom 的排版
 - **y 轴顶端 = 整窗真实最高值** —— 60s 窗口内任何一处的高度都能直接用顶端刻度读出来，
   刻度绝不撒谎（配合 `PI_SYSMON_SCALE_WINDOW=<1` 还能开启尖峰后自动回落）
@@ -129,7 +131,7 @@ pi 的估算考虑了那些累计值看不到的东西。
 pi install npm:pi-sysmon
 
 # 或锁定具体版本
-pi install npm:pi-sysmon@0.4.0
+pi install npm:pi-sysmon@0.9.0
 
 # 或直接装 git 源
 pi install git:github.com/zzjcool/pi-sysmon
@@ -411,7 +413,8 @@ pi 单独测试与复用；`metrics.ts` 只负责读数，不关心怎么显示�
 ## 测试
 
 ```bash
-npm test          # 167 项单元测试（braille 13 + layout 74 + tokens 31 + state 26 + extension 23）
+npm test          # 244 项单元测试（braille 13 + layout 87 + tokens 32 + state 26 + extension 28 + metrics 58；
+                  #   其中 13 个 darwin 真机测试在其他平台自动跳过，其余 231 个全平台必跑）
 ```
 
 ```bash
@@ -429,6 +432,12 @@ npm run check     # 两者都跑
 `line` 模式也在这里扫全宽度：`plainLineSegs` + `renderStyledLine` 在 8..220 列下
 渲染宽度必须**恰好等于**声明宽度（多一列就 pi 退出），且窄到 1 列也不抛异常、
 CPU 段永远保留。
+
+`test/metrics.test.ts` 覆盖 macOS 采集层：darwin 各外部命令的解析器
+（`vm_stat` / `netstat -ib` / `iostat` / `ioreg`）以纯函数形式对固定 fixture 逐一断言，
+以及异步采样器契约（卡死的外部命令不得阻塞主线程且不得重复 spawn、坏输出
+不得抹掉最后一笔好读数），另有仅在 macOS 跑的真机测试（其他平台自动跳过），
+会诱导真实的 CPU / 网络 / 磁盘负载来验证。
 
 `test/tokens.test.ts` 覆盖 token 估算（英文 `chars/4`、CJK 逐字、emoji 算一个、
 非字符串防御）、每秒桶的排空语义（关闭期积压不得变成假尖峰），

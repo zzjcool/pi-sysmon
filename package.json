@@ -34,7 +34,9 @@
 	},
 	"files": [
 		"src",
-		"docs",
+		"docs/ARCHITECTURE.md",
+		"docs/ARCHITECTURE.zh-CN.md",
+		"docs/images",
 		"README.md",
 		"README.zh-CN.md",
 		"CHANGELOG.md",

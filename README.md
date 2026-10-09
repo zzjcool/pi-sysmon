@@ -6,7 +6,7 @@
 
 CPU · Memory · Network · Tokens — real-time history curves drawn with braille dot-matrix characters
 
-[![test](https://img.shields.io/badge/tests-167%2F167-brightgreen)](#testing)
+[![test](https://img.shields.io/badge/tests-244-brightgreen)](#testing)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="Four charts side by side: CPU / Memory / Network / Tokens" width="100%">
@@ -29,7 +29,8 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
 - **CPU temperature curve** — the CPU chart draws a second (red) line with its own 0–100°C scale
   sharing the plot area with CPU% (a `100°` label marks the secondary scale at the top-right corner;
   the title bar carries the current `°C` reading). Linux reads `/sys/class/hwmon` + `/sys/class/thermal`;
-  macOS has no unprivileged API, so an optional user-installed helper (`osx-cpu-temp` / `istats`) is probed —
+  macOS has no unprivileged API, so an optional user-installed helper is probed
+  ([`macmon`](https://github.com/vladkens/macmon) on Apple Silicon; `osx-cpu-temp` / `istats` on Intel) —
   without a source the chart silently degrades to the plain single-curve form
 - **Proper axes** — y-axis tick marks, an x-axis line, and time-window labels, replicating bottom's layout
 - **Top of y-axis = true window maximum** — the height at any point in the 60s window can be read
@@ -143,7 +144,7 @@ the token readout is far less recoverable from elsewhere on screen.
 pi install npm:pi-sysmon
 
 # or pin an exact version
-pi install npm:pi-sysmon@0.4.0
+pi install npm:pi-sysmon@0.9.0
 
 # or straight from git
 pi install git:github.com/zzjcool/pi-sysmon
@@ -453,7 +454,8 @@ widths (the `┌ CPU ─ 1.91 1.80 2.17 ───┐` kind). For example:
 ## Testing
 
 ```bash
-npm test          # 167 unit tests (braille 13 + layout 74 + tokens 31 + state 26 + extension 23)
+npm test          # 244 unit tests (braille 13 + layout 87 + tokens 32 + state 26 + extension 28 + metrics 58;
+                  #   13 darwin-only live tests are skipped on other platforms, 231 run everywhere)
 ```
 
 ```bash
@@ -475,6 +477,12 @@ sweep the whole width range rather than spot-checking a few widths.
 `renderStyledLine` must render at **exactly** the declared width across 8..220 columns (one
 column over and pi exits), must not throw even when squeezed to 1 column, and the CPU segment
 is always kept.
+
+`test/metrics.test.ts` covers the macOS collection layer: every darwin external's parser
+(`vm_stat` / `netstat -ib` / `iostat` / `ioreg`) as exported pure functions against fixture
+text, the async sampler contracts (a wedged external must hold its slot without blocking the
+main thread, must never double-spawn, and a bad output must not wipe the last good reading),
+plus darwin-only live tests (skipped elsewhere) that induce real CPU / network / disk load.
 
 `test/tokens.test.ts` covers token estimation (English `chars/4`, per-character CJK, emoji count
 as one, non-string defenses), the drain semantics of per-second buckets (backlog during an off

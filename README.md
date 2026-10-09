@@ -277,11 +277,13 @@ every session.
 One line, in descending order of importance; when it doesn't fit, whole segments are dropped **from the tail** (never cutting a number in half, e.g. no `↑1.0` stubs):
 
 ```text
-CPU 12%  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
-└─ system metrics ──────────────────────┘ └─ LLM tokens ────────────────┘
+CPU 12% 48°  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
+└─ system metrics ──────────────────────────┘ └─ LLM tokens ────────────────┘
 ```
 
 - **CPU / MEM / NET** come from the same sources and use the same colors as the corresponding chart-mode blocks;
+  the CPU group also carries the temperature (`48°`, same thresholds as the chart title) and
+  omits it when no sensor is available;
 - **TOK** is LLM token throughput: `~<rate>` (estimated from streaming deltas, hence the `~`)
   plus the session-cumulative `↑input ↓output RcacheRead` (from the **exact** `usage` of
   `message_end`, byte-aligned with pi footer's `↑↓R` convention, so it can be checked directly

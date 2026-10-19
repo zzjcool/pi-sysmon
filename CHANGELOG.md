@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Line mode shows the CPU temperature** (`CPU 12% 48°  MEM …`), with the same reading and
   color thresholds as the CPU chart title (>75°C warning, >90°C error). Omitted when there is
   no sensor, so non-Linux / sensorless hosts see no bare `°`.
+- **The Memory chart draws this pi process's own RSS as a second (red) curve**, with the
+  sub-axis ceiling in bytes and a title-bar reading —
+  `┌ Memory ─ 52%  33G/62G  pi 706M ────┐`, the plot's top-right corner carrying `64G`.
+  Read from `process.memoryUsage().rss` once per second. Two scope decisions are deliberate:
+  **this process only** (not aggregating the other pi instances on the machine — that needs
+  `/proc/*/stat` or `ps`, and it would tangle with herdr's multi-instance semantics), and
+  **no new spawn / file read** (a pure in-process call, ~14µs; it also works on Windows where
+  the rest of the memory chart reads 0). The curve is excluded from the y-scale, so the fixed
+  0..100 memory axis — and its comparability across time — is untouched. **The floating
+  readout box is deliberately unchanged** (`RAM 52% 33G/62G`, still one line): a second line
+  is dropped outright at the default plot height (`legendH < plotRows`), and appending to the
+  existing line would widen it past what a 24-column block can hold. The RSS reading therefore
+  lives in the title bar and in line mode (`MEM 52% 33G pi 706M`) only.
 
 ## [0.9.0] — 2026-09-29
 

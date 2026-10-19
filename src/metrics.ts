@@ -144,6 +144,19 @@ export interface Snapshot {
 	memUsed: number;
 	memTotal: number;
 	memPct: number;
+	/**
+	 * RSS of **this** pi process, in bytes (`process.memoryUsage().rss`).
+	 *
+	 * **0 means unknown** (the reading failed) — the chart layer gates the RSS
+	 * curve on a live >0 reading, so a failed read degrades to the old
+	 * single-curve Memory block instead of drawing a line glued to 0 B.
+	 *
+	 * Deliberately **this process only**, not every pi instance on the machine:
+	 * aggregating them would mean reading every pid's `/proc` stat entry or shelling
+	 * out to `ps`, which is both expensive per tick and tangled up with herdr's
+	 * multi-instance semantics (each instance already draws its own charts).
+	 */
+	procRss: number;
 	/** 1/5/15 minute load averages (bottom's CPU title bar shows these three) */
 	load1: number;
 	load5: number;
@@ -201,6 +214,30 @@ function readMem(): { used: number; total: number } {
 	} catch {
 		// Fall back to os.totalmem off Linux; no reliable source for `used`, so report 0
 		return { used: 0, total: os.totalmem() };
+	}
+}
+
+/**
+ * RSS of **this** pi process, in bytes.
+ *
+ * Why `process.memoryUsage().rss` instead of `/proc/self/status`'s `RssAnon`:
+ *  · cross-platform — it also returns a real number on Windows, where every
+ *    other memory source in this file reads 0 (`/proc` absent, and the darwin
+ *    `vm_stat` layer is macOS-only);
+ *  · ~13.7µs per call, i.e. invisible at the 1 Hz sampling rate (no spawn, no
+ *    file read — this must stay a pure in-process call);
+ *  · it agrees with what `top`/`ps` print for this pid, so the chart can be
+ *    cross-checked against them.
+ *
+ * Never throws (the repo's hard rule: nothing here may throw on a non-Linux
+ * platform) and clamps non-finite/non-positive readings to 0 = "unknown".
+ */
+function readProcRss(): number {
+	try {
+		const v = process.memoryUsage().rss;
+		return Number.isFinite(v) && v > 0 ? v : 0;
+	} catch {
+		return 0; // unavailable: 0 = unknown, never a fabricated reading
 	}
 }
 
@@ -1371,6 +1408,7 @@ export function createCollector(): Collector {
 			memUsed: used,
 			memTotal: total,
 			memPct: total > 0 ? (100 * used) / total : 0,
+			procRss: readProcRss(),
 			load1: l1,
 			load5: l5,
 			load15: l15,

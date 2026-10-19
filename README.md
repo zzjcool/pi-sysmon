@@ -32,6 +32,12 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
   macOS has no unprivileged API, so an optional user-installed helper is probed
   ([`macmon`](https://github.com/vladkens/macmon) on Apple Silicon; `osx-cpu-temp` / `istats` on Intel) —
   without a source the chart silently degrades to the plain single-curve form
+- **Process RSS curve** — the Memory chart draws a second (red) line: **this pi process's own RSS**
+  (`process.memoryUsage().rss`), pre-mapped onto the same 0–100% axis as `100 × rss / memTotal`.
+  The label in the plot's top-right corner is what 100% stands for in bytes (the memory total,
+  `64G` — *not* the current reading), and the title bar carries the reading itself (`pi 700M`).
+  Scope is deliberately **this process only** — it does not aggregate the machine's other pi
+  instances — and it is the one memory readout that still has a real value on Windows
 - **Proper axes** — y-axis tick marks, an x-axis line, and time-window labels, replicating bottom's layout
 - **Top of y-axis = true window maximum** — the height at any point in the 60s window can be read
   directly off the top tick; the scale never lies (set `PI_SYSMON_SCALE_WINDOW=<1` to also enable
@@ -135,6 +141,34 @@ touch the cache degrade to the previous single-curve block unchanged. In `line` 
 importance order — when the line runs out of room, whole groups are dropped from the tail, and
 the token readout is far less recoverable from elsewhere on screen.
 
+### Memory: this process's RSS as the second curve
+
+The Memory chart draws **two** curves: the machine's memory percentage (the block's own yellow
+curve) and, once a reading exists, a **red line for this pi process's own RSS** —
+`process.memoryUsage().rss`, sampled once per tick (1 s by default) and stored as raw bytes (the
+mapping onto the shared 0–100% axis, `100 × rss / memTotal`, happens at render time, where the
+memory total is known).
+
+```text
+┌ Memory ─ 52%  33G/64G  pi 700M ──────────────────────────┐
+│100%                                                   64G│
+```
+
+- **Scope: this process only.** The RSS curve is not an aggregate over the machine's pi processes —
+  with several instances running (herdr panes, subagents) **each one draws its own line**. The
+  percentage curve above it is still machine-wide, so two instances on one box draw the same
+  memory% curve and different RSS curves;
+- **The corner label is the byte scale, not the reading.** `64G` at the plot's top-right is what
+  100% of the axis stands for (the memory total in bytes); the current RSS is the `pi 700M`
+  segment in the title bar, in the same red as the curve, so the two can be matched at a glance;
+- **The only memory readout that works on Windows**, where the machine-wide memory chart reads 0
+  (see the platform table above);
+- **No reading, no curve**: a platform or process where the call fails degrades to the plain
+  single-curve Memory block — no corner label, and no `pi 0B` stub in the title bar;
+- **The floating box is unaffected**: with `PI_SYSMON_LABEL=box` it stays the single line
+  `RAM 52% 33G/64G`; the RSS reading appears in the title bar (default `title` mode) and in `line`
+  mode (`MEM 52% 33G pi 700M`).
+
 ## Installation
 
 ### Install with pi (recommended)
@@ -187,7 +221,7 @@ curve and gets a one-time startup notice (see *Startup dependency preflight* bel
 | Chart | Linux | macOS | Windows |
 |---|---|---|---|
 | CPU | ✅ `/proc/stat` | ✅ `os.cpus()` | ❌ reads 0 |
-| Memory | ✅ `/proc/meminfo` | ✅ `sysctl` + `vm_stat` | ❌ reads 0 |
+| Memory | ✅ `/proc/meminfo` | ✅ `sysctl` + `vm_stat` | ❌ reads 0; the RSS curve still works³ |
 | Network | ✅ `/proc/net/dev` | ✅ `netstat -ib` | ❌ reads 0 |
 | Disk | ✅ `/proc/diskstats` | ✅ `ioreg` | ❌ reads 0 |
 | CPU temperature | ✅ `/sys/class/hwmon` + `/sys/class/thermal`¹ | ⚠️ needs `macmon`² | ❌ reads 0 |
@@ -201,6 +235,10 @@ missing dependency, and the other charts work normally.
 [`macmon`](https://github.com/vladkens/macmon) (`brew install macmon`); on Intel Macs
 `osx-cpu-temp` or `istats` also work. Without one, the CPU chart simply drops back to
 the single-curve form and everything else is unaffected.
+
+³ The machine-wide memory percentage needs `/proc` / `sysctl`, but the Memory chart's second
+curve is this process's own RSS from `process.memoryUsage()`, which is cross-platform — so on
+Windows the percentage curve sits at 0 while `pi 700M` stays a real reading.
 
 Node ≥ 22.19 required (`engines` field is enforced by npm).
 
@@ -277,17 +315,23 @@ every session.
 One line, in descending order of importance; when it doesn't fit, whole segments are dropped **from the tail** (never cutting a number in half, e.g. no `↑1.0` stubs):
 
 ```text
-CPU 12% 48°  MEM 60% 37G  NET ↑592K/s ↓34K/s  TOK ~0t/s ↑5.7k ↓89 R2.7k
-└─ system metrics ──────────────────────────┘ └─ LLM tokens ────────────────┘
+CPU 37% 61°  MEM 52% 33G pi 700M  TOK ~1.2Kt/s ·88% ⌀32%  NET ↑7.7K/s ↓121K/s
+└─ CPU ───┘  └─ MEM ───────────┘  └─ LLM tokens ───────┘  └─ network ───────┘
 ```
 
 - **CPU / MEM / NET** come from the same sources and use the same colors as the corresponding chart-mode blocks;
-  the CPU group also carries the temperature (`48°`, same thresholds as the chart title) and
-  omits it when no sensor is available;
-- **TOK** is LLM token throughput: `~<rate>` (estimated from streaming deltas, hence the `~`)
-  plus the session-cumulative `↑input ↓output RcacheRead` (from the **exact** `usage` of
-  `message_end`, byte-aligned with pi footer's `↑↓R` convention, so it can be checked directly
-  against the bottom line);
+  the CPU group also carries the temperature (`61°`, same thresholds as the chart title) and
+  omits it when no sensor is available; the MEM group also carries this process's RSS
+  (`pi 700M`, red — the same reading and color as the Memory chart's title bar). Its width follows
+  the number (`pi 700M` is 8 columns, `pi 15G` 7, `pi 1023M` 9), and with the reading above the
+  whole line is 77 columns, so the NET group (dropped last) only appears from 77 columns instead
+  of 69 — a narrower terminal loses the network rate where it used to fit;
+- **TOK** is LLM token throughput: `~<rate>` (estimated from streaming deltas, hence the `~`),
+  followed by the context-window usage `◔N%` when pi reports one (it had none for the frame above),
+  then the instantaneous / cumulative cache hit rates `·N%` / `⌀N%` — all gated exactly like
+  their chart-mode counterparts. In `footer` mode (which replaces pi's own bar) the group also
+  carries the session-cumulative `↑input ↓output RcacheRead` (from the **exact** `usage` of
+  `message_end`, byte-aligned with pi footer's `↑↓R` convention);
 - Without a snapshot (non-Linux / `/proc` unreadable) the TOK segment is still emitted — it's
   the only metric that doesn't depend on `/proc`.
 

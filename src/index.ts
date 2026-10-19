@@ -343,6 +343,7 @@ export default function (pi: ExtensionAPI) {
 		cpu: [],
 		cpuTemp: [],
 		mem: [],
+		procRss: [],
 		netRx: [],
 		netTx: [],
 		diskR: [],
@@ -482,6 +483,9 @@ export default function (pi: ExtensionAPI) {
 			pushCapped(hist.cpu, snap.cpuPct, STORE_CAP);
 			pushCapped(hist.cpuTemp, snap.cpuTemp, STORE_CAP);
 			pushCapped(hist.mem, snap.memPct, STORE_CAP);
+			// Raw **bytes**, not the percentage — `buildBlocks` does the mapping at
+			// render time (the history has no idea what `memTotal` is).
+			pushCapped(hist.procRss, snap.procRss, STORE_CAP);
 			pushCapped(hist.netRx, snap.rxBps, STORE_CAP);
 			pushCapped(hist.netTx, snap.txBps, STORE_CAP);
 			pushCapped(hist.diskR, snap.readBps, STORE_CAP);

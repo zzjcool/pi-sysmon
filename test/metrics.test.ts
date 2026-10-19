@@ -541,6 +541,57 @@ test("execText: missing command and non-zero exit both degrade to null", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* 5f. procRss — THIS process's RSS (cross-platform, never skipped)     */
+/* ------------------------------------------------------------------ */
+
+// Why this block is **not** `skip: !isDarwin` like everything else in this
+// file: `process.memoryUsage()` is the one memory source in `metrics.ts` that
+// works on every platform (no `/proc`, no `vm_stat`). Linux CI therefore gets
+// its only live coverage of `readProcRss()` right here — skipping it would
+// leave the whole feature unverified on the platform most users run.
+
+test("procRss: a live collector reports this process's RSS (finite, positive, <= total RAM)", () => {
+	const s = createCollector().collect();
+	assert.equal(typeof s.procRss, "number");
+	assert.ok(Number.isFinite(s.procRss), `not finite: ${s.procRss}`);
+	assert.ok(s.procRss > 0, `a live process must report >0 bytes, got ${s.procRss}`);
+	// A single process's RSS can never exceed the machine's RAM.
+	assert.ok(
+		s.procRss <= os.totalmem(),
+		`procRss ${s.procRss} > totalmem ${os.totalmem()}`,
+	);
+});
+
+test("procRss: agrees with process.memoryUsage().rss (same quantity, ±50% GC slack)", () => {
+	// This is what pins the **unit**: `readProcRss` must report raw bytes. A kB
+	// (or page-count) mix-up would draw a curve 1024× (or 4096×) too short and
+	// still "look plausible" on screen — no other test would notice.
+	// ±50% slack because the two reads are separated by a full collect() and the
+	// GC may have run in between (V8's RSS moves by tens of MB in a tick).
+	const s = createCollector().collect();
+	const direct = process.memoryUsage().rss;
+	assert.ok(direct > 0, `test precondition: memoryUsage().rss > 0, got ${direct}`);
+	assert.ok(
+		s.procRss >= direct * 0.5 && s.procRss <= direct * 1.5,
+		`procRss ${s.procRss} is not the same quantity as memoryUsage().rss ${direct}`,
+	);
+});
+
+test("procRss: never negative, never NaN (0 means unknown, not garbage)", () => {
+	// 0 is a legal value ("reading unavailable"), so the degradation contract —
+	// `buildBlocks` gates the whole RSS curve on `> 0` — depends on this field
+	// being strictly a finite non-negative number. NaN reaching
+	// `100 * v / memTotal` would poison the coordinates (ARCHITECTURE pitfall 4:
+	// NaN coordinates crash the renderer).
+	const s = createCollector().collect();
+	assert.equal(typeof s.procRss, "number", "must always be a number, never undefined");
+	// `Number.isFinite` below already implies both "not NaN" and "not ±Infinity",
+	// so a separate `!Number.isNaN` assertion would be dead weight.
+	assert.ok(Number.isFinite(s.procRss), `procRss not finite: ${s.procRss}`);
+	assert.ok(s.procRss >= 0, `procRss negative: ${s.procRss}`);
+});
+
+/* ------------------------------------------------------------------ */
 /* 6. Live smoke tests (darwin only)                                    */
 /* ------------------------------------------------------------------ */
 

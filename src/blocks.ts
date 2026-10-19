@@ -38,6 +38,24 @@ export interface History {
 	 */
 	cpuTemp: number[];
 	mem: number[];
+	/**
+	 * RSS of **this pi process** in **BYTES** (0 = unknown), sampled once per frame
+	 * from `Snapshot.procRss`.
+	 *
+	 * Stored **raw bytes, not a percentage** — the same reason `cpuTemp` stores raw
+	 * °C: the reading keeps its own unit, and the mapping onto the shared percent
+	 * axis (`100 * rss / memTotal`) happens at render time, where `memTotal` is
+	 * known. Storing a percentage would freeze this frame's `memTotal` into the
+	 * history and silently corrupt the curve after a hotplug/resize.
+	 *
+	 * **0 = unknown**, and "unknown ⇒ curve absent" means the **whole second curve**
+	 * is missing (the gate looks for a >0 reading within the visible window), not
+	 * that individual points are skipped: braille has no gap semantics, so a single
+	 * unknown point inside an otherwise live window is drawn as 0 (the same
+	 * per-point rule `cpuTemp` uses). Degrading to the old single-curve Memory
+	 * block beats drawing a red line glued to 0 B.
+	 */
+	procRss: number[];
 	netRx: number[];
 	netTx: number[];
 	diskR: number[];
@@ -406,6 +424,15 @@ export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
 			seg("MEM ", "muted"),
 			seg(`${s.memPct.toFixed(0)}%`, "warning"),
 			seg(` ${fmtBytes(s.memUsed)}`, "muted"),
+			// Same reading and colour as the Memory chart's title bar (`pi 706M`), so the
+			// two modes can be cross-checked. Inside the MEM group rather than as a
+			// group of its own: the group count and the drop-from-tail order are
+			// load-bearing (MEM is group 2 of 4), and a fifth group would change which
+			// readings survive a narrow terminal. Omitted when unavailable so there is
+			// never a `pi 0B` stub.
+			...(Number.isFinite(s.procRss) && s.procRss > 0
+				? [seg(` pi ${fmtBytes(s.procRss)}`, "error")]
+				: []),
 		]);
 	}
 
@@ -689,6 +716,78 @@ if (hasTemp) {
 		});
 	}
 
+	// ── Process RSS series (second curve, only once a reading exists) ──
+	// Same dual-scale pattern as the CPU temperature curve above: two curves, one
+	// gutter. The difference is that RSS arrives in **bytes** while the Memory
+	// block's axis is the fixed 0..100.5 percent scale (`percentAxis()`), so the
+	// values are **pre-mapped** by the caller (`100 * rss / memTotal`) — exactly
+	// like the Tokens block's hit-rate curve, which is likewise pre-mapped onto the
+	// TPS axis. The `fmtBytes(memTotal)` label overlaid at the plot's top-right
+	// corner is the only on-screen trace of the byte scale; the colour binding (red
+	// line ⇄ red `pi 706M` title readout) is what tells the two apart.
+	//
+	// `excludeFromScale` is mandatory here for **one** reason — the overflow
+	// detector (measured on an otherwise identical frame: with the flag the top
+	// tick stays `100%`, without it the same frame paints `100+`).
+	// `renderBlock` skips excluded series when scanning for overflow, so a curve
+	// that runs past the ceiling clamps silently to the top row instead of
+	// lying a `+` onto the `100%` tick.
+	//
+	// ⚠ The *other* half of the note on the temperature series above — "a big
+	// RSS would stretch the percentage axis past 100.5" — does **not** apply to
+	// this block, and copying it here would be factually wrong: Memory's axis is
+	// `percentAxis()`, which **ignores its `dataMax` argument** and always
+	// returns `{labels: ["100%"], max: 100.5}`. `dataMax`'s only downstream
+	// consumer is `block.axis(dataMax, rows)` (`chart-panel.ts`), so on a
+	// fixed-axis block "the axis got stretched" is physically impossible —
+	// deleting the flag changes nothing about the scale, only the `+` marker.
+	// Blocks where the argument does decide the top (`tokenAxis`, `rateAxis`)
+	// are the ones that note was written for. Do not copy it back.
+	// Memory% stays **series[0]**: `renderChartGlyphs` resolves same-cell
+	// collisions in favour of the lowest index, so the % curve keeps its cells
+	// (and its block colour) wherever the two lines cross.
+	//
+	// Gate: three conditions ANDed, all load-bearing:
+	//  · a >0 reading inside the **visible window** (`hist.procRss`) — a platform or
+	//    process without the reading pushes 0s, and "unknown ⇒ curve absent" beats a
+	//    line glued to the baseline (same degradation as `cpuTemp`/`ctxPct`);
+	//  · a live `snap.procRss > 0` — otherwise a stale window (sensor just died, or
+	//    every sample so far failed) would keep drawing a curve with no current value;
+	//  · `memTotal` finite and > 0 — the mapping needs a denominator, and
+	//    `100 * v / 0` is `Infinity` ⇒ NaN coordinates ⇒ an out-of-bounds crash,
+	//    while `100 * v / Infinity` is 0 for every point (a flat line glued to the
+	//    floor) and `fmtBytes(Infinity)` is the nonsense label `0B`. The
+	//    `Number.isFinite` half is the same first-line guard every other numeric
+	//    check in this file uses. `snap === undefined` (collection not run yet /
+	//    failed) implies both of the last two, and is written out so a reader
+	//    doesn't think it was missed.
+	const memTotal = snap?.memTotal ?? 0;
+	const rssTail = tail(hist.procRss, points);
+	let hasProc = false;
+	for (const v of rssTail)
+		if (Number.isFinite(v) && v > 0) {
+			hasProc = true;
+			break;
+		}
+	hasProc =
+		hasProc &&
+		snap !== undefined &&
+		snap.procRss > 0 &&
+		Number.isFinite(memTotal) &&
+		memTotal > 0;
+
+	const memSeries: BlockSeries[] = [{ values: tail(hist.mem, points) }];
+	if (hasProc) {
+		memSeries.push({
+			// Unknown points inside a live window map to 0, never to NaN (NaN
+			// coordinates are the road to out-of-bounds crashes — ARCHITECTURE
+			// pitfall 4); braille has no gap semantics to draw a hole with.
+			values: rssTail.map((v) => (100 * (Number.isFinite(v) && v > 0 ? v : 0)) / memTotal),
+			color: "error",
+			excludeFromScale: true,
+		});
+	}
+
 	const blocks: MetricBlock[] = [
 		{
 			// Name matches bottom's border title
@@ -748,10 +847,44 @@ if (hasTemp) {
 								text: `  ${fmtBytes(snap.memUsed)}/${fmtBytes(snap.memTotal)}`,
 								color: "muted",
 							},
+							// Third readout = this process's RSS, pairing with the red curve.
+							// It must stay **last**: the title bar drops segments from the tail
+							// when the block is narrow, so the earlier two readings (the block's
+							// own subject matter) survive first. Omitted when the reading is
+							// unavailable, so a broken source never renders a `pi 0B` stub —
+							// `fmtBytes` floors every non-finite input to `0B` (`metrics.ts`),
+							// so `Infinity` without this guard would literally print `pi 0B`.
+							// Same predicate as line mode (`Number.isFinite && > 0`).
+							// No `atomic`: this is a single segment, nothing to weld.
+							...(Number.isFinite(snap.procRss) && snap.procRss > 0
+								? [seg(`  pi ${fmtBytes(snap.procRss)}`, "error")]
+								: []),
 						]
 					: undefined,
 			),
-			series: [{ values: tail(hist.mem, points) }],
+			series: memSeries,
+			// The byte-scale readout for the RSS curve, at the plot's top-right
+			// corner: the number of bytes the top of the plot represents (`15G` for a
+			// 15GB machine), i.e. "% of memTotal", not the current RSS. Static like
+			// the CPU block's `100°` (the 0.5% headroom over 100 is the same accepted
+			// approximation as `100°` for a 100°C ceiling).
+			//
+			// Not padded to a constant width, which ARCHITECTURE pitfall 6 normally
+			// requires: `fmtBytes` spans 2/3/4/5 columns (`15G`=3, `700M`=4, `>999T`=5).
+			// What makes that safe is **not** "memTotal never changes" — it is not a
+			// per-machine constant (`readMem()` falls back to `os.totalmem()` when
+			// `/proc/meminfo` is unreadable, darwin reads 0 until its first async
+			// refresh lands, and VM hot-plug / ballooning move it). What makes it safe
+			// is that this label does not participate in the layout budget at all:
+			// `rawGutter` (the left budget that positions the plot's left edge) is
+			// computed from `block.axis().labels` only and never sees this string
+			// (`chart-panel.ts`), and the label is right-anchored. So a width change
+			// at worst moves its own left edge by a column, or makes it be skipped
+			// a width earlier by the roomfulness guard — the plot's shape, the row
+			// count and the other blocks are untouched. (Measured with `memTotal`
+			// flipped between 9.9G and 10G every frame across w=8..120: no width or
+			// row-count anomaly, only the label's own left edge moved.)
+			rightAxisLabel: hasProc ? fmtBytes(memTotal) : undefined,
 			legend: ab(
 				snap
 					? [

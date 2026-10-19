@@ -454,7 +454,10 @@ reused, so the irreversible step needs a person present. `npm stage view <id>` /
 `npm stage download <id>` inspect a stage first, and `npm stage reject <id>` discards it.
 
 This needs **npm 12+** (`npm stage` does not exist in npm 11) and an `NPM_TOKEN` repository
-secret with publish rights — the staging token never needs 2FA, only the approval does.
+secret with publish rights. The token only ever *stages*, so it never needs to bypass 2FA —
+npm is actively restricting 2FA-bypass tokens for direct publishing, which is another reason
+the irreversible step stays manual. If the approve step is run from a machine that is not
+logged in, `npm login` first.
 
 ## Implementation Notes
 

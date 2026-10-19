@@ -726,14 +726,23 @@ if (hasTemp) {
 	// corner is the only on-screen trace of the byte scale; the colour binding (red
 	// line ⇄ red `pi 706M` title readout) is what tells the two apart.
 	//
-	// `excludeFromScale` is mandatory, for the two reasons the temperature series
-	// already documents:
-	//  ① a 600MB RSS must not stretch the memory percentage axis past 100.5 —
-	//    ARCHITECTURE §3 promises CPU/memory a **fixed 0..100** so that two
-	//    moments in time stay directly comparable, and a stretched axis silently
-	//    breaks that (the % curve's height would change meaning);
-	//  ② `renderBlock`'s overflow detector skips excluded series, so the curve
-	//    clamps to the top row without lying a `+` onto the `100%` tick.
+	// `excludeFromScale` is mandatory here for **one** reason — the overflow
+	// detector (measured on an otherwise identical frame: with the flag the top
+	// tick stays `100%`, without it the same frame paints `100+`).
+	// `renderBlock` skips excluded series when scanning for overflow, so a curve
+	// that runs past the ceiling clamps silently to the top row instead of
+	// lying a `+` onto the `100%` tick.
+	//
+	// ⚠ The *other* half of the note on the temperature series above — "a big
+	// RSS would stretch the percentage axis past 100.5" — does **not** apply to
+	// this block, and copying it here would be factually wrong: Memory's axis is
+	// `percentAxis()`, which **ignores its `dataMax` argument** and always
+	// returns `{labels: ["100%"], max: 100.5}`. `dataMax`'s only downstream
+	// consumer is `block.axis(dataMax, rows)` (`chart-panel.ts`), so on a
+	// fixed-axis block "the axis got stretched" is physically impossible —
+	// deleting the flag changes nothing about the scale, only the `+` marker.
+	// Blocks where the argument does decide the top (`tokenAxis`, `rateAxis`)
+	// are the ones that note was written for. Do not copy it back.
 	// Memory% stays **series[0]**: `renderChartGlyphs` resolves same-cell
 	// collisions in favour of the lowest index, so the % curve keeps its cells
 	// (and its block colour) wherever the two lines cross.
@@ -744,10 +753,14 @@ if (hasTemp) {
 	//    line glued to the baseline (same degradation as `cpuTemp`/`ctxPct`);
 	//  · a live `snap.procRss > 0` — otherwise a stale window (sensor just died, or
 	//    every sample so far failed) would keep drawing a curve with no current value;
-	//  · `memTotal > 0` — the mapping needs a denominator, and `100 * v / 0` is
-	//    `Infinity` ⇒ NaN coordinates ⇒ an out-of-bounds crash. `snap === undefined`
-	//    (collection not run yet / failed) implies both of the last two, and is
-	//    written out so a reader doesn't think it was missed.
+	//  · `memTotal` finite and > 0 — the mapping needs a denominator, and
+	//    `100 * v / 0` is `Infinity` ⇒ NaN coordinates ⇒ an out-of-bounds crash,
+	//    while `100 * v / Infinity` is 0 for every point (a flat line glued to the
+	//    floor) and `fmtBytes(Infinity)` is the nonsense label `0B`. The
+	//    `Number.isFinite` half is the same first-line guard every other numeric
+	//    check in this file uses. `snap === undefined` (collection not run yet /
+	//    failed) implies both of the last two, and is written out so a reader
+	//    doesn't think it was missed.
 	const memTotal = snap?.memTotal ?? 0;
 	const rssTail = tail(hist.procRss, points);
 	let hasProc = false;
@@ -756,7 +769,12 @@ if (hasTemp) {
 			hasProc = true;
 			break;
 		}
-	hasProc = hasProc && snap !== undefined && snap.procRss > 0 && memTotal > 0;
+	hasProc =
+		hasProc &&
+		snap !== undefined &&
+		snap.procRss > 0 &&
+		Number.isFinite(memTotal) &&
+		memTotal > 0;
 
 	const memSeries: BlockSeries[] = [{ values: tail(hist.mem, points) }];
 	if (hasProc) {
@@ -833,12 +851,13 @@ if (hasTemp) {
 							// It must stay **last**: the title bar drops segments from the tail
 							// when the block is narrow, so the earlier two readings (the block's
 							// own subject matter) survive first. Omitted when the reading is
-							// unavailable, so a broken source never renders a `pi 0B` stub.
+							// unavailable, so a broken source never renders a `pi 0B` stub —
+							// `fmtBytes` floors every non-finite input to `0B` (`metrics.ts`),
+							// so `Infinity` without this guard would literally print `pi 0B`.
+							// Same predicate as line mode (`Number.isFinite && > 0`).
 							// No `atomic`: this is a single segment, nothing to weld.
-							...(snap.procRss > 0
-								? ([
-										{ text: `  pi ${fmtBytes(snap.procRss)}`, color: "error" },
-									] as Seg[])
+							...(Number.isFinite(snap.procRss) && snap.procRss > 0
+								? [seg(`  pi ${fmtBytes(snap.procRss)}`, "error")]
 								: []),
 						]
 					: undefined,
@@ -850,17 +869,21 @@ if (hasTemp) {
 			// the CPU block's `100°` (the 0.5% headroom over 100 is the same accepted
 			// approximation as `100°` for a 100°C ceiling).
 			//
-			// Deliberately **not** padded to a constant width, which normally would
-			// violate ARCHITECTURE pitfall 6 ("tick width must be constant"):
-			// `fmtBytes` spans 2/3/4/5 columns (`15G`=3, `700M`=4, `>999T`=5). Safe here
-			// because the label is `fmtBytes(snap.memTotal)` — a **per-machine constant**
-			// (`memTotal` does not change frame to frame), so it cannot jitter. And it
-			// is the right-hand overlay, not a left gutter label: `rawGutter` (the left
-			// budget that positions the plot's left edge) is computed from
-			// `block.axis().labels` only and never sees this string (`chart-panel.ts`),
-			// so a wider label merely moves its own left edge left — and gets skipped
-			// earlier by the roomfulness guard — without pushing the plot around.
-			// That is exactly why the right label does not need a fixed width.
+			// Not padded to a constant width, which ARCHITECTURE pitfall 6 normally
+			// requires: `fmtBytes` spans 2/3/4/5 columns (`15G`=3, `700M`=4, `>999T`=5).
+			// What makes that safe is **not** "memTotal never changes" — it is not a
+			// per-machine constant (`readMem()` falls back to `os.totalmem()` when
+			// `/proc/meminfo` is unreadable, darwin reads 0 until its first async
+			// refresh lands, and VM hot-plug / ballooning move it). What makes it safe
+			// is that this label does not participate in the layout budget at all:
+			// `rawGutter` (the left budget that positions the plot's left edge) is
+			// computed from `block.axis().labels` only and never sees this string
+			// (`chart-panel.ts`), and the label is right-anchored. So a width change
+			// at worst moves its own left edge by a column, or makes it be skipped
+			// a width earlier by the roomfulness guard — the plot's shape, the row
+			// count and the other blocks are untouched. (Measured with `memTotal`
+			// flipped between 9.9G and 10G every frame across w=8..120: no width or
+			// row-count anomaly, only the label's own left edge moved.)
 			rightAxisLabel: hasProc ? fmtBytes(memTotal) : undefined,
 			legend: ab(
 				snap

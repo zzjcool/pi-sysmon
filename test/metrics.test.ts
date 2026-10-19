@@ -585,7 +585,8 @@ test("procRss: never negative, never NaN (0 means unknown, not garbage)", () => 
 	// NaN coordinates crash the renderer).
 	const s = createCollector().collect();
 	assert.equal(typeof s.procRss, "number", "must always be a number, never undefined");
-	assert.ok(!Number.isNaN(s.procRss), "procRss is NaN");
+	// `Number.isFinite` below already implies both "not NaN" and "not ±Infinity",
+	// so a separate `!Number.isNaN` assertion would be dead weight.
 	assert.ok(Number.isFinite(s.procRss), `procRss not finite: ${s.procRss}`);
 	assert.ok(s.procRss >= 0, `procRss negative: ${s.procRss}`);
 });

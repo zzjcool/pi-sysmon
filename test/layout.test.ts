@@ -2717,20 +2717,36 @@ test("buildBlocks: Memory plots this process's RSS as a second (error) curve on 
 		h.procRss.slice(-30).map((v) => (100 * v) / snap.memTotal),
 		"the RSS bytes must be pre-mapped onto the percent axis via memTotal",
 	);
-	// The block's axis spec is untouched: still the fixed percent scale.
-	assert.equal(mem.axis(999, 4).max, 100.5, "Memory range stays fixed at 100.5");
+	// The block's axis spec is untouched: `percentAxis()` is a **fixed** axis, and
+	// that is exactly why it is unaffected by the RSS curve. Proving it means
+	// showing the argument is ignored — asserting `max === 100.5` for one input
+	// would pass for any implementation that happens to return 100.5 there.
+	assert.deepEqual(
+		mem.axis(0, 4),
+		mem.axis(1e9, 4),
+		"percentAxis ignores dataMax ⇒ the Memory scale cannot be redefined by the RSS curve",
+	);
+	assert.equal(mem.axis(1e9, 4).max, 100.5, "Memory range stays fixed at 100.5");
 });
 
 test("buildBlocks: no RSS reading ⇒ single-curve Memory block, no right-axis label (graceful degradation)", () => {
-	// The gate is a three-condition AND and every leg gets its own variant —
-	// implementing only two of them passes typecheck and "looks right" on a
-	// healthy machine, then misbehaves on the one frame that matters.
+	// The gate is a three-condition AND and each variant isolates exactly **one**
+	// leg — a variant that flips two legs at once cannot tell you which leg died
+	// (that is how the window-scan leg went uncovered: the only variant that
+	// touched it also killed the live frame, so removing the loop was 0-red).
+	// ① kills the window scan **and** the live frame (the "nothing at all" case);
+	// ② isolates the live `snap.procRss` leg (window alive);
+	// ③ isolates `snap !== undefined`;
+	// ④ isolates the `memTotal` denominator leg (window + live frame alive);
+	// ⑤ isolates the window-scan leg (live frame alive, window all zeros);
+	// ⑥ isolates the `Number.isFinite(memTotal)` half of that same leg, which
+	//    `memTotal > 0` alone cannot catch (a non-finite total is not `0`).
 	const noTitlePi = (mem: MetricBlock) => {
 		const title = (mem.titleInfo ?? []).map((s) => s.text).join("");
 		assert.ok(!title.includes("pi "), `no RSS segment in the title: ${JSON.stringify(title)}`);
 	};
 
-	// ① the visible window holds no >0 reading (platform/process without the source)
+	// ① nothing anywhere: no window history, no live reading
 	{
 		const h = fakeHist(50);
 		h.procRss = new Array(50).fill(0);
@@ -2757,11 +2773,76 @@ test("buildBlocks: no RSS reading ⇒ single-curve Memory block, no right-axis l
 	// ④ memTotal unknown ⇒ the mapping has no denominator. This is the leg that
 	//    prevents `100 * v / 0` ⇒ Infinity ⇒ NaN coordinates ⇒ a renderer crash
 	//    (ARCHITECTURE pitfall 4), on a platform where readMem()'s fallback is 0.
+	//    The **curve** needs a denominator; the title readout does not, so it is
+	//    still painted here — a deliberate difference, pinned below so it cannot
+	//    drift silently.
 	{
 		const mem = memBlockOf(fakeHist(50), fakeSnap({ memTotal: 0, memPct: 0 }));
 		assert.equal(mem.series.length, 1, "④memTotal=0 ⇒ single curve (no divide by zero)");
 		assert.equal(mem.rightAxisLabel, undefined, "④memTotal=0 ⇒ no label");
+		const title = (mem.titleInfo ?? []).map((s) => s.text).join("");
+		assert.ok(
+			title.includes(`pi ${fmtBytes(fakeSnap().procRss)}`),
+			`④the title readout does not need memTotal, so it survives: ${JSON.stringify(title)}`,
+		);
 	}
+	// ⑤ window is all zeros while this frame is live: the **window-scan** leg has
+	//    to work on its own. Without it, "the newest value exists" would be taken
+	//    as "there is history" and a curve would be drawn from an all-zero window.
+	{
+		const h = fakeHist(50);
+		h.procRss = new Array(50).fill(0);
+		const mem = memBlockOf(h, fakeSnap()); // procRss is the live 700M
+		assert.equal(
+			mem.series.length,
+			1,
+			"⑤a zero-only window ⇒ no curve even with a live frame",
+		);
+		assert.equal(mem.rightAxisLabel, undefined, "⑤no >0 reading in the window ⇒ no label");
+	}
+	// ⑥ `memTotal` non-finite (a source that returned garbage, not just 0):
+	//    `100 * v / Infinity` maps every point to 0 (a flat line glued to the
+	//    floor) and `fmtBytes(Infinity)` is the nonsense `0B` — i.e. a scale label
+	//    reading "the top of the plot is 0 bytes". Same first-line `Number.isFinite`
+	//    guard as everywhere else in the file.
+	for (const memTotal of [Number.POSITIVE_INFINITY, Number.NaN]) {
+		const mem = memBlockOf(fakeHist(50), fakeSnap({ memTotal }));
+		assert.equal(mem.series.length, 1, `⑥memTotal=${memTotal} ⇒ single curve`);
+		assert.equal(mem.rightAxisLabel, undefined, `⑥memTotal=${memTotal} ⇒ no label`);
+	}
+});
+
+test("buildBlocks: per-point non-finite/negative RSS readings map to 0 instead of poisoning the curve", () => {
+	// The gate decides whether there is a curve; this decides what the **points**
+	// inside it are worth. A partially-bad window (one failed sample, a sentinel
+	// `-1`, a `NaN` from a broken source) must map the bad points to the baseline,
+	// never to `NaN` — NaN coordinates are the road to out-of-bounds crashes
+	// (ARCHITECTURE pitfall 4) and braille has no gap semantics to draw a hole.
+	// Without the per-point guard the mixed window below still draws a curve, so
+	// only these two assertions can catch its removal.
+	const mb = 1024 ** 2;
+	const h = fakeHist(50);
+	h.procRss = [0, Number.NaN, -5, 700 * mb, 0, Number.POSITIVE_INFINITY, 650 * mb, -1];
+	const memTotal = 64 * 1024 ** 3;
+	const mem = memBlockOf(h, fakeSnap({ memTotal }));
+
+	// A >0 reading exists in the window ⇒ the curve is drawn.
+	assert.equal(mem.series.length, 2, "a window holding some >0 readings still draws the curve");
+	const values = mem.series[1]?.values ?? [];
+	assert.equal(values.length, h.procRss.length, "every window point survives into the curve");
+	for (const [i, v] of values.entries()) {
+		assert.ok(
+			Number.isFinite(v),
+			`point ${i} must be finite, got ${v} (input ${h.procRss[i]})`,
+		);
+		assert.ok(v >= 0, `point ${i} must not be negative, got ${v} (input ${h.procRss[i]})`);
+	}
+	// The good points must keep their real value — otherwise "everything is 0"
+	// would satisfy the two assertions above.
+	const good = h.procRss.map((v, i) => [v, i] as const).filter(([v]) => Number.isFinite(v) && v > 0);
+	assert.ok(good.length >= 2, "fixture precondition: at least two usable readings");
+	for (const [v, i] of good)
+		assert.equal(values[i], (100 * v) / memTotal, `point ${i} must keep its mapped value`);
 });
 
 test("buildBlocks: the RSS sub-axis label is fmtBytes(memTotal) (the ceiling in bytes, not the current RSS)", () => {
@@ -2790,27 +2871,99 @@ test("buildBlocks: the title bar carries `pi 700M` as the LAST segment (dropped 
 	const mem = memBlockOf(fakeHist(50), snap);
 	const title = mem.titleInfo ?? [];
 	assert.equal(title[0]?.text, "52%", "the percentage still leads");
-	assert.match(title[1]?.text ?? "", /^\s+33G\/64G$/, "the used/total pair is still second");
+	// `fmtBytes`-computed rather than a `33G\/64G` literal: a hard-coded string
+	// only reproduces the fixture's current numbers, so the day `fakeSnap`
+	// changes the failure would point at the wrong thing (D10's rule).
+	assert.equal(
+		title[1]?.text,
+		`  ${fmtBytes(snap.memUsed)}/${fmtBytes(snap.memTotal)}`,
+		"the used/total pair is still second",
+	);
 	const last = title.at(-1);
 	assert.ok(last, "the title must have a tail segment");
 	assert.equal(last.text, `  pi ${fmtBytes(snap.procRss)}`, "the RSS reading is the last segment");
 	assert.equal(last.color, "error", "same colour as the curve it describes");
 	assert.equal(last.atomic, undefined, "a single segment needs no atomic weld");
+	// A non-finite live reading must not reach the title either: `fmtBytes` floors
+	// every non-finite input to `0B`, so `procRss > 0` alone would print the very
+	// `pi 0B` stub this segment promises never to render. Same predicate as line
+	// mode (`Number.isFinite && > 0`), asserted here so the two modes can't drift.
+	for (const procRss of [Number.POSITIVE_INFINITY, Number.NaN, -1]) {
+		const t = (memBlockOf(fakeHist(50), fakeSnap({ procRss })).titleInfo ?? [])
+			.map((s) => s.text)
+			.join("");
+		assert.ok(!t.includes("pi "), `procRss=${procRss}: no RSS segment: ${JSON.stringify(t)}`);
+		assert.ok(!t.includes("0B"), `procRss=${procRss}: no \`pi 0B\` stub: ${JSON.stringify(t)}`);
+	}
 });
 
 test("renderBlock: procRss === memTotal clamps the RSS curve to the top without stretching the axis or lying a `+`", () => {
 	// The two `excludeFromScale` guarantees, at render level, mirroring the
 	// 105°C test for the CPU block:
 	//  ① the scale is sampled from the **non-excluded** series only, so the RSS
-	//    curve can never redefine what the top of the memory plot means (0..100
-	//    across time, ARCHITECTURE §3);
-	//  ② the overflow detector skips it too, so a curve pinned to the ceiling
-	//    never puts a `+` on the `100%` tick.
+	//    curve can never redefine what the top of the memory plot means. On this
+	//    block that is belt-and-braces — `percentAxis()` ignores `dataMax`
+	//    altogether — so the assertion below pins the **identity** of the fixed
+	//    axis (same spec for two wildly different inputs) rather than claiming
+	//    the RSS curve could have moved it;
+	//  ② the overflow detector skips excluded series, so a curve pinned to the
+	//    ceiling never puts a `+` on the `100%` tick. **This is the guarantee that
+	//    actually depends on `excludeFromScale`** — see the two-sided probe at the
+	//    end (a real >100 curve must paint `100+`, the excluded one must not).
 	const n = 50;
 	const memTotal = 64 * 1024 ** 3;
+
+	// ② FIRST, because it is the only part of this test that can actually fail
+	// when `excludeFromScale` is wrong (part ① below is an identity of the fixed
+	// axis). Two-sided by construction:
+	//   · probe validity — a curve that is **not** excluded and really exceeds the
+	//     axis MUST paint `100+`. Without this positive case the negative
+	//     assertion is unfalsifiable: it passes on any implementation that never
+	//     draws a `+` at all, including one whose flag does nothing (exactly the
+	//     hole that `!includes("100%+")` left — the real marker is `100+`, since
+	//     `renderBlock` replaces the label's **last** character);
+	//   · the real case — the RSS curve, excluded, must not.
+	const W = 50;
+
+	const realOver = fakeHist(n);
+	realOver.mem = new Array(n).fill(150); // the % curve itself, genuinely >100
+	const realTop = renderOne(memBlockOf(realOver, fakeSnap()), W)[1] ?? "";
+	assert.ok(
+		realTop.includes("100+"),
+		`probe validity: a real >100% reading must paint "100+": ${JSON.stringify(realTop)}`,
+	);
+
+	// The documented transient in chart-panel's `excludeFromScale` note is a
+	// pre-mapped value that momentarily exceeds the axis. With the series
+	// excluded it must be clamped silently; the frame above proves that without
+	// the flag it would paint `100+`. Not a claim that RSS can exceed RAM — just
+	// that the guard holds.
+	const over = fakeHist(n);
+	over.procRss = new Array(n).fill(memTotal * 1.2);
+	const overLines = renderOne(memBlockOf(over, fakeSnap({ procRss: memTotal * 1.2 })), W);
+	for (const line of overLines)
+		assert.equal(visibleWidth(line), W, `over: line wider than ${W}: ${JSON.stringify(line)}`);
+	const overTop = overLines[1] ?? "";
+	assert.ok(
+		!overTop.includes("100+"),
+		`a >100% mapped reading must not trip the overflow marker: ${JSON.stringify(overTop)}`,
+	);
+	assert.ok(
+		overTop.includes("100%"),
+		`the top tick is still the percentage label: ${JSON.stringify(overTop)}`,
+	);
+
+	// Same for the ceiling-hugging frame (`mapped value = exactly 100`).
 	const h = fakeHist(n);
-	h.procRss = new Array(n).fill(memTotal); // mapped value = exactly 100
+	h.procRss = new Array(n).fill(memTotal);
 	const mem = memBlockOf(h, fakeSnap({ procRss: memTotal }));
+	const lines = renderOne(mem, W);
+	assert.ok(lines.length > 0);
+	for (const line of lines)
+		assert.equal(visibleWidth(line), W, `line wider than ${W}: ${JSON.stringify(line)}`);
+	const topRow = lines[1] ?? "";
+	assert.ok(topRow.includes("100%"), `the top tick must survive: ${JSON.stringify(topRow)}`);
+	assert.ok(!topRow.includes("100+"), `no overflow marker on the tick: ${JSON.stringify(topRow)}`);
 
 	// ① dataMax the way `renderBlock` computes it (excluded series skipped):
 	// it must be the memory percentages' max, NOT the RSS curve's 100.
@@ -2822,34 +2975,16 @@ test("renderBlock: procRss === memTotal clamps the RSS curve to the top without 
 	const memMax = Math.max(...h.mem.slice(-n));
 	assert.equal(dataMax, memMax, "the RSS curve must not feed the y-scale");
 	assert.ok(dataMax < 100, `precondition: the % curve stays below the ceiling (got ${dataMax})`);
-	assert.equal(mem.axis(dataMax, 4).max, 100.5, "the memory axis stays fixed at 100.5");
-
-	// ② no `+` marker, exact widths, over the whole `100%`-hugging frame.
-	const W = 50;
-	const lines = renderOne(mem, W);
-	assert.ok(lines.length > 0);
-	for (const line of lines)
-		assert.equal(visibleWidth(line), W, `line wider than ${W}: ${JSON.stringify(line)}`);
-	const topRow = lines[1] ?? "";
-	assert.ok(topRow.includes("100%"), `the top tick must survive: ${JSON.stringify(topRow)}`);
-	assert.ok(!topRow.includes("100%+"), `no overflow marker on the tick: ${JSON.stringify(topRow)}`);
-
-	// Synthetic over-the-ceiling check (the same shape as the 105°C CPU test):
-	// the documented transient in chart-panel's `excludeFromScale` note is a
-	// pre-mapped value that momentarily exceeds the axis. With the series
-	// excluded it must be clamped silently; without that flag it would paint
-	// `100%+`. Not a claim that RSS can exceed RAM — just that the guard holds.
-	const over = fakeHist(n);
-	over.procRss = new Array(n).fill(memTotal * 1.2);
-	const overMem = memBlockOf(over, fakeSnap({ procRss: memTotal * 1.2 }));
-	const overLines = renderOne(overMem, W);
-	for (const line of overLines)
-		assert.equal(visibleWidth(line), W, `over: line wider than ${W}: ${JSON.stringify(line)}`);
-	const overTop = overLines[1] ?? "";
-	assert.ok(
-		!overTop.includes("100%+"),
-		`a >100% mapped reading must not trip the overflow marker: ${JSON.stringify(overTop)}`,
+	// Fixed-axis identity, not a claim about `excludeFromScale`: `percentAxis()`
+	// returns the same spec whatever `dataMax` is, which is precisely why the
+	// Memory scale cannot be stretched by anything. What a wrong
+	// `excludeFromScale` would break is the `+` marker, tested above.
+	assert.deepEqual(
+		mem.axis(dataMax, 4),
+		mem.axis(1e9, 4),
+		"percentAxis is a fixed axis: dataMax cannot change the Memory scale",
 	);
+	assert.equal(mem.axis(dataMax, 4).max, 100.5, "the memory axis stays fixed at 100.5");
 });
 
 test("renderBlock: the Memory right-axis label lands flush against the right border", () => {
@@ -2905,6 +3040,13 @@ test("sweep: the Memory block really carries the second curve (guard against a s
 	// class of silent coverage loss this repo has hit before (see the comment on
 	// the main sweep's `blocks.length` derivation). This test turns that failure
 	// mode itself into a red light.
+	//
+	// `buildBlocks` does **not** take a width, so its output is identical for
+	// every `w` (verified: the same two series and the same label each time).
+	// `w` only enters at `renderPanel`, so the second half of the test renders the
+	// two-curve block at several widths and asserts the two panel invariants that
+	// would crash or misalign pi — no line wider than `w`, constant row count.
+	// That is the part that actually depends on the width.
 	for (const w of [8, 24, 48, 96, 150, 220]) {
 		const mem = buildBlocks(fakeHist(200), fakeSnap(), { points: 60 })
 			.find((b) => b.name === "Memory");
@@ -2919,6 +3061,27 @@ test("sweep: the Memory block really carries the second curve (guard against a s
 			fmtBytes(64 * 1024 ** 3),
 			`w=${w}: no byte-scale label ⇒ the sweep lost the right-label coverage`,
 		);
+
+		const plotRows = 6;
+		const layout = {
+			cols: 1,
+			bands: 1,
+			widths: [w],
+			plotRows,
+			totalRows: plotRows + BLOCK_CHROME_ROWS,
+		};
+		const lines = renderPanel(plainTheme, [mem], w, layout, 60);
+		assert.equal(
+			lines.length,
+			layout.totalRows,
+			`w=${w}: the two-curve block changed the row count (${lines.length} ≠ ${layout.totalRows})`,
+		);
+		for (const [i, line] of lines.entries())
+			assert.equal(
+				visibleWidth(line),
+				w,
+				`w=${w}: line ${i} is ${visibleWidth(line)} columns, not ${w}`,
+			);
 	}
 });
 
@@ -2974,6 +3137,62 @@ test("plainLineSegs: includes token readouts (rate + session cumulative), same c
 	assert.equal(colorOf("⌀"), "warning");
 });
 
+test("plainLineSegs: the MEM RSS segment costs 8 columns, pushing the NET threshold from 69 to 77", () => {
+	// The RSS readout is not free: `pi 700M` plus its leading space is 8 columns
+	// inside the MEM group, and the whole line drops groups from the **tail**, so
+	// the NET group — dropped last — needs a correspondingly wider terminal. This
+	// is the user-visible price of the feature and it belongs in an assertion, not
+	// just a comment: a comment rots, and the previous comment here did (it said
+	// 71 cols when the line was 77).
+	//
+	// Measured on this fixture (`fakeSnap()` defaults + tpsNow=1234 / tokensIn=5671
+	// / tokensOut=89 / tokensCacheRead=2700 / hitNow=88), sweeping w=1..400:
+	//   procRss=0    → full line 69 cols, MEM@24, TOK@48, NET@69
+	//   procRss=700M → full line 77 cols, MEM@32, TOK@56, NET@77
+	// (MEM/TOK/NET are the first `w` at which each group appears.)
+	const opts = (procRss: number) => ({
+		snap: fakeSnap({ procRss }),
+		tpsNow: 1234,
+		tokensIn: 5671,
+		tokensOut: 89,
+		tokensCacheRead: 2700,
+		hitNow: 88,
+	});
+	const widthAt = (o: ReturnType<typeof opts>, needle: RegExp): number => {
+		for (let w = 1; w <= 400; w++)
+			if (needle.test(segsText(plainLineSegs(o, w)))) return w;
+		return -1;
+	};
+	const rss = 700 * 1024 ** 2;
+	const withRss = opts(rss);
+	const without = opts(0);
+
+	// Use `visibleWidth`, not `.length`: the arrows/`·`/`⌀` are width 1 today, but
+	// the whole point of this repo's width discipline is not to bet on that.
+	assert.equal(visibleWidth(segsText(plainLineSegs(withRss, 400))), 77, "full line with RSS");
+	assert.equal(visibleWidth(segsText(plainLineSegs(without, 400))), 69, "full line without RSS");
+	assert.equal(widthAt(withRss, /MEM /), 32, "MEM appears at 32 cols with RSS");
+	assert.equal(widthAt(withRss, /TOK /), 56, "TOK appears at 56 cols with RSS");
+	assert.equal(widthAt(withRss, / NET /), 77, "NET appears at the full 77 cols");
+	assert.equal(widthAt(without, /MEM /), 24, "MEM appears at 24 cols without RSS");
+	assert.equal(widthAt(without, /TOK /), 48, "TOK appears at 48 cols without RSS");
+	assert.equal(widthAt(without, / NET /), 69, "NET appears at 69 cols without RSS");
+
+	// The pinned thresholds themselves: NET at the full width, gone one column
+	// short. This is the assertion that reddens when the MEM group grows or
+	// shrinks, which is exactly what happened here.
+	assert.match(
+		segsText(plainLineSegs(withRss, 77)),
+		/ NET /,
+		"NET must return at the full 77-column width",
+	);
+	assert.doesNotMatch(
+		segsText(plainLineSegs(withRss, 76)),
+		/ NET /,
+		"NET must still be dropped at 76 columns",
+	);
+});
+
 test("plainLineSegs: CPU group carries the temperature with the chart's color rule", () => {
 	// Same reading and thresholds as the CPU chart title (`tempColor`), so the
 	// two modes can be cross-checked.
@@ -3005,7 +3224,13 @@ test("plainLineSegs: MEM group carries the process RSS (omitted when unknown)", 
 	const snap = fakeSnap();
 	const segs = plainLineSegs({ snap }, 200);
 	const text = segsText(segs);
-	assert.match(text, /^CPU 37% 61°  MEM 52% 33G pi 700M/);
+	// Computed, not literal (`33G` / `700M`): see D10's "no hard-coded fmtBytes".
+	assert.match(
+		text,
+		new RegExp(
+			`^CPU 37% 61°  MEM 52% ${fmtBytes(snap.memUsed)} pi ${fmtBytes(snap.procRss)}`,
+		),
+	);
 	assert.equal(colorOf(segs, "pi "), "error", "same colour as the RSS curve");
 	// The MEM group is still **not** split: the RSS segment travels with its
 	// group when the line narrows (never a dangling `pi 700M` without `MEM`).
@@ -3014,11 +3239,19 @@ test("plainLineSegs: MEM group carries the process RSS (omitted when unknown)", 
 		if (t.includes("pi ")) assert.match(t, /MEM /, `w=${w}: RSS without its MEM group: ${t}`);
 	}
 	// Unknown reading (0 / non-finite): no `pi 0B` noise at all.
-	for (const procRss of [0, Number.NaN]) {
+	for (const procRss of [0, Number.NaN, Number.POSITIVE_INFINITY]) {
 		const t = segsText(plainLineSegs({ snap: fakeSnap({ procRss }) }, 200));
-		assert.match(t, /^CPU 37% 61°  MEM 52% 33G  TOK /, `procRss=${procRss}: ${t}`);
+		assert.match(
+			t,
+			new RegExp(`^CPU 37% 61°  MEM 52% ${fmtBytes(snap.memUsed)}  TOK `),
+			`procRss=${procRss}: ${t}`,
+		);
 		assert.doesNotMatch(t, /pi /, `procRss=${procRss}: ${t}`);
-		assert.doesNotMatch(t, /700M/, `procRss=${procRss}: ${t}`);
+		assert.ok(
+			!t.includes(fmtBytes(snap.procRss)),
+			`procRss=${procRss}: the RSS byte count must not be on the line: ${t}`,
+		);
+		assert.doesNotMatch(t, /0B/, `procRss=${procRss}: a non-finite reading must not render: ${t}`);
 	}
 });
 
@@ -3036,9 +3269,29 @@ test("plainLineSegs: TOK group sits before NET, and NET is the group dropped fir
 		hitNow: 88,
 		ctxPct: 42,
 	};
-	// 70 columns: TOK is in, NET is out (measured: the full line is now 71
-	// cols — without the token totals it got ~19 cols shorter, so NET only
-	// appears at 71+)
+	// The MEM group now carries ` pi 700M` (8 more columns), so every group
+	// threshold after it shifted right. Measured on **this** fixture
+	// (`fakeSnap()` defaults + tpsNow=12345 / tokensIn=1234567 / tokensOut=987654 /
+	// tokensCacheRead=543210 / hitNow=88 / ctxPct=42, sweeping w=1..400):
+	//   TOK first appears at w=62, NET at w=83, and the complete line is exactly
+	//   83 columns (`w=82` yields the 62-column TOK-only line). Without the RSS
+	//   segment the same fixture is 8 columns shorter (75 / TOK at 54), which is
+	//   the user-visible cost of the reading: on an 82-column terminal NET is
+	//   gone where it used to fit.
+	// The assertions below pin both numbers: a comment rots, an assertion does not.
+	const fullWidth = visibleWidth(segsText(plainLineSegs(opts, 400)));
+	assert.equal(fullWidth, 83, `the complete line is ${fullWidth} columns on this fixture`);
+	assert.match(
+		segsText(plainLineSegs(opts, fullWidth)),
+		/ NET /,
+		"NET must be present at the full width",
+	);
+	assert.doesNotMatch(
+		segsText(plainLineSegs(opts, fullWidth - 1)),
+		/ NET /,
+		`NET must be gone one column short of the full width (${fullWidth - 1})`,
+	);
+	// 70 columns: TOK is in, NET is out
 	const w70 = segsText(plainLineSegs(opts, 70));
 	assert.match(w70, /TOK /, `TOK must survive at 70 cols: ${w70}`);
 	assert.doesNotMatch(w70, /NET /, `NET should already be dropped at 70 cols: ${w70}`);

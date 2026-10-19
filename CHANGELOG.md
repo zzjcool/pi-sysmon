@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readout box is deliberately unchanged** (`RAM 52% 33G/62G`, still one line): a second line
   is dropped outright at the default plot height (`legendH < plotRows`), and appending to the
   existing line would widen it past what a 24-column block can hold. The RSS reading therefore
-  lives in the title bar and in line mode (`MEM 52% 33G pi 706M`) only.
+  lives in the title bar and in line mode (`MEM 52% 33G pi 706M`) only. User-visible cost in
+  line mode: the complete line grows from **69 to 77 columns** (the RSS segment is 8 wide), so
+  the NET group — dropped last on a narrow terminal — now only appears from 77 columns instead
+  of 69. Terminals between the two widths lose the network rate where they used to show it.
 
 ## [0.9.0] — 2026-09-29
 

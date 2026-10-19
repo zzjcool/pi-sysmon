@@ -33,9 +33,11 @@ y-axis tick marks are overlaid inside the plot area, and time labels are embedde
   ([`macmon`](https://github.com/vladkens/macmon) on Apple Silicon; `osx-cpu-temp` / `istats` on Intel) —
   without a source the chart silently degrades to the plain single-curve form
 - **Process RSS curve** — the Memory chart draws a second (red) line: **this pi process's own RSS**
-  (`process.memoryUsage().rss`), pre-mapped onto the same 0–100% axis as `100 × rss / memTotal`.
-  The label in the plot's top-right corner is what 100% stands for in bytes (the memory total,
-  `64G` — *not* the current reading), and the title bar carries the reading itself (`pi 700M`).
+  (`process.memoryUsage().rss`) on **its own adaptive byte axis** (window peak × 1.5, the same
+  headroom Network / Disks / Tokens use), so the curve always fills about two thirds of the plot
+  height no matter how much RAM the machine has. The top-right label is that axis' ceiling in
+  bytes (`1.3G` for an ~860MB peak — *not* the current reading); the title bar carries the reading
+  itself (`pi 822M`). The memory-percentage curve keeps its fixed 0–100% axis, untouched.
   Scope is deliberately **this process only** — it does not aggregate the machine's other pi
   instances — and it is the one memory readout that still has a real value on Windows
 - **Proper axes** — y-axis tick marks, an x-axis line, and time-window labels, replicating bottom's layout
@@ -145,22 +147,29 @@ the token readout is far less recoverable from elsewhere on screen.
 
 The Memory chart draws **two** curves: the machine's memory percentage (the block's own yellow
 curve) and, once a reading exists, a **red line for this pi process's own RSS** —
-`process.memoryUsage().rss`, sampled once per tick (1 s by default) and stored as raw bytes (the
-mapping onto the shared 0–100% axis, `100 × rss / memTotal`, happens at render time, where the
-memory total is known).
+`process.memoryUsage().rss`, sampled once per tick (1 s by default) and stored as raw bytes.
 
 ```text
-┌ Memory ─ 52%  33G/64G  pi 700M ──────────────────────────┐
-│100%                                                   64G│
+┌ Memory ─ 47%  7.0G/15G  pi 822M ─────────────────────────┐
+│100%                                                  1.3G│
 ```
 
+- **The RSS curve has its own adaptive byte axis.** Its ceiling is the visible window's peak × 1.5
+  (the same headroom `rateAxis` uses), so the curve's high point always sits at about two thirds of
+  the plot height. This matters: squeezing RSS onto the shared 0–100% axis meant a 700MB process on
+  a 16GB machine occupied **one braille sub-row** out of 24, and its ±10–50MB drift was 0.002–0.073
+  rows — a dead flat line glued to the baseline. The memory-percentage curve is unchanged and still
+  uses the fixed 0–100% axis, so the two lines carry different units; their colours (yellow %,
+  red RSS) are what tells them apart;
 - **Scope: this process only.** The RSS curve is not an aggregate over the machine's pi processes —
   with several instances running (herdr panes, subagents) **each one draws its own line**. The
   percentage curve above it is still machine-wide, so two instances on one box draw the same
   memory% curve and different RSS curves;
-- **The corner label is the byte scale, not the reading.** `64G` at the plot's top-right is what
-  100% of the axis stands for (the memory total in bytes); the current RSS is the `pi 700M`
-  segment in the title bar, in the same red as the curve, so the two can be matched at a glance;
+- **The corner label is the RSS axis' ceiling, not the reading.** `1.3G` at the plot's top-right is
+  the byte value the top of the *red* axis stands for (window peak × 1.5, padded to a constant
+  5 columns so it cannot jitter as it crosses unit boundaries — `1020M` → `1.0G`); the current RSS
+  is the `pi 822M` segment in the title bar, in the same red as the curve, so the two can be
+  matched at a glance;
 - **The only memory readout that works on Windows**, where the machine-wide memory chart reads 0
   (see the platform table above);
 - **No reading, no curve**: a platform or process where the call fails degrades to the plain

@@ -11,15 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Line mode shows the CPU temperature** (`CPU 12% 48°  MEM …`), with the same reading and
   color thresholds as the CPU chart title (>75°C warning, >90°C error). Omitted when there is
   no sensor, so non-Linux / sensorless hosts see no bare `°`.
-- **The Memory chart draws this pi process's own RSS as a second (red) curve**, with the
-  sub-axis ceiling in bytes and a title-bar reading —
-  `┌ Memory ─ 52%  33G/62G  pi 706M ────┐`, the plot's top-right corner carrying `64G`.
-  Read from `process.memoryUsage().rss` once per second. Two scope decisions are deliberate:
+- **The Memory chart draws this pi process's own RSS as a second (red) curve**, on its **own
+  adaptive byte axis** (window peak × 1.5 — the same headroom Network / Disks / Tokens use), with
+  a title-bar reading — `┌ Memory ─ 45%  7.0G/15G  pi 802M ────┐`, the plot's top-right corner
+  carrying that axis' ceiling (` 1.2G`, a fixed 5 columns so it cannot jitter across unit carries).
+  Read from `process.memoryUsage().rss` once per second.
+  **Why an adaptive axis instead of the shared percent scale**: measured, squeezing RSS onto the
+  0–100% axis put a 700MB process on a 16GB box at 4.3% of the axis — **one braille sub-row out
+  of 24** — and its ±10–50MB drift at 0.002–0.073 rows, i.e. a dead flat line glued to the
+  baseline. Deriving the ceiling from the window's own peak makes the curve fill ~2/3 of the plot
+  height regardless of the machine's RAM. The memory-percentage curve keeps its fixed 0–100% axis
+  untouched (ARCHITECTURE §3), so the two lines carry different units and are told apart by
+  colour; the `memTotal` denominator is gone, so `memTotal: 0` still draws the RSS curve.
+  Two scope decisions are deliberate:
   **this process only** (not aggregating the other pi instances on the machine — that needs
   `/proc/*/stat` or `ps`, and it would tangle with herdr's multi-instance semantics), and
   **no new spawn / file read** (a pure in-process call, ~14µs; it also works on Windows where
-  the rest of the memory chart reads 0). The curve is excluded from the y-scale, so the fixed
-  0..100 memory axis — and its comparability across time — is untouched. **The floating
+  the rest of the memory chart reads 0). The curve is `excludeFromScale`, so it cannot put a `+`
+  overflow marker on the `100%` tick and never feeds the scale sampling. **The floating
   readout box is deliberately unchanged** (`RAM 52% 33G/62G`, still one line): a second line
   is dropped outright at the default plot height (`legendH < plotRows`), and appending to the
   existing line would widen it past what a 24-column block can hold. The RSS reading therefore

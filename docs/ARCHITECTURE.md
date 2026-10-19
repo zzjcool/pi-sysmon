@@ -95,8 +95,24 @@ work without a second gutter:
   need a fixed width**, unlike every tick in `block.axis().labels`.
 
 Two instances today: the CPU block's temperature segment (`100°`) and the Memory block's process
-RSS segment (`fmtBytes(memTotal)`, e.g. `64G` — the byte value that 100% of the shared percent
-axis stands for, *not* the current RSS).
+RSS segment (`fmtBytes(rssAxisMax(tail))`, e.g. ` 1.2G` — the ceiling of the **RSS curve's own**
+adaptive byte axis, window peak × 1.5, *not* the current RSS).
+
+**The Memory RSS label is the one right axis that is auto-scaled, and it is padded to a constant
+width.** Two consequences worth recording:
+
+- Its ceiling moves with the window's peak, so it crosses unit carries as RSS grows. Measured
+  `fmtBytes` outputs on that path: `75M` (3 cols), `300M` (4), `1020M` — the widest — (5), `1.0G`
+  (4), `34G` (3). Left alone that jitters the label's left edge every time it crosses, which is the
+  right-axis analogue of pitfall 6. `blocks.ts` therefore pads it with
+  `padStart(RSS_LABEL_W /* 5 */)`, pinning it to 5 columns; **padding, not the `rateAxis`
+  "reduce precision" trick**, because truncating `1020M` to fit 5 columns with a unit appended
+  would print `102M` — a lie about the scale. A constant-width right overlay costs nothing: it is
+  right-anchored and outside the gutter (see above).
+- The axis top comes from the **history window**, not from `memTotal`, so the gate needs no
+  denominator — `memTotal: 0` still draws the curve (pinned by a test). That is why the fixed
+  0–100% promise a few paragraphs above still holds: the memory-percentage curve keeps that axis,
+  and only the *red* curve has a moving one.
 
 ### 4. Enablement is two layers: display prefs in a file, the session switch in `pi.appendEntry()`
 

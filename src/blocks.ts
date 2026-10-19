@@ -43,10 +43,12 @@ export interface History {
 	 * from `Snapshot.procRss`.
 	 *
 	 * Stored **raw bytes, not a percentage** — the same reason `cpuTemp` stores raw
-	 * °C: the reading keeps its own unit, and the mapping onto the shared percent
-	 * axis (`100 * rss / memTotal`) happens at render time, where `memTotal` is
-	 * known. Storing a percentage would freeze this frame's `memTotal` into the
-	 * history and silently corrupt the curve after a hotplug/resize.
+	 * °C: the reading keeps its own unit, and the mapping into axis units happens at
+	 * render time, against the **windowed** axis top (`rssAxisMax`, i.e. window max
+	 * × 1.5). Storing a percentage instead would freeze one frame's scale into the
+	 * history and silently corrupt the curve as soon as the scale moved — and it is
+	 * precisely the raw bytes that let the axis be derived from this array itself
+	 * rather than from the machine's `memTotal`.
 	 *
 	 * **0 = unknown**, and "unknown ⇒ curve absent" means the **whole second curve**
 	 * is missing (the gate looks for a >0 reading within the visible window), not
@@ -518,6 +520,31 @@ export function plainLineSegs(opts: LineOptions, width: number): StyledLine {
 export const MIN_TPS_SCALE = 10;
 
 /**
+ * Headroom for the RSS curve's own byte axis (scale = window max × this).
+ *
+ * Kept equal to `rateAxis`'s `max × 1.5` (`chart-panel.ts`): with the same
+ * headroom the RSS peak lands at ~2/3 of the plot height, so the Memory chart
+ * reads with the same rhythm as Network / Disks / Tokens instead of hugging the
+ * ceiling. Change one of the two and the curves stop being comparable at a
+ * glance.
+ */
+export const RSS_AXIS_HEADROOM = 1.5;
+
+/**
+ * Column count the RSS sub-axis label is padded to.
+ *
+ * `fmtBytes` returns 2..5 columns (`0B`=2, `75M`=3, `300M`=4, `1020M`=5) and the
+ * axis top climbs across unit boundaries as RSS grows, so the raw string jitters
+ * between widths frame to frame. The label is right-anchored by `renderBlock`,
+ * which would move its **left edge** by a column on every such change
+ * (ARCHITECTURE pitfall 6 — the plot area's left edge jumping is the same class
+ * of bug, and here it would be visibly flickering text). Padding to a constant
+ * width pins the left edge. 5 is the widest ordinary output (`1020M`); longer
+ * than that never happens for a real machine's RSS axis.
+ */
+export const RSS_LABEL_W = 5;
+
+/**
  * Tick column width for the TPS chart.
  *
  * Wider than `RATE_GUTTER` (5): the widest tick this axis can emit is the
@@ -576,6 +603,30 @@ export function tokenAxis(dataMax: number): AxisSpec {
 		return s.padStart(TPS_GUTTER);
 	};
 	return { labels: [fit(top)], max: top };
+}
+
+/**
+ * Bytes the top of the RSS curve's own axis represents (0 = no usable axis).
+ *
+ * The RSS curve gets its **own** adaptive byte axis instead of being squeezed
+ * onto the shared 0..100 percent axis. Why: a 700MB RSS on a 16GB machine is
+ * 4.3% of the axis — 1.02 braille sub-rows — and the whole point of this curve
+ * (RSS movement over 60s, ±10..50MB ⇒ 0.002..0.073 sub-rows) was invisible: it
+ * rendered as a dead flat line glued to the baseline. Deriving the axis top from
+ * the window's own maximum means the curve always fills ~2/3 of the plot height
+ * no matter how large the machine's RAM is.
+ *
+ * Same strategy as `rateAxis`/`tokenAxis` (window max × 1.5). Returns `0` for
+ * "no usable axis" — an empty window, an all-zero window, or a window of garbage
+ * — so callers can gate the curve on it. `Number.isFinite` comes first because
+ * a non-finite scale reaches the coordinate maths and NaN coordinates are an
+ * out-of-bounds crash (ARCHITECTURE pitfall 4).
+ */
+export function rssAxisMax(rss: number[]): number {
+	let max = 0;
+	for (const v of rss) if (Number.isFinite(v) && v > max) max = v;
+	const scaled = max * RSS_AXIS_HEADROOM;
+	return Number.isFinite(scaled) && scaled > 0 ? scaled : 0;
 }
 
 /** Result of resolving the time window */
@@ -720,11 +771,17 @@ if (hasTemp) {
 	// Same dual-scale pattern as the CPU temperature curve above: two curves, one
 	// gutter. The difference is that RSS arrives in **bytes** while the Memory
 	// block's axis is the fixed 0..100.5 percent scale (`percentAxis()`), so the
-	// values are **pre-mapped** by the caller (`100 * rss / memTotal`) — exactly
-	// like the Tokens block's hit-rate curve, which is likewise pre-mapped onto the
-	// TPS axis. The `fmtBytes(memTotal)` label overlaid at the plot's top-right
-	// corner is the only on-screen trace of the byte scale; the colour binding (red
-	// line ⇄ red `pi 706M` title readout) is what tells the two apart.
+	// bytes have to be pre-mapped into axis units. Unlike the Tokens block's
+	// hit-rate curve (pre-mapped onto the TPS axis from a fixed 0..100 scale),
+	// the RSS curve gets its **own adaptive byte axis** — `rssAxisMax(rssTail)`,
+	// i.e. window max × 1.5, the same strategy as `rateAxis`/`tokenAxis` — and is
+	// then pre-mapped onto the percent axis by that top. See `rssAxisMax` for the
+	// measurement that forced this: on a fixed 0..100% axis a 700MB RSS on 16GB
+	// occupies 1.02 braille sub-rows and its ±10..50MB drift 0.002..0.073 rows, so
+	// the curve rendered as a dead flat line glued to the baseline — the axis was
+	// honest and the chart was useless. Because the axis top is the window max
+	// × 1.5, the mapped peak is always `100.5 / 1.5 ≈ 67`, i.e. the curve never
+	// reaches the ceiling regardless of how much RAM the machine has.
 	//
 	// `excludeFromScale` is mandatory here for **one** reason — the overflow
 	// detector (measured on an otherwise identical frame: with the flag the top
@@ -747,42 +804,64 @@ if (hasTemp) {
 	// collisions in favour of the lowest index, so the % curve keeps its cells
 	// (and its block colour) wherever the two lines cross.
 	//
-	// Gate: three conditions ANDed, all load-bearing:
+	// Gate: two conditions ANDed, both load-bearing:
 	//  · a >0 reading inside the **visible window** (`hist.procRss`) — a platform or
 	//    process without the reading pushes 0s, and "unknown ⇒ curve absent" beats a
 	//    line glued to the baseline (same degradation as `cpuTemp`/`ctxPct`);
 	//  · a live `snap.procRss > 0` — otherwise a stale window (sensor just died, or
-	//    every sample so far failed) would keep drawing a curve with no current value;
-	//  · `memTotal` finite and > 0 — the mapping needs a denominator, and
-	//    `100 * v / 0` is `Infinity` ⇒ NaN coordinates ⇒ an out-of-bounds crash,
-	//    while `100 * v / Infinity` is 0 for every point (a flat line glued to the
-	//    floor) and `fmtBytes(Infinity)` is the nonsense label `0B`. The
-	//    `Number.isFinite` half is the same first-line guard every other numeric
-	//    check in this file uses. `snap === undefined` (collection not run yet /
-	//    failed) implies both of the last two, and is written out so a reader
-	//    doesn't think it was missed.
-	const memTotal = snap?.memTotal ?? 0;
+	//    every sample so far failed) would keep drawing a curve with no current value.
+	// `memTotal` deliberately plays **no** part: since the axis top comes from the
+	// window's own maximum, there is no denominator left to be missing or zero, and
+	// requiring one would suppress a perfectly drawable curve on hosts where the
+	// memory total is unreadable (non-Linux) — see the `memTotal: 0` test, which
+	// pins exactly that behaviour flip.
+	// `snap === undefined` (collection not run yet / failed) implies the second
+	// leg, and is written out so a reader doesn't think it was missed.
 	const rssTail = tail(hist.procRss, points);
-	let hasProc = false;
-	for (const v of rssTail)
-		if (Number.isFinite(v) && v > 0) {
-			hasProc = true;
-			break;
-		}
-	hasProc =
-		hasProc &&
+	// ── Gate ──
+	// **One** leg, not three, because `rssAxisMax` already asks the window question
+	// and asks it strictly harder: it returns >0 exactly when the window contains a
+	// finite value >0 that survives `max * 1.5` without overflowing. That single
+	// condition therefore subsumes the window scan (`Number.isFinite(v) && v > 0`),
+	// the "no usable scale" check, AND the "window value is enormous but finite"
+	// case — which is the one that would otherwise divide by a zero axis and emit a
+	// series of `Infinity` points plus a `0B` ("the top of this plot is zero bytes")
+	// label. Keeping a separate scan loop next to it was **dead code**: the
+	// mutations that delete it (`M2`), or gut its `Number.isFinite` (`M14`), turn
+	// nothing red — measured — and a leg no test can falsify is worse than no leg,
+	// because the comment claims a guard that the code no longer needs.
+	//
+	// The remaining legs are about the **live frame**, which the history cannot
+	// answer: `snap.procRss` must be a real number (not `Infinity`/`NaN`, which
+	// `fmtBytes` would render as `0B`), and `> 0` so a dead sensor stops the curve
+	// instead of freezing the last window's shape. `snap === undefined` (collection
+	// not run yet / failed) implies both and is spelled out as documentation.
+	//
+	// `memTotal` deliberately plays **no** part — since the axis top comes from the
+	// window's own maximum there is no denominator left to be missing or zero, and
+	// requiring one would suppress a perfectly drawable curve on hosts where the
+	// memory total is unreadable (non-Linux). The `memTotal` test pins that flip.
+	const rssAxisTop = rssAxisMax(rssTail);
+	const hasProc =
+		rssAxisTop > 0 &&
 		snap !== undefined &&
-		snap.procRss > 0 &&
-		Number.isFinite(memTotal) &&
-		memTotal > 0;
+		Number.isFinite(snap.procRss) &&
+		snap.procRss > 0;
 
 	const memSeries: BlockSeries[] = [{ values: tail(hist.mem, points) }];
+	// Units for the pre-mapped RSS curve. Taken from the block's own axis spec rather
+	// than hard-coded as 100.5: `excludeFromScale` curves live in axis units by
+	// courtesy of this mapping, so if `percentAxis()` ever moves, a literal here would
+	// silently de-sync the two (the same trap `tokenAxis`'s `scaleTop` note records).
 	if (hasProc) {
+		const rssUnits = percentAxis().max;
 		memSeries.push({
 			// Unknown points inside a live window map to 0, never to NaN (NaN
 			// coordinates are the road to out-of-bounds crashes — ARCHITECTURE
 			// pitfall 4); braille has no gap semantics to draw a hole with.
-			values: rssTail.map((v) => (100 * (Number.isFinite(v) && v > 0 ? v : 0)) / memTotal),
+			values: rssTail.map(
+				(v) => (rssUnits * (Number.isFinite(v) && v > 0 ? v : 0)) / rssAxisTop,
+			),
 			color: "error",
 			excludeFromScale: true,
 		});
@@ -863,28 +942,32 @@ if (hasTemp) {
 					: undefined,
 			),
 			series: memSeries,
-			// The byte-scale readout for the RSS curve, at the plot's top-right
-			// corner: the number of bytes the top of the plot represents (`15G` for a
-			// 15GB machine), i.e. "% of memTotal", not the current RSS. Static like
-			// the CPU block's `100°` (the 0.5% headroom over 100 is the same accepted
-			// approximation as `100°` for a 100°C ceiling).
+			// The byte-scale readout for the RSS curve, at the plot's top-right corner:
+			// the number of bytes the **top of the plot** represents for that curve
+			// (`1.2G`, i.e. window max × 1.5), not the current RSS — the current RSS is
+			// the title bar's `pi 802M`. Without this label the red curve would be
+			// unquantified: it has its own axis, and the left column belongs to the
+			// memory percentages.
 			//
-			// Not padded to a constant width, which ARCHITECTURE pitfall 6 normally
-			// requires: `fmtBytes` spans 2/3/4/5 columns (`15G`=3, `700M`=4, `>999T`=5).
-			// What makes that safe is **not** "memTotal never changes" — it is not a
-			// per-machine constant (`readMem()` falls back to `os.totalmem()` when
-			// `/proc/meminfo` is unreadable, darwin reads 0 until its first async
-			// refresh lands, and VM hot-plug / ballooning move it). What makes it safe
-			// is that this label does not participate in the layout budget at all:
-			// `rawGutter` (the left budget that positions the plot's left edge) is
-			// computed from `block.axis().labels` only and never sees this string
-			// (`chart-panel.ts`), and the label is right-anchored. So a width change
-			// at worst moves its own left edge by a column, or makes it be skipped
-			// a width earlier by the roomfulness guard — the plot's shape, the row
-			// count and the other blocks are untouched. (Measured with `memTotal`
-			// flipped between 9.9G and 10G every frame across w=8..120: no width or
-			// row-count anomaly, only the label's own left edge moved.)
-			rightAxisLabel: hasProc ? fmtBytes(memTotal) : undefined,
+			// `padStart(RSS_LABEL_W)` is **not** cosmetic tidiness: `fmtBytes` returns
+			// 2..5 columns (`0B`=2, `75M`=3, `300M`=4, `1020M`=5, `1.0G`=4) and the axis
+			// top crosses those unit boundaries as RSS grows, so the unpadded label
+			// changed width between frames. `renderBlock` right-anchors the label
+			// (`rightEdge - labW`), so a width change moves its **left edge** by a column
+			// every time the axis crosses a boundary — a flicker of both the text and
+			// the numbers' alignment (ARCHITECTURE pitfall 6).
+			//
+			// Deliberately **not** `rateAxis`'s "reduce precision, don't truncate" trick:
+			// that one exists to keep a 5-column gutter and would turn `1020M` into
+			// `102M` here — a lie about the scale. Padding loses no information: the
+			// leading spaces are invisible filler inside an overlay, and the label never
+			// participates in the layout budget (`rawGutter` is computed from
+			// `block.axis().labels` only, `chart-panel.ts`), so the extra columns are
+			// free rather than stolen from the plot.
+			//
+			// `undefined` (never an empty string) when there is no curve, so
+			// `renderBlock`'s `if (block.rightAxisLabel)` keeps working.
+			rightAxisLabel: hasProc ? fmtBytes(rssAxisTop).padStart(RSS_LABEL_W) : undefined,
 			legend: ab(
 				snap
 					? [

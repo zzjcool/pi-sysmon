@@ -430,6 +430,32 @@ packages are optional `peerDependencies` that pi itself provides). The npm tarba
 `docs/`, both READMEs, the changelog and the license — it is what `pi install npm:pi-sysmon`
 fetches.
 
+### Releasing
+
+Publishing is **two steps, and only the second one is irreversible**.
+
+```sh
+# 1. tag — CI runs the full gate, then STAGES the package
+git tag v0.10.0 && git push origin v0.10.0
+```
+
+The `Release` workflow reuses the same `check` job as PRs (a tag can never publish something a
+PR did not verify), asserts the tag matches `package.json`, and runs
+`npm stage publish --provenance`. It prints a **stage id** and writes it to the run's job
+summary. Nothing is on the registry yet and no dist-tag points at it.
+
+```sh
+# 2. approve — a human, with a 2FA OTP
+npm stage approve <stage-id>
+```
+
+`npm stage approve` is deliberately not automated: a published version number can never be
+reused, so the irreversible step needs a person present. `npm stage view <id>` /
+`npm stage download <id>` inspect a stage first, and `npm stage reject <id>` discards it.
+
+This needs **npm 12+** (`npm stage` does not exist in npm 11) and an `NPM_TOKEN` repository
+secret with publish rights — the staging token never needs 2FA, only the approval does.
+
 ## Implementation Notes
 
 The charts use no TUI drawing library; the characters are composed by hand. The core is the

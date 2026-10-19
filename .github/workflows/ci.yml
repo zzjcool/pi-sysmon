@@ -1,9 +1,15 @@
 name: CI
 
+# Reusable: the release workflow calls this job via `workflow_call`, so a
+# tag can never publish something that has not passed the exact same gate
+# as a PR. Only one definition of "green" exists — the alternative
+# (copying these steps into release.yml) is how a tag ends up shipping a
+# build the PR never verified.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 jobs:
   check:
@@ -11,9 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 22.22.2 is npm 12's floor for `npm stage`
+      # (^22.22.2 || ^24.15.0 || >=26). The release workflow stages with
+      # npm 12, so the checked and the published version are built and
+      # tested on the same Node line.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.19"
+          node-version: "22.22.2"
 
       - name: Install dev dependencies
         run: npm install --no-audit --no-fund

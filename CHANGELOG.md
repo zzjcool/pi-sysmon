@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-19
+
 ### Added
 
 - **Line mode shows the CPU temperature** (`CPU 12% 48°  MEM …`), with the same reading and
@@ -442,6 +444,9 @@ installable with `pi install npm:pi-sysmon`.
   existing file that only carries the older `enabled: false` field is read as "global default off".
 - `chart` and `line` share one widget, so both follow `above`/`below` placement.
 
+[0.10.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.9.1...v0.10.0
+[0.9.1]: https://github.com/zzjcool/pi-sysmon/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.8.1...v0.9.0
 [0.8.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/zzjcool/pi-sysmon/compare/v0.7.1...v0.7.2
 [0.8.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.7.2...v0.8.0

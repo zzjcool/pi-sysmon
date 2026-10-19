@@ -14,6 +14,10 @@ on:
     tags:
       - "v*.*.*"
 
+env:
+  # Pinned npm for staging. Bump deliberately, never float.
+  NPM12_VERSION: "12.2.1"
+
 # Never let two tags race for the same npm version, and never cancel a stage
 # halfway through — a cancelled run leaves no record of whether a stage id was
 # handed out.
@@ -47,13 +51,23 @@ jobs:
           node-version: "22.22.2"
           registry-url: "https://registry.npmjs.org"
 
-      # npm 11 (the version bundled with Node 22) has no `stage` command at all;
-      # `npm stage publish` only exists from npm 12. Installed globally rather
-      # than via npx so the version is pinned and visible in the log.
-      - name: Install npm 12 (first release with `npm stage`)
+      # npm 11 (bundled with Node 22) has no `stage` command; `npm stage` only
+      # exists from npm 12. Run it through `npx npm@<pin>` rather than
+      # `npm install -g npm@12`: the global install **uninstalls the npm it is
+      # running on** and then fails to relink, dying with
+      # `MODULE_NOT_FOUND: Cannot find module 'promise-retry'` from inside its
+      # own arborist. npx leaves the host npm untouched.
+      #
+      # Pinned (not `npm@12`) so a 12.x regression cannot change what
+      # publishes a version number that can never be reused.
+      # `npx ... --version` prints what is actually running, so the log
+      # records it.
+      - name: Resolve npm 12 (the first release with `npm stage`)
         run: |
-          npm install -g npm@12
-          npm --version
+          set -eu
+          NPM12="npm@${NPM12_VERSION}"
+          echo "NPM12=${NPM12}" >> "$GITHUB_ENV"
+          npx --yes "$NPM12" --version
 
       - name: Install dev dependencies
         run: npm install --no-audit --no-fund
@@ -80,7 +94,9 @@ jobs:
       # --dry-run first: proves the tarball assembles and that the tag/version
       # agree, before any state is created on the registry.
       - name: Verify the tarball (dry run)
-        run: npm stage publish --dry-run --access public --ignore-scripts
+        run: |
+          npx --yes "$NPM12" stage publish --dry-run \
+            --access public --ignore-scripts
 
       - name: Stage on npm
         id: stage
@@ -90,8 +106,8 @@ jobs:
           set -eu
           # `--provenance` ties the staged tarball to this workflow run and
           # commit; npm shows the attestation on the version page once approved.
-          out="$(npm stage publish --access public --provenance \
-            --ignore-scripts 2>&1)"
+          out="$(npx --yes "$NPM12" stage publish --access public \
+            --provenance --ignore-scripts 2>&1)"
           printf '%s\n' "$out"
           # The stage id only appears in the human-readable trailer
           # (`+ pkg@ver (staged with id <uuid>)`), so scrape it rather than
@@ -115,7 +131,9 @@ jobs:
           The package is **staged, not published**. It does not exist on the
           registry yet, and no dist-tag points at it.
 
-          Approve it (needs a 2FA OTP):
+          Approve it (needs a 2FA OTP, and **npm 12+** — `npm stage` does not
+          exist in npm 11; use `npx npm@${NPM12_VERSION} stage ...` if your
+          local npm is older):
 
           \`\`\`sh
           npm stage approve ${{ steps.stage.outputs.stage_id }}
@@ -146,5 +164,6 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -n "${{ steps.stage.outputs.stage_id }}" ]; then
-            npm stage reject "${{ steps.stage.outputs.stage_id }}" || true
+            npx --yes "$NPM12" stage reject \
+              "${{ steps.stage.outputs.stage_id }}" || true
           fi

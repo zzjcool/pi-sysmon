@@ -21,8 +21,14 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# `contents: read` for checkout. `id-token: write` is **required** by
+# `--provenance`: sigstore mints the attestation from the OIDC token that
+# GitHub only exposes when this permission is granted
+# (`ACTIONS_ID_TOKEN_REQUEST_URL` / `_TOKEN` are absent otherwise, and
+# `@sigstore/sign` fails with "missing id token" instead of degrading).
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   # Reuse the PR gate instead of restating it. A tag must be exactly as green as
@@ -52,12 +58,14 @@ jobs:
       - name: Install dev dependencies
         run: npm install --no-audit --no-fund
 
-      # `prepublishOnly` runs `npm run check` again — that is intentional: it is
-      # the guard that also protects a manual `npm publish` from a laptop, and
-      # the redundant run here is a few seconds against a wrong tarball.
-      #
-      # --dry-run first: proves the tarball assembles and that the tag/version
-      # agree, before any state is created on the registry.
+      # `--ignore-scripts` is deliberate. `prepublishOnly` calls
+      # `npm run check`, and this job runs after the reusable `check`
+      # job already gated the same commit — so without it the suite would
+      # run **three** times (check job, dry run, real stage). Skipping here
+      # does not weaken the guarantee: the gate that matters is the `check`
+      # job, and if it fails the stage job never starts. A manual
+      # `npm publish` from a laptop still gets the guard, because that
+      # invocation does not pass this flag.
       - name: Assert the tag matches package.json
         run: |
           set -eu
@@ -69,8 +77,10 @@ jobs:
           fi
           echo "tag ${GITHUB_REF_NAME} matches pkg ${pkg_version}"
 
+      # --dry-run first: proves the tarball assembles and that the tag/version
+      # agree, before any state is created on the registry.
       - name: Verify the tarball (dry run)
-        run: npm stage publish --dry-run --access public
+        run: npm stage publish --dry-run --access public --ignore-scripts
 
       - name: Stage on npm
         id: stage
@@ -80,7 +90,8 @@ jobs:
           set -eu
           # `--provenance` ties the staged tarball to this workflow run and
           # commit; npm shows the attestation on the version page once approved.
-          out="$(npm stage publish --access public --provenance 2>&1)"
+          out="$(npm stage publish --access public --provenance \
+            --ignore-scripts 2>&1)"
           printf '%s\n' "$out"
           # The stage id only appears in the human-readable trailer
           # (`+ pkg@ver (staged with id <uuid>)`), so scrape it rather than

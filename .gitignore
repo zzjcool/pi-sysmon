@@ -8,3 +8,6 @@ pi-sysmon.json
 .vscode/
 .pi-subagents/
 PUBLISH.md
+# 容器化 TUI 回归的抓帧产物（test/docker/verify-tui-visual.sh）
+test/tui/artifacts/
+.ruff_cache/

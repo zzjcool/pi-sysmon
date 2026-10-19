@@ -56,6 +56,7 @@
 		"typecheck": "tsc --noEmit",
 		"build:single": "node scripts/bundle-single-file.mjs",
 		"check": "npm run typecheck && npm test",
+		"test:docker": "make -C test/docker build && make -C test/docker tui-visual",
 		"prepublishOnly": "npm run check"
 	},
 	"peerDependencies": {

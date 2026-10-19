@@ -1,0 +1,14 @@
+# 构建上下文裁剪：镜像只需要 test/docker、test/tui 与 package.json，
+# 源码是运行期只读挂载的（改源码不需要重建镜像）。
+# 不做这一步，node_modules（~190M）和抓帧产物会一起 tar 进 daemon，构建慢十倍。
+.git
+.github
+node_modules
+dist
+test/tui/artifacts
+.pi
+.pi-subagents
+.ruff_cache
+**/*.log
+core
+docs/images

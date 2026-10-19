@@ -221,6 +221,25 @@ cp -r pi-sysmon ~/.pi/agent/extensions/pi-sysmon
 pi -e npm:pi-sysmon
 ```
 
+### Try the source in a container (no host pollution)
+
+This repo ships a containerized sandbox under [`test/docker`](test/docker)
+that mounts the working tree into a clean image with pi preinstalled, so you can
+see the real rendering (and the Tokens chart animating) without touching your
+local `~/.pi/agent`:
+
+```bash
+cd test/docker
+make build      # once, ~1.5 min
+make mock       # pi in a container with a built-in mock LLM (40 tok/s streaming)
+# or, against your real host gateway:
+make run
+```
+
+Source is mounted read-only at `/plugin`, so **edits take effect without rebuilding**.
+`make tui-visual` runs the deterministic regression (tmux frame capture, assertions,
+and PNG evidence). See [`test/docker/README.md`](test/docker/README.md) for details.
+
 ## Requirements & Platform Support
 
 Everything below needs **zero manual setup** unless marked otherwise — no optional
@@ -561,6 +580,21 @@ Unit tests catch geometry and bad values, but not **packaging/loading** problems
 extension never actually loading in a real pi, or a bundle with leftover relative imports. This
 project launches a real pi under `pty` and replays the screen with `pyte` to verify; this step has
 caught multiple "all unit tests green but nothing shows on a real machine" incidents.
+
+### Containerized check (optional)
+
+[`test/docker`](test/docker) reproduces that check reproducibly: a clean image with pi
+preinstalled, the working tree mounted at `/plugin`, and tmux capturing real frames.
+
+```bash
+cd test/docker
+make smoke        # L1 model reachable → L2 plugin loaded → L3 /sysmon command really runs
+make tui-visual   # mock LLM + tmux capture + assertions + PNG evidence
+```
+
+`make smoke`'s L3 is the strongest layer: it runs `pi -e src/index.ts --print "/sysmon global off"`
+and asserts the config file was written — only possible if the extension actually loaded and
+registered its command. See [`test/docker/README.md`](test/docker/README.md).
 
 ## Pitfalls Hit During Development
 

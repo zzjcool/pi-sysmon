@@ -200,6 +200,23 @@ cp -r pi-sysmon ~/.pi/agent/extensions/pi-sysmon
 pi -e npm:pi-sysmon
 ```
 
+### 在容器里试用源码（不污染本机）
+
+本仓库自带 [`test/docker`](test/docker)：把工作区挂进一个装好 pi 的干净镜像，
+直接看真实渲染效果（包括 Tokens 图动起来），完全不碰本地 `~/.pi/agent`：
+
+```bash
+cd test/docker
+make build      # 首次约 1.5 分钟
+make mock       # 容器内 pi + 内置 mock LLM（按 40 tok/s 流式吐字）
+# 或者接宿主真网关：
+make run
+```
+
+源码以只读方式挂到 `/plugin`，所以**改源码不用重建镜像**。
+`make tui-visual` 跑确定性回归（tmux 抓帧 + 断言 + PNG 取证）。
+细节见 [`test/docker/README.md`](test/docker/README.md)。
+
 ## 环境要求与平台支持
 
 下表中除特别标注外**均无需任何手动安装** —— 图表工作不依赖任何可选依赖；
@@ -505,6 +522,21 @@ CPU 段永远保留。
 例如扩展在真实 pi 里根本没被加载、或 bundle 残留相对 import。
 本项目用 `pty` 启动真实 pi、用 `pyte` 回放屏幕来验证，
 这一步捉到过多次「单测全绿但真机不显示」的事故。
+
+### 容器化验证（可选）
+
+[`test/docker`](test/docker) 把这一步做成可复现的：干净镜像装好 pi，工作区挂到 `/plugin`，
+用 tmux 抓真实帧。
+
+```bash
+cd test/docker
+make smoke        # L1 模型可达 → L2 插件已加载 → L3 /sysmon 命令真执行
+make tui-visual   # mock LLM + tmux 抓帧 + 断言 + PNG 取证
+```
+
+`make smoke` 的 L3 是最硬的一层：它跑 `pi -e src/index.ts --print "/sysmon global off"`
+并断言配置文件被写入 —— 只有扩展真加载并注册了命令才可能通过。
+细节见 [`test/docker/README.md`](test/docker/README.md)。
 
 ## 开发时踩过的坑
 

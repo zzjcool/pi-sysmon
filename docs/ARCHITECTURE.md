@@ -61,6 +61,43 @@ history accumulates it visually converges to right-aligned anyway.
   bottom: it places peaks at about 2/3 of the axis height, leaving breathing room above and
   below the curve instead of touching the top.
 
+#### Dual-scale blocks: `excludeFromScale` + `rightAxisLabel`
+
+A block can draw a second curve whose unit differs from the block's own axis (CPU °C over CPU%,
+RSS-in-percent over memory%, a 0–100 hit rate over tok/s). Two `MetricBlock` fields make that
+work without a second gutter:
+
+- **`excludeFromScale: true`** on the secondary series has **two** effects inside `renderBlock`:
+  1. the series does not contribute to `dataMax` (the scale sampling);
+  2. it does not participate in **overflow detection**, so a value above the axis top clamps
+     silently to the top row instead of painting a `+` onto the top tick.
+
+  ⚠️ **Which of the two actually bites depends on the axis kind, and getting this wrong is easy**:
+  on a **fixed-axis** block (`percentAxis()`, max always 100.5, `dataMax` ignored entirely) effect (1)
+  has **no observable consequence** — deleting the flag cannot change the scale, only the `+`
+  marker (measured: same frame, with the flag the top tick stays `100%`, without it `100+`).
+  On an **auto-scaled** block (`rateAxis` / `tokenAxis`, where `max` really is derived from
+  `dataMax`) effect (1) is the mechanism that keeps the axis from being stretched — measured on the
+  Tokens block (idle 1 tok/s tail + a 90% hit-rate curve): the axis top is `10` with the flag and
+  `13.5` without it, i.e. without the flag a 90% curve would only reach 2/3 of the height.
+  The only live instance of that case today is the Tokens block's hit-rate curve; both
+  `rightAxisLabel` blocks (CPU temperature, Memory RSS) sit on the *fixed* percent axis.
+  So "the big secondary reading would stretch the axis" is a true argument for auto-scaled blocks
+  and a **false** one for the percentage blocks — do not copy the note across.
+- **`rightAxisLabel`** is an overlay painted at the plot area's **top-right corner** (after the
+  legend box, so it sits left of the box rather than under it). It carries its own unit and colour
+  (the last series' colour, i.e. the same red/yellow as the curve it belongs to).
+  It is **not** part of the layout budget: `rawGutter` — the left budget that positions the plot
+  area's left edge — is computed from `block.axis().labels` only and never sees this string. A
+  label that grows or shrinks therefore only moves **its own left edge** (it is right-anchored) or
+  gets skipped one width earlier by the roomfulness guard; it never moves the plot's left edge and
+  never changes a row's width or the panel's row count. **That is exactly why this label does not
+  need a fixed width**, unlike every tick in `block.axis().labels`.
+
+Two instances today: the CPU block's temperature segment (`100°`) and the Memory block's process
+RSS segment (`fmtBytes(memTotal)`, e.g. `64G` — the byte value that 100% of the shared percent
+axis stands for, *not* the current RSS).
+
 ### 4. Enablement is two layers: display prefs in a file, the session switch in `pi.appendEntry()`
 
 `pi.appendEntry()` writes into the **session file**. It was originally rejected because
@@ -374,6 +411,11 @@ and the time labels all flash left and right, far uglier than any tick.
 
 **The later-added overflow marker `+` is subject to this constraint too**: it must replace
 a character, not append — see the previous section.
+
+**Exception — the corner `rightAxisLabel` is deliberately *not* fixed-width**: it is not part of
+`rawGutter` at all (that budget comes from `block.axis().labels` only), so a width change moves
+only its own left edge or gets it skipped earlier — never the plot area, never a row count. See
+"Dual-scale blocks" under §3.
 
 So `rateAxis` uses `fit()` to **normalize every label to exactly `RATE_GUTTER` columns**,
 and the normalization strategy is **reducing precision, not truncating**:
@@ -730,7 +772,12 @@ point would pin the scale at 1.5, and the next 200 tok/s reply would slam the ce
   The data is unavailable — not a bug.
 - **redacted thinking** has no delta and can't be measured.
 - Multiple processes (herdr subagents) are independent pi instances, each drawing its own
-  chart — per-process counters are naturally correct.
+  chart — per-process counters are naturally correct. **That claim is scoped to TPS / session
+  counters** (they come from this process's own stream events), not to every curve: the Memory
+  block's RSS curve is genuinely per-process (each instance plots only its own
+  `process.memoryUsage().rss`), but the **machine-wide memory percentage curve above it is shared
+  state** — two pi instances on one box draw the *same* memory% curve and *different* RSS curves.
+  Same for CPU%, network and disk: they are machine totals, so N instances show N identical copies.
 
 ## Chart above or below the editor
 
@@ -837,3 +884,8 @@ All `/proc` and `/sys` reads are wrapped in try/catch, degrading to zero values 
 (total memory falls back to `os.totalmem()`). This way the extension loads and the UI
 renders fine on macOS/Windows — the curves just hug the bottom. Far better than throwing
 and taking pi down.
+
+One metric is the exception: `procRss` comes from `process.memoryUsage().rss`, a pure in-process
+call that also returns a real number on **Windows**, where every other memory source reads 0. It is
+therefore the only memory readout with a real value on that platform (the machine-wide memory
+percentage curve stays at 0; the RSS curve keeps drawing).

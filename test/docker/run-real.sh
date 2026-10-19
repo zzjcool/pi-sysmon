@@ -44,6 +44,7 @@ start_mock() {
 	docker rm -f "$NAME" >/dev/null 2>&1 || true
 	docker run -d --name "$NAME" \
 		-e TERM=xterm-256color \
+		-e COLORTERM="${COLORTERM:-truecolor}" \
 		-e TUI_COLS="$COLS" -e TUI_ROWS="$ROWS" \
 		-v "$ROOT:/plugin:ro" \
 		-w /root/work \
@@ -62,6 +63,7 @@ start_real() {
 	docker rm -f "$NAME" >/dev/null 2>&1 || true
 	docker run -d --name "$NAME" --network=host \
 		-e TERM=xterm-256color \
+		-e COLORTERM="${COLORTERM:-truecolor}" \
 		-v "$ROOT:/plugin:ro" \
 		-v "$HOST_AGENT/auth.json:$HOST_AGENT/auth.json:ro" \
 		-v "$HOST_AGENT/models-store.json:$HOST_AGENT/models-store.json" \

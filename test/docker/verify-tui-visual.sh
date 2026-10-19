@@ -132,7 +132,12 @@ write_mock_home "$PI_HOME" "$PORT" "$PLUGIN_ROOT"
 # ── 3. tmux 起 pi ────────────────────────────────────────────────────────
 tmux new-session -d -s "$SESSION" -x "$COLS" -y "$ROWS"
 tmux send-keys -t "$SESSION" \
-	"HOME=$PI_HOME PI_CODING_AGENT_DIR=$PI_HOME TERM=xterm-256color PI_OFFLINE=1 LANG=C.utf8 pi --provider mock --model flash --thinking off --tui-mode fullscreen" C-m
+	# COLORTERM=truecolor: without it pi's `system` theme emits indexed ANSI
+	# colours (`warning`=ANSI 3, `error`=ANSI 1), and the Memory chart's two
+	# curves are exactly that pair — the captured PNG then shows one colour and
+	# the artifact cannot answer "are the curves right". Fixed truecolor keeps
+	# the evidence deterministic across hosts, which is this script's whole job.
+	"HOME=$PI_HOME PI_CODING_AGENT_DIR=$PI_HOME TERM=xterm-256color COLORTERM=truecolor PI_OFFLINE=1 LANG=C.utf8 pi --provider mock --model flash --thinking off --tui-mode fullscreen" C-m
 
 wait_panel || {
 	echo "FAIL: sysmon 面板（CPU/Memory）在 30s 内从未渲染 —— 插件没加载"

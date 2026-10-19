@@ -37,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the NET group — dropped last on a narrow terminal — now only appears from 77 columns instead
   of 69. Terminals between the two widths lose the network rate where they used to show it.
 
+### Fixed
+
+- **The docker test environment showed both Memory curves in one colour.** `run-real.sh`
+  forwarded `TERM` but not `COLORTERM`, so inside the container pi's `system` theme fell back
+  to **indexed** ANSI colours: `warning` became ANSI 3 and `error` ANSI 1. Those are indeed two
+  different colour numbers — the chart code was always correct — but they are both
+  low-saturation *base* colours, and the Memory block is exactly the pair that uses them
+  (memory% = warning, RSS = error), so on many palettes they read as one. The CPU block escaped
+  it because its pair is green/red. Both `docker run` sites now pass
+  `COLORTERM="${COLORTERM:-truecolor}"` (the `:-` matters: `docker run -e VAR` on an unset
+  variable passes an *empty string*, which is the exact value that triggers the fallback), and
+  `verify-tui-visual.sh` pins `COLORTERM=truecolor` so the captured PNG evidence is
+  deterministic across hosts. Measured in the container: truecolor gives
+  `warning #c7941a` vs `error #ec7276`; indexed gave `ANSI 3` vs `ANSI 1`.
+
 ## [0.9.0] — 2026-09-29
 
 > **Publishing note**: the `0.8.2` entry below was written but never shipped

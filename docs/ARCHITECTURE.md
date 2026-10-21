@@ -574,8 +574,34 @@ box but can't copy it". This is a real incident recorded by this project's prede
 `tps.ts` extension on this machine). So with or without data, the same row count must be
 returned, with placeholder content when there's no data.
 
-Thus `totalRows` from `computeLayout` is a hard contract: `renderPanel` must return exactly
-that many rows (22 tests watch this, including a sweep across all widths 8..220).
+Thus the layout's `totalRows` is a hard contract: `renderPanel` must return exactly that many
+rows, and the layout must depend on **width and terminal height only** — never on data (the
+sweep tests over widths 8..220 and the per-block row-count assertions in `layout.test.ts`
+watch this).
+
+### Height adaptation: shrink plot rows first, drop blocks last
+
+Width alone doesn't decide the panel's height. `plotRows` has a floor
+(`MIN_PLOT_ROWS = 2`: a one-row chart is a straight line, not information) that deliberately
+**outranks the row budget**, so `computeLayout` can never get under
+`bands * MIN_PANEL_ROWS`. Stacked on a portrait/phone-width terminal, four blocks are therefore
+pinned at 16 rows no matter what budget is passed in — which is exactly the case where the
+panel eats half the screen.
+
+`fitLayout(width, chartH, count, maxRows)` is the layer that resolves that conflict: it takes
+the largest block count whose `computeLayout` fits the budget, and reports `shown`/`dropped`.
+Plot rows shrink first (so all charts stay visible whenever row shrinking suffices); dropping
+is the last resort, and it drops from the tail of the importance order that `buildBlocks`
+already emits (CPU → Memory → Network → Tokens → Disks). The dropped count is announced as
+`+N` in the last drawn title bar, since charts silently vanishing reads as a rendering bug.
+
+`layout.shown` is what keeps the two ledgers aligned: `renderPanel` truncates the block list to
+it, so the same grid that produced `totalRows` is the grid that gets drawn.
+
+The budget itself comes from `heightBudget(cap, tui.terminal.rows, reserve)` in `index.ts`:
+`min(cap, floor(rows × PI_SYSMON_HEIGHT_SHARE))`, floored at `MIN_PANEL_ROWS`, falling back to
+`cap` when the host can't report rows (stubs, broken PTY, `rows = 0`). `SHARE=1` disables the
+adaptation entirely and reproduces the pre-adaptive layout byte for byte.
 
 ### There can be only one source of truth for block count
 

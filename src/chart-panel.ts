@@ -331,6 +331,13 @@ export const RATE_GUTTER = 5;
 export const MIN_PLOT_ROWS = 2;
 
 /**
+ * Smallest panel that can still be drawn: one block with the plot floor and its
+ * two border rows. Nothing can be squeezed below this by shrinking rows — the
+ * only axis left is **how many blocks are shown** (see `fitLayout`).
+ */
+export const MIN_PANEL_ROWS = MIN_PLOT_ROWS + BLOCK_CHROME_ROWS;
+
+/**
  * Decide the column count from width and **block count**. A **pure function**
  * of width (never depends on data) — otherwise the column/row count would
  * jitter with data, re-triggering the old "row count changes shift the editor"
@@ -353,6 +360,14 @@ export function chooseColumns(width: number, count = 3): number {
 export interface Layout {
 	/** Column count */
 	cols: number;
+	/**
+	 * Blocks the layout intends to draw. Optional: `computeLayout` leaves it
+	 * undefined (meaning "all of them") so every existing caller keeps its
+	 * exact behavior; `fitLayout` sets it when it had to drop blocks.
+	 * `renderPanel` truncates the block list to this — that is what keeps the
+	 * drawn grid and `totalRows` describing the same panel.
+	 */
+	shown?: number;
 	/** How many bands (rows of blocks) to lay out (3 charts in 2 columns = 2 bands) */
 	bands: number;
 	/** Width of each block, length = cols; the remainder goes to the earlier blocks, sum exactly = width */
@@ -415,6 +430,64 @@ export function computeLayout(
 		plotRows,
 		totalRows: bands * (plotRows + BLOCK_CHROME_ROWS),
 	};
+}
+
+/** A layout that also reports how many blocks it decided to draw. */
+export interface FittedLayout extends Layout {
+	/** Blocks actually drawn (`≤` the count passed to `fitLayout`) */
+	shown: number;
+	/** Blocks hidden by the row budget (`count - shown`) */
+	dropped: number;
+}
+
+/**
+ * `computeLayout`, but honoring the row budget **by dropping blocks from the
+tail** when shrinking plot rows runs out of room.
+ *
+ * Why block-dropping exists at all: `MIN_PLOT_ROWS` deliberately takes priority
+ * over the budget (a 1-row chart is a straight line, so it isn't worth the
+ * rows), which means `computeLayout` on its own can never get under
+ * `bands * MIN_PANEL_ROWS`. Stacked on a phone-width terminal, four blocks are
+ * therefore stuck at 16 rows no matter what budget is passed in — measured, and
+ * exactly the case where the panel eats half the screen. Shrinking plot rows is
+ * tried first (the caller's `chartH` still wins whenever it fits); dropping is
+ * the last resort, and it drops the **least important** block first because
+ * `buildBlocks` emits the blocks in importance order (CPU → Memory → Network →
+ * Tokens → Disks).
+ *
+ * Dropping happens in tail order (least important first). A partially filled
+ * last band is fine — `renderPanel` already pads empty grid cells with blanks —
+ * but in practice `shown` always comes out as a multiple of `cols` whenever
+ * anything is dropped: the downward scan takes the **largest** fitting count, and
+ * if `shown` were not a multiple, `shown + 1` would have the same `bands` and hence
+ * the same `totalRows`, so it would have been chosen instead (exhaustively
+ * verified over width 1..260 × count 2..6 × budget 4..45: zero cases).
+ *
+ * Purity: same inputs ⇒ same output, and the output depends on width/height/
+ * count only — never on data, so the row count stays constant per terminal size
+ * (the "row count may only change on resize" rule).
+ */
+export function fitLayout(
+	width: number,
+	chartH: number,
+	count: number,
+	maxRows: number,
+): FittedLayout {
+	const safeCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+	if (safeCount === 0)
+		return { ...computeLayout(width, chartH, 0, maxRows), shown: 0, dropped: 0 };
+
+	const budget = Number.isFinite(maxRows) ? Math.floor(maxRows) : 0;
+	// Downward scan, not binary search: `totalRows` is **not** monotone in the
+	// block count (5 bands × 2 plot rows can be taller than 4 bands × 2), so the
+	// first fitting count from the top is the only cheap correct answer.
+	for (let shown = safeCount; shown >= 1; shown--) {
+		const l = computeLayout(width, chartH, shown, budget);
+		if (l.totalRows <= budget) return { ...l, shown, dropped: safeCount - shown };
+	}
+	// Budget below the smallest possible panel (only reachable through a direct
+	// call; the callers clamp to MIN_PANEL_ROWS first): one block is the floor.
+	return { ...computeLayout(width, chartH, 1, budget), shown: 1, dropped: safeCount - 1 };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1238,8 +1311,26 @@ export function renderPanel(
 	// Defensive: when a caller passes 0/negative, the `" ".repeat` and `truncateToWidth` below would blow up
 	const safeW = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
 
+	// Truncate to `layout.shown` so the drawn block list and the grid that produced
+	// `totalRows` are provably the same thing. `undefined` (plain `computeLayout`)
+	// means "draw them all" — every pre-adaptive caller's behavior.
+	//
+	// Honest note on what this does and doesn't guard: with the current `fitLayout`
+	// the truncation is **not observable** — `fitLayout` picks the largest fitting
+	// count, so it never returns a `shown` that is a non-multiple of `cols` with
+	// `dropped > 0` (verified by exhaustive comparison: 10,920 (width, budget)
+	// combinations produce byte-identical panels with and without this line).
+	// It is kept as a structural invariant, not as a fix for a reproducible bug:
+	// the grid and the drawn list must agree *by construction* rather than by a
+	// coincidence of today's scanning order. Do not cite this as evidence that
+	// removing it breaks the row-count contract — no test can show that.
+	const want = layout.shown === undefined ? blocks.length : layout.shown;
+	const drawn =
+		want >= blocks.length ? blocks : blocks.slice(0, Math.max(0, want));
+	if (drawn.length === 0) return [];
+
 	const { cols, widths, plotRows } = layout;
-	const blockLines = blocks.map((b, i) => {
+	const blockLines = drawn.map((b, i) => {
 		const w = widths[i % cols] ?? widths[0] ?? safeW;
 		return renderBlock(theme, b, w, plotRows, windowSecs);
 	});

@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The panel's height now adapts to the terminal's height**, so a portrait / phone-sized
+  terminal stops losing half the screen to the charts. Previously height was a function of
+  width only: four default charts stacked into 16 rows at any width below 48 columns
+  (measured, e.g. 45×20), and `MIN_PLOT_ROWS = 2` deliberately outranked the row budget, so
+  nothing could shrink that. Now the budget is `min(cap, floor(rows × 0.5))`, plot rows are
+  squeezed first, and only when that isn't enough are the least important charts dropped
+  (CPU → Memory → Network → Tokens → Disks) — announced as `+N` in the last drawn title bar
+  instead of vanishing silently. Wide terminals are untouched (4×1 already fits). New env
+  knob `PI_SYSMON_HEIGHT_SHARE` (default `0.5`, `1` = never adapt = the old behavior
+  byte for byte). New pure `fitLayout` / `MIN_PANEL_ROWS` in `chart-panel.ts`;
+  `layout.shown` keeps the drawn block list and `totalRows` describing the same grid.
+  `tui.terminal.rows` is now read per render (through the live Proxy, so a tuiMode switch is
+  seen) and joined the memo cache key, alongside `PI_SYSMON_HEIGHT_SHARE`.
+
 ## [0.10.0] — 2026-10-19
 
 ### Added

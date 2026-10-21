@@ -79,7 +79,8 @@ const HEADER = `/**
  * Environment variables:
  *   PI_SYSMON_INTERVAL=1000      sampling interval in ms (floor 500)
  *   PI_SYSMON_POINTS=400         history point count (default adapts to terminal width)
- *   PI_SYSMON_CHART_HEIGHT=4     plot rows per chart (excluding the 4 border rows)
+ *   PI_SYSMON_CHART_HEIGHT=6     plot rows per chart (excluding the 2 border rows)
+ *   PI_SYSMON_HEIGHT_SHARE=0.5   max fraction of the terminal's rows the panel may use (1 = never adapt)
  *   PI_SYSMON_LABEL=title        readout position: title (default, border title bar) / box (floating box top-right) / both / none
  *   PI_SYSMON_DISKS=1            add an extra disk I/O chart
  *   PI_SYSMON_MODE=chart         initial mode

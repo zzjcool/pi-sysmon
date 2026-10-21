@@ -478,8 +478,30 @@ CJK、组合符、零宽符、全角空格、emoji 的扫描测试，逐宽度�
 表现为「选中输入框文字后复制不了」。这是本项目前身（本机的 `tps.ts` 扩展）
 记录过的真实事故。所以有数据 / 无数据都必须返回相同行数，无数据时填占位内容。
 
-于是 `computeLayout` 给出的 `totalRows` 就是硬合同：`renderPanel` 返回的行数
-必须恰好等于它（有 22 条测试盯着这一点，包括对 8..220 全宽度的扫描）。
+于是布局给出的 `totalRows` 就是硬合同：`renderPanel` 返回的行数必须恰好等于它，
+而且布局只能由**终端宽度与终端高度**决定、**绝不依赖数据**
+（`layout.test.ts` 里对 8..220 全宽度的扫描测试与逐块行数断言都在盯着这一点）。
+
+### 高度自适应：先压绘图行，最后才丢块
+
+只靠宽度决定不了面板高度。`plotRows` 有个下限（`MIN_PLOT_ROWS = 2`：一行的图
+是一条直线，不是信息），并且这个下限**优先于行预算**，所以 `computeLayout` 永远
+不可能低于 `bands * MIN_PANEL_ROWS`。在竖屏/手机宽度的终端上四块图就被钉死在 16 行，
+不管传进去多少预算 —— 而这恰好就是面板吃掉半屏的场景。
+
+`fitLayout(width, chartH, count, maxRows)` 就是消解这个矛盾的那一层：取「
+`computeLayout` 能塞进预算」的最大块数，并回报 `shown`/`dropped`。
+**先压绘图行**（只要压行够用，所有图都留着），**丢块是最后手段**，
+且按 `buildBlocks` 已经排好的重要性顺序**从尾部丢**（CPU → Memory → Network → Tokens → Disks）。
+丢掉的块数会用 `+N` 标在最后一块的标题栏上 —— 图静默消失会被当成渲染 bug。
+
+`layout.shown` 是让两个账本对齐的关键：`renderPanel` 按它截断块列表，
+于是「算出 `totalRows` 的那个网格」和「真正画出来的网格」是同一个。
+
+预算本身来自 `index.ts` 的 `heightBudget(cap, tui.terminal.rows, reserve)`：
+`min(cap, floor(rows × PI_SYSMON_HEIGHT_SHARE))`，以 `MIN_PANEL_ROWS` 兜底，
+宿主报不出行数时（测试桩、坏 PTY、`rows = 0`）回退到 `cap`。
+`SHARE=1` 完全关闭自适应，逐字节还原旧布局。
 
 ### 块数只能有一个真相来源
 

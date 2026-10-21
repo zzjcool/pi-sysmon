@@ -6,7 +6,7 @@
 
 CPU · Memory · Network · Tokens — real-time history curves drawn with braille dot-matrix characters
 
-[![test](https://img.shields.io/badge/tests-244-brightgreen)](#testing)
+[![test](https://img.shields.io/badge/tests-276-brightgreen)](#testing)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="Four charts side by side: CPU / Memory / Network / Tokens" width="100%">
@@ -380,6 +380,14 @@ The charts lay out **responsively** by terminal width (using the default four ch
 > Row counts assume the default widget-mode budget (`PI_SYSMON_CHART_HEIGHT=6`, `WIDGET_MAX_ROWS=18`);
 > footer mode has a larger budget (40 rows), so it gets more rows.
 
+Height adapts too: the panel's budget is at most `PI_SYSMON_HEIGHT_SHARE` (default `0.5`) of the
+**terminal height**. On a portrait/phone-sized terminal — say 45 columns × 20 rows, where the four
+default charts would stack into 16 rows — the panel shrinks plot rows first and then drops the
+least important charts (CPU → Memory → Network → Tokens → Disks), marking the loss with `+N` in
+the last title bar. A wide terminal that is also tall is unaffected (4×1 already fits);
+a **wide but short** one does shrink (width is not the only constraint).
+`PI_SYSMON_HEIGHT_SHARE=1` disables the adaptation entirely.
+
 Each chart needs at least 24 columns (2 for the border + 22 for the plot). Tick marks are
 **overlaid** on the plot area rather than owning a column, so this floor is much lower than the
 old layout (where ticks owned 5 columns). Below that, bottom would crush N charts together (at 50
@@ -398,6 +406,7 @@ second group has a single block plus a full row of blanks.
 | `PI_SYSMON_INTERVAL` | `1000` | Sampling interval (milliseconds, floor 500) |
 | `PI_SYSMON_POINTS` | `60` | History point count (overrides the count derived from `PI_SYSMON_WINDOW`) |
 | `PI_SYSMON_CHART_HEIGHT` | `6` | Plot rows per chart (excluding the 2 border rows) |
+| `PI_SYSMON_HEIGHT_SHARE` | `0.5` | Fraction of the **terminal's rows** the panel may occupy (clamped to `0.1`–`1`). Drives the height adaptation: on a short terminal the panel shrinks plot rows and then hides the least important charts (a `+N` marker in the last title bar says how many). Set `1` to never adapt (pre-adaptive behavior) |
 | `PI_SYSMON_LABEL` | `title` | Reading placement: `title` (border title bar) / `box` (top-right floating box) / `both` / `none` |
 | `PI_SYSMON_WINDOW` | `60` | Horizontal time-window length (seconds) |
 | `PI_SYSMON_SCALE_WINDOW` | `1` (= scale window == display window) | **Scale sampling ratio** for rate charts: `1` = top of y-axis is the true window maximum; set `<1` (e.g. `1/6`) to enable "auto-falloff about 10s after a spike passes" (spikes beyond the scale then show as `+` markers) |
@@ -557,8 +566,8 @@ widths (the `┌ CPU ─ 1.91 1.80 2.17 ───┐` kind). For example:
 ## Testing
 
 ```bash
-npm test          # 244 unit tests (braille 13 + layout 87 + tokens 32 + state 26 + extension 28 + metrics 58;
-                  #   13 darwin-only live tests are skipped on other platforms, 231 run everywhere)
+npm test          # 276 unit tests (braille 13 + layout 110 + tokens 32 + state 26 + extension 34 + metrics 61;
+                  #   13 darwin-only live tests are skipped on other platforms, 263 run everywhere)
 ```
 
 ```bash

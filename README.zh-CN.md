@@ -6,7 +6,7 @@
 
 CPU · 内存 · 网络 · Tokens —— 用盲文点阵字符画的实时历史曲线
 
-[![test](https://img.shields.io/badge/tests-244-brightgreen)](#测试)
+[![test](https://img.shields.io/badge/tests-276-brightgreen)](#测试)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <img src="docs/images/overview.png" alt="四图并排：CPU / Memory / Network / Tokens" width="100%">
@@ -343,6 +343,13 @@ CPU 37% 61°  MEM 52% 33G pi 700M  TOK ~1.2Kt/s ·88% ⌀32%  NET ↑7.7K/s ↓1
 > 行数按 widget 模式默认预算计算（`PI_SYSMON_CHART_HEIGHT=6`、`WIDGET_MAX_ROWS=18`）；
 > footer 模式预算更大（40 行），行数会更多。
 
+高度也自适应：面板预算最多是**终端行数**的 `PI_SYSMON_HEIGHT_SHARE`（默认 `0.5`）。
+在竖屏/手机尺寸的终端上——比如 45 列 × 20 行，四张默认图竖排要占 16 行——面板会先压缩绘图行，
+再按重要性从尾部丢弃图形（CPU → Memory → Network → Tokens → Disks），并在最后一块的标题栏用 `+N`
+标出隐藏数量。又宽又高的终端不受影响（4 列一行本来就塞得下），
+**宽但矮**的终端同样会收缩（宽度不是唯一约束）。
+设 `PI_SYSMON_HEIGHT_SHARE=1` 可完全关闭自适应。
+
 每张图最少需要 24 列（边框 2 + 绘图区 22）。刻度是**叠印**在绘图区上的、
 不占独立列，所以这个下限比旧排版（刻度独占 5 列）低不少。
 比这更窄时 bottom 会把 N 张图硬挤成一团（50 列时每张只有 16 列，曲线已不可读），
@@ -359,6 +366,7 @@ CPU 37% 61°  MEM 52% 33G pi 700M  TOK ~1.2Kt/s ·88% ⌀32%  NET ↑7.7K/s ↓1
 | `PI_SYSMON_INTERVAL` | `1000` | 采样间隔（毫秒，下限 500） |
 | `PI_SYSMON_POINTS` | `60` | 历史点数（覆盖 `PI_SYSMON_WINDOW` 换算出的点数） |
 | `PI_SYSMON_CHART_HEIGHT` | `6` | 每张图的绘图行数（不含上/下边框那 2 行） |
+| `PI_SYSMON_HEIGHT_SHARE` | `0.5` | 面板最多占用**终端行数**的比例（钳到 `0.1`–`1`）。驱动高度自适应：矮终端上先压缩绘图行、再隐藏最次要的图（最后一块标题栏用 `+N` 标出隐藏了几张）。设 `1` 关闭自适应（回到旧行为） |
 | `PI_SYSMON_LABEL` | `title` | 读数位置：`title`（边框标题栏）/ `box`（右上角浮框）/ `both` / `none` |
 | `PI_SYSMON_WINDOW` | `60` | 横轴时间窗长度（秒） |
 | `PI_SYSMON_SCALE_WINDOW` | `1`（= 量程窗 == 显示窗） | 速率图**量程取样比例**：`1` = y 轴顶端为整窗真实最高值；设 `<1`（如 `1/6`）开启「尖峰过去约 10s 后自动回落」（此时超出量程的尖峰会显示为 `+` 标记） |
@@ -477,8 +485,8 @@ pi 单独测试与复用；`metrics.ts` 只负责读数，不关心怎么显示�
 ## 测试
 
 ```bash
-npm test          # 244 项单元测试（braille 13 + layout 87 + tokens 32 + state 26 + extension 28 + metrics 58；
-                  #   其中 13 个 darwin 真机测试在其他平台自动跳过，其余 231 个全平台必跑）
+npm test          # 276 项单元测试（braille 13 + layout 110 + tokens 32 + state 26 + extension 34 + metrics 61；
+                  #   其中 13 个 darwin 真机测试在其他平台自动跳过，其余 263 个全平台必跑）
 ```
 
 ```bash

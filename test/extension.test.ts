@@ -133,7 +133,14 @@ async function loadExtension(flags: Record<string, unknown> = {}) {
 	const makeTui = (mode: string) => ({ requestRender: () => {}, mode });
 	// Instantiate the most recently mounted factory (widget or footer) with a
 	// controllable tui and the ANSI theme.
-	const instantiate = (f: AnyFn | undefined, tui: { requestRender(): void; mode: string }) => {
+	//
+	// `terminal.rows` is optional and absent by default: the real pi tui exposes
+	// it, but the stub deliberately omits it unless a test opts in, so every
+	// pre-existing test keeps exercising the "host can't report rows" fallback.
+	const instantiate = (
+		f: AnyFn | undefined,
+		tui: { requestRender(): void; mode: string; terminal?: { rows?: number } },
+	) => {
 		assert.ok(f, "expected a mounted factory");
 		return f(tui, ansiTheme) as {
 			render(width: number): string[];
@@ -873,5 +880,202 @@ test("memoization: a message_end invalidates the cache (token readouts refresh)"
 		assert.notEqual(titleB, titleA, "message_end must invalidate the render cache");
 	} finally {
 		(c as { dispose(): void }).dispose();
+	}
+});
+
+/* ------------------------------------------------------------------ */
+/* Height adaptation: the budget follows the real terminal height       */
+/* ------------------------------------------------------------------ */
+
+test("height adaptation: a short terminal shrinks the panel, a tall one is unchanged", async () => {
+	// The end-to-end contract of the portrait fix: the panel's row budget comes
+	// from `tui.terminal.rows`, so a phone-shaped terminal (few rows) must not get
+	// the same 16-row stack a desktop gets. `makeTui` has no `terminal` field, so
+	// `h.mount` (all the pre-existing tests) keeps the static cap — that
+	// compatibility edge is asserted first.
+	const h = await loadExtension();
+	await h.sessionStart();
+	const withRows = (mode: string, rows: number) =>
+		h.instantiate(h.lastWidget(), { requestRender: () => {}, mode, terminal: { rows } });
+	const tall = withRows("regular", 200);
+	const short = withRows("regular", 20);
+	const legacy = h.mount("regular");
+	try {
+		// No terminal rows available → exactly the old static-cap behavior
+		assert.equal(legacy.render(45).length, 16, "no terminal info must keep 16 rows at 45 cols");
+		// A tall terminal must not grow past the old layout at all
+		assert.equal(tall.render(45).length, 16, "a tall terminal keeps the full stack");
+		assert.equal(tall.render(150).length, 8, "wide + tall stays 4×1");
+		// A short terminal must actually shrink the panel...
+		const shortRows = short.render(45).length;
+		assert.ok(shortRows < 16, `short terminal must shrink (got ${shortRows})`);
+		assert.ok(shortRows <= 10, `20 rows × 0.5 share = 10 (got ${shortRows})`);
+		// ...without ever overflowing its own budget at any width
+		for (const w of [20, 45, 80, 96, 150, 220]) {
+			const n = short.render(w).length;
+			assert.ok(n <= 10, `w=${w}: ${n} rows exceeds the 10-row budget`);
+		}
+	} finally {
+		tall.dispose();
+		short.dispose();
+		legacy.dispose();
+	}
+});
+
+test("height adaptation: a terminal resize invalidates the render cache", async () => {
+	// Height joined the memo key (dataVersion, width, fs, rows). Without it a
+	// resize to a shorter terminal would keep returning the cached tall panel
+	// until the next sample tick — the same class of bug the width key prevents.
+	const h = await loadExtension();
+	await h.sessionStart();
+	const tui = { requestRender: () => {}, mode: "regular", terminal: { rows: 200 } };
+	const comp = h.instantiate(h.lastWidget(), tui);
+	try {
+		const tall = comp.render(45).length;
+		tui.terminal.rows = 20;
+		const short = comp.render(45).length;
+		assert.ok(
+			short < tall,
+			`rows must be re-derived on resize without a data change (tall=${tall} short=${short})`,
+		);
+		// And going back up restores the tall panel (no one-way ratchet)
+		tui.terminal.rows = 200;
+		assert.equal(comp.render(45).length, tall);
+	} finally {
+		comp.dispose();
+	}
+});
+
+test("height adaptation: dropped charts are announced in the last title bar", async () => {
+	// Silently losing Network/Tokens reads as a rendering bug. The marker must
+	// appear only when blocks were actually dropped — a permanently present
+	// `+0` would be noise in every tall terminal.
+	const h = await loadExtension();
+	await h.sessionStart();
+	const mk = (rows: number) =>
+		h.instantiate(h.lastWidget(), { requestRender: () => {}, mode: "regular", terminal: { rows } });
+	const short = mk(20);
+	const tall = mk(200);
+	try {
+		// Sweep the phone-width band, not just one comfortable width: the marker used
+		// to be appended to the END of the title segments, where the title bar's
+		// tail-first trimming removed it first — so it was invisible at 16..37
+		// columns, i.e. precisely the widths this feature exists for.
+		for (const w of [20, 24, 28, 32, 36, 45]) {
+			const t = stripAnsi(short.render(w).join("\n"));
+			assert.match(t, /\+\d/, `w=${w}: a dropped block must be announced`);
+		}
+		const shortText = stripAnsi(short.render(45).join("\n"));
+		assert.ok(
+			!shortText.includes("Tokens"),
+			"the announced block must really be gone from the panel",
+		);
+		const tallText = stripAnsi(tall.render(45).join("\n"));
+		assert.ok(!tallText.includes("+"), `no marker when nothing was dropped: ${tallText}`);
+		assert.ok(tallText.includes("Tokens"), "a tall terminal keeps all four charts");
+	} finally {
+		short.dispose();
+		tall.dispose();
+	}
+});
+
+test("height adaptation: PI_SYSMON_HEIGHT_SHARE=1 disables adaptation even on a tiny terminal", async () => {
+	// The documented escape hatch must be a real short-circuit, not just a bigger
+	// multiplier: with share=1 the budget used to be `min(cap, rows)` — so on rows
+	// BELOW the cap the panel still shrank and still hid charts, which is exactly
+	// the tiny-terminal case a user would reach for this setting to undo. Pin it
+	// with rows < cap, where the two behaviors differ (rows >= cap proves nothing).
+	process.env.PI_SYSMON_HEIGHT_SHARE = "1";
+	process.env.PI_SYSMON_DISKS = "1"; // 5 blocks → at 45 cols the old layout is 20 rows
+	const h = await loadExtension();
+	try {
+		await h.sessionStart();
+		const legal = h.mount("regular"); // no terminal info → the pre-adaptive layout
+		const oldRows = legal.render(45).length;
+		try {
+			for (const rows of [6, 10, 16, 24, 40]) {
+				const comp = h.instantiate(h.lastWidget(), {
+					requestRender: () => {},
+					mode: "regular",
+					terminal: { rows },
+				});
+				try {
+					const n = comp.render(45).length;
+					assert.equal(n, oldRows, `rows=${rows}: share=1 must not shrink anything`);
+					assert.ok(
+						!stripAnsi(comp.render(45).join("\n")).includes("+"),
+						`rows=${rows}: share=1 must not hide any chart`,
+					);
+				} finally {
+					comp.dispose();
+				}
+			}
+		} finally {
+			legal.dispose();
+		}
+	} finally {
+		delete process.env.PI_SYSMON_HEIGHT_SHARE;
+		delete process.env.PI_SYSMON_DISKS;
+	}
+});
+
+test("height adaptation: an empty PI_SYSMON_HEIGHT_SHARE falls back to the default share", async () => {
+	// `Number("") === 0`, which would clamp to the most aggressive 0.1 instead of
+	// the documented 0.5 default — the same "unparseable ⇒ default" contract the
+	// other env knobs follow. 100 rows × 0.5 = 16 (all four charts), 100 × 0.1 = 10.
+	process.env.PI_SYSMON_HEIGHT_SHARE = "";
+	const h = await loadExtension();
+	try {
+		await h.sessionStart();
+		const comp = h.instantiate(h.lastWidget(), {
+			requestRender: () => {},
+			mode: "regular",
+			terminal: { rows: 100 },
+		});
+		try {
+			const text = stripAnsi(comp.render(45).join("\n"));
+			assert.ok(text.includes("Tokens"), "an empty value must not shrink to the 0.1 floor");
+			assert.equal(comp.render(45).length, 16);
+		} finally {
+			comp.dispose();
+		}
+	} finally {
+		delete process.env.PI_SYSMON_HEIGHT_SHARE;
+	}
+});
+
+test("height adaptation: no terminal info keeps the pre-adaptive layout even when it overruns the cap", async () => {
+	// D5's sharpest edge: `computeLayout` lets MIN_PLOT_ROWS outrank the cap, so 5
+	// blocks at 45 cols is 20 rows — over WIDGET_MAX_ROWS. Routing "no height
+	// information" through `fitLayout` would treat the cap as a hard ceiling and
+	// start hiding charts, i.e. a visible change for every host that can't report
+	// rows. This asserts the two paths are genuinely distinct (20 rows, no marker),
+	// and that the very same build adapts once rows are known (10 rows, marker).
+	process.env.PI_SYSMON_DISKS = "1";
+	const h = await loadExtension();
+	try {
+		await h.sessionStart();
+		const legacy = h.mount("regular");
+		const adapted = h.instantiate(h.lastWidget(), {
+			requestRender: () => {},
+			mode: "regular",
+			terminal: { rows: 20 },
+		});
+		try {
+			const legacyLines = legacy.render(45);
+			assert.equal(legacyLines.length, 20, "no rows reported ⇒ old 20-row layout");
+			assert.ok(
+				!stripAnsi(legacyLines.join("\n")).includes("+"),
+				"nothing may be reported as hidden when nothing was hidden",
+			);
+			const adaptedLines = adapted.render(45);
+			assert.equal(adaptedLines.length, 10);
+			assert.match(stripAnsi(adaptedLines.join("\n")), /\+3/, "5 blocks − 2 shown = +3");
+		} finally {
+			legacy.dispose();
+			adapted.dispose();
+		}
+	} finally {
+		delete process.env.PI_SYSMON_DISKS;
 	}
 });

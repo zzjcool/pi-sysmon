@@ -27,8 +27,12 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
 	computeLayout,
+	fitLayout,
+	MIN_PANEL_ROWS,
 	renderPanel,
 	renderStyledLine,
+	type FittedLayout,
+	type MetricBlock,
 	type StyledLine,
 	type ThemeLike,
 } from "./chart-panel.ts";
@@ -89,7 +93,7 @@ const WIDGET_KEY = "sysmon-chart";
  * version). `mode` is optional because the factory may be invoked with any
  * object that merely *quacks* like a tui (tests, older hosts).
  */
-type TuiLike = { requestRender(): void; mode?: string };
+type TuiLike = { requestRender(): void; mode?: string; terminal?: { rows?: number } };
 
 /**
  * Structural stand-in for pi-tui's `TuiMouseEvent` (same reasoning as
@@ -259,6 +263,30 @@ export default function (pi: ExtensionAPI) {
 	 * 168 cells to 288 (+71%).
 	 */
 	const chartH = envInt("PI_SYSMON_CHART_HEIGHT", 1, 40) ?? 6;
+	/**
+	 * Share of the terminal's rows the panel may occupy (0.1..1), default 0.5.
+	 *
+	 * Why this exists: every row the panel takes is a row the chat area loses,
+	 * and on a **portrait phone-ish terminal** (≤ 45 cols) the four default
+	 * charts stack into four bands = 16 rows — a third to half of the screen no
+	 * matter how short the terminal is. Width-only responsiveness can't see
+	 * that; this knob keys the panel's row budget off the real terminal height.
+	 *
+	 * `1` = never adapt: the budget is then not derived from the terminal at all
+	 * (the static cap applies, exactly the pre-adaptive behavior). Values are
+	 * clamped, so a bad env var can only make the panel *smaller*, never overflow.
+	 *
+	 * An unparseable/empty value falls back to the default, the same contract as
+	 * `envInt` — note `Number("") === 0`, which without the explicit empty check
+	 * would land on the most aggressive 0.1 setting instead of the default.
+	 */
+	const heightShare = (() => {
+		const raw = process.env.PI_SYSMON_HEIGHT_SHARE?.trim();
+		if (!raw) return 0.5;
+		const v = Number(raw);
+		if (!Number.isFinite(v)) return 0.5;
+		return Math.min(1, Math.max(0.1, v));
+	})();
 	/**
 	 * Default time window (seconds), aligned with bottom's `default_time_value = 60_000`.
 	 *
@@ -551,9 +579,22 @@ export default function (pi: ExtensionAPI) {
 	function renderPanelFor(
 		theme: ThemeLike,
 		width: number,
-		maxRows: number,
+		cap: number,
 		/** Whether the `↑`/`↓`/`R` token totals may be shown — footer mode only (see BlockOptions.showTokenTotals). */
 		showTokenTotals: boolean,
+		/**
+		 * Terminal rows this frame, or `undefined` when the host can't tell us
+		 * (stubbed tests, a non-tty host). `undefined` means "no adaptation": the
+		 * layout is then exactly the pre-adaptive `computeLayout(width, chartH,
+		 * count, cap - reserve)`.
+		 */
+		termRows?: number,
+		/**
+		 * Rows this mode spends on something other than the block grid (the
+		 * fullscreen chip row). Subtracted from whichever budget wins (static cap or
+		 * height share), so "the chip is paid for, never added on top" holds for both.
+		 */
+		reserve = 0,
 	): string[] {
 		const { points, windowSecs } = resolveWindow({
 			windowSecs: defaultWindowSecs,
@@ -594,8 +635,96 @@ export default function (pi: ExtensionAPI) {
 			// `undefined` is taken over by the `?? DEFAULT_...` inside buildBlocks, so pass it through
 			scaleWindowFrac,
 		});
-		const layout = computeLayout(width, chartH, blocks.length, maxRows);
-		return renderPanel(theme, blocks, width, layout, windowSecs);
+		const budget = heightBudget(cap, termRows, reserve);
+		// ── Two layout paths, on purpose ──
+		// No height information (or `PI_SYSMON_HEIGHT_SHARE=1`) ⇒ `computeLayout`
+		// with the static cap, i.e. the **exact pre-adaptive code path**. It matters
+		// that this is the same function and not an equivalent-budget `fitLayout`
+		// call: `computeLayout` lets `MIN_PLOT_ROWS` outrank the cap, so with 5
+		// blocks at width < 48 it returns 20 rows (over the 18-row cap). Routing that
+		// through `fitLayout` would treat 18 as a hard ceiling and start hiding
+		// charts — a visible behavior change for every host that can't report rows.
+		// So the two cases are kept structurally distinct: "no height info" means
+		// "don't touch the layout", not "adapt to an assumed height".
+		const layout: FittedLayout =
+			budget === undefined
+				? {
+						...computeLayout(width, chartH, blocks.length, cap - reserve),
+						shown: blocks.length,
+						dropped: 0,
+					}
+				: fitLayout(width, chartH, blocks.length, budget);
+		// The hint is not part of the drawing itself: it borrows columns from the
+		// **last visible block's title bar**, so it costs no rows. `dropped === 0`
+		// hands the blocks over untouched.
+		const drawnBlocks =
+			layout.dropped > 0
+				? withDroppedHint(blocks.slice(0, layout.shown), layout.dropped)
+				: blocks;
+		return renderPanel(theme, drawnBlocks, width, layout, windowSecs);
+	}
+
+	/**
+	 * Append a `+N` marker to the last visible block's title, meaning "N more
+	 * charts didn't fit".
+	 *
+	 * **Placed first, not last**, and **not `atomic`**: the title bar keeps
+	 * segments in order and drops them tail-first when it runs out of columns, so a
+	 * marker appended at the end would be the very first thing to disappear —
+	 * exactly on the narrow phone-width terminals this feature exists for (measured:
+	 * invisible at 16..37 columns). Putting it at the head also keeps it out of the
+	 * `Σ↓X ↑Y` atomic run that Network builds, which would otherwise weld the marker
+	 * to a unit that gets dropped whole.
+	 *
+	 * Still loses to the chart name at truly absurd widths (the name wins the
+	 * column fight) — that is fine: a panel 8 columns wide has bigger problems.
+	 *
+	 * Returns a **new array with a new last block object**: the block objects come
+	 * fresh out of `buildBlocks` each frame, but not mutating them keeps this safe
+	 * if a caller ever memoizes them.
+	 */
+	function withDroppedHint(blocks: MetricBlock[], dropped: number): MetricBlock[] {
+		const last = blocks.at(-1);
+		if (!last) return blocks;
+		return [
+			...blocks.slice(0, -1),
+			{
+				...last,
+				titleInfo: [
+					{ text: `+${dropped} `, color: "muted" },
+					...(last.titleInfo ?? []),
+				],
+			},
+		];
+	}
+
+	/**
+	 * Rows the panel may use this frame, or `undefined` for "don't adapt".
+	 *
+	 * Returns `undefined` — not a number — when there is no height information or
+	 * when the user set `PI_SYSMON_HEIGHT_SHARE=1`. That distinction is load-bearing:
+	 * `undefined` sends the caller down the untouched `computeLayout` path (which,
+	 * unlike `fitLayout`, lets `MIN_PLOT_ROWS` overrun the cap), so "adaptation off"
+	 * is really off instead of "off, but with the cap now treated as a hard ceiling".
+	 *
+	 * Otherwise: `min(cap, share × terminal rows)`, floored at `MIN_PANEL_ROWS` —
+	 * a budget below "one block + its borders" would make `fitLayout` drop every
+	 * chart, and overrunning a micro-terminal slightly beats rendering nothing.
+	 * Stub/non-tty hosts and `rows = 0` (broken PTY) both land in the `undefined`
+	 * branch rather than producing a degenerate budget.
+	 */
+	function heightBudget(
+		cap: number,
+		termRows?: number,
+		reserve = 0,
+	): number | undefined {
+		if (heightShare >= 1) return undefined;
+		if (termRows === undefined || !Number.isFinite(termRows) || termRows <= 0)
+			return undefined;
+		return Math.max(
+			MIN_PANEL_ROWS,
+			Math.min(Math.max(1, cap - reserve), Math.floor(termRows * heightShare) - reserve),
+		);
 	}
 
 	/**
@@ -730,7 +859,12 @@ export default function (pi: ExtensionAPI) {
 	 * touched) and the row-count contract is owned in one place.
 	 */
 	function makeSampled(
-		render: (theme: ThemeLike, width: number, fs: boolean) => string[],
+		render: (
+			theme: ThemeLike,
+			width: number,
+			fs: boolean,
+			termRows?: number,
+		) => string[],
 		extraRow?: (theme: ThemeLike, width: number, fs: boolean) => string,
 	) {
 		return (tui: TuiLike, theme: ThemeLike) => {
@@ -751,8 +885,9 @@ export default function (pi: ExtensionAPI) {
 				v: number;
 				w: number;
 				fs: boolean;
+				rows: number;
 				lines: string[];
-			} = { v: -1, w: 0, fs: false, lines: [] };
+			} = { v: -1, w: 0, fs: false, rows: 0, lines: [] };
 			return {
 				// dispose must be idempotent and **only clear its own timer**: pi calls
 				// dispose when replacing/removing a widget (by then the module-level
@@ -797,14 +932,28 @@ export default function (pi: ExtensionAPI) {
 				// PTY, odd SSH client) normalizes to 0 — NaN !== NaN would otherwise
 				// make every render a cache miss (harmless but pure overhead).
 				const w = Number.isFinite(width) ? width : 0;
+				// Terminal rows this frame — the input behind the panel's height
+				// budget. Read through the live Proxy (the renderer is swapped on a
+				// tuiMode switch without re-running the factory, same reason as
+				// `tui.mode` above). Optional-chained twice: the real pi terminal
+				// exposes `rows`, while the test stubs have no `terminal` at all, and
+				// `undefined` must mean "use the static cap", never throw.
+				// Non-finite/≤ 0 folds to 0 so NaN never reaches the cache key
+				// (NaN !== NaN would defeat memoization entirely).
+				const rawRows = tui.terminal?.rows;
+				const rows =
+					typeof rawRows === "number" && Number.isFinite(rawRows) && rawRows > 0
+						? Math.floor(rawRows)
+						: 0;
 				if (
 					cache.v === dataVersion &&
 					cache.w === w &&
-					cache.fs === fs
+					cache.fs === fs &&
+					cache.rows === rows
 				) {
 					return [...cache.lines];
 				}
-				const lines = render(theme, w, fs);
+				const lines = render(theme, w, fs, rows > 0 ? rows : undefined);
 				if (fs && extraRow) {
 					const row = extraRow(theme, w, fs);
 					// A chart-mode extra row (y=-1 sentinel from chipRow) is appended
@@ -819,6 +968,7 @@ export default function (pi: ExtensionAPI) {
 				cache.v = dataVersion;
 				cache.w = w;
 				cache.fs = fs;
+				cache.rows = rows;
 				cache.lines = [...lines];
 				return lines;
 			},
@@ -865,12 +1015,18 @@ export default function (pi: ExtensionAPI) {
 			// constant: fullscreen subtracts 1 so panel + chip stays within
 			// maxRows, while regular mode (fs=false) gets the identical budget
 			// and therefore byte-identical rows to before this feature.
-			(theme, width, fs) =>
+			(theme, width, fs, termRows) =>
 				renderPanelFor(
 					theme,
 					width,
-					maxRows - (fs ? 1 : 0),
+					maxRows,
 					showTokenTotals,
+					// The row budget follows the **real** terminal height (falling back
+					// to maxRows when the host can't report it).
+					termRows,
+					// Fullscreen spends one row on the chip; it comes out of whichever
+					// budget won (static cap or height share), so the total never grows.
+					fs ? 1 : 0,
 				),
 			(theme, width) => chipRow(theme, width),
 		);

@@ -21,7 +21,9 @@ import {
 	BLOCK_CHROME_ROWS,
 	blockMetrics,
 	computeLayout,
+	fitLayout,
 	chooseColumns,
+	MIN_PANEL_ROWS,
 	percentAxis,
 	plotWidthFor,
 	RATE_GUTTER,
@@ -78,6 +80,9 @@ const ANSI: Record<string, string> = {
 	dim: "\x1b[2m",
 	text: "\x1b[37m",
 };
+/** Strip the fake theme's ANSI codes so assertions see what's actually on screen. */
+const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+
 const ansiTheme: ThemeLike = {
 	fg: (c, s) => (s.trim() === "" ? s : `${ANSI[c] ?? ""}${s}\x1b[0m`),
 };
@@ -3966,4 +3971,169 @@ test("plainLineSegs: ctxPct renders the same ◔ segment with the same colors as
 		s.text,
 	).join("");
 	assert.ok(!unknown.includes("◔"), unknown);
+});
+
+/* ------------------------------------------------------------------ */
+/* 6. Height adaptation (portrait / short terminals)                    */
+/*                                                                      */
+/* `computeLayout` alone can never shrink a stacked panel below         */
+/* `bands * MIN_PANEL_ROWS`, because the plot-row floor deliberately    */
+/* outranks the budget. `fitLayout` is the layer that resolves that     */
+/* conflict by dropping blocks from the tail. These tests pin the two   */
+/* things that must never regress: the budget is honored when it can    */
+/* be, and nothing changes at all when the budget is generous.          */
+/* ------------------------------------------------------------------ */
+
+test("fitLayout: a generous budget is byte-identical to computeLayout", () => {
+	// The compatibility edge: every pre-adaptive caller passes a budget the
+	// panel already fits in, and must keep getting exactly the old layout.
+	for (let w = 1; w <= 220; w += 3) {
+		for (const count of [1, 3, 4]) {
+			const l = computeLayout(w, 6, count, 18);
+			const f = fitLayout(w, 6, count, 18);
+			assert.equal(f.cols, l.cols, `w=${w} count=${count}`);
+			assert.equal(f.bands, l.bands, `w=${w} count=${count}`);
+			assert.equal(f.plotRows, l.plotRows, `w=${w} count=${count}`);
+			assert.equal(f.totalRows, l.totalRows, `w=${w} count=${count}`);
+			assert.deepEqual(f.widths, l.widths, `w=${w} count=${count}`);
+			assert.equal(f.shown, count);
+			assert.equal(f.dropped, 0);
+		}
+	}
+});
+
+test("fitLayout: honors a tight budget by dropping blocks from the tail", () => {
+	// 45 cols = one column → four blocks are four bands. Each band needs at
+	// least MIN_PANEL_ROWS (2 plot + 2 chrome), so 16 rows is the hard floor for
+	// the full set and a 20-row terminal can never fit it. The budget must be
+	// paid by dropping the least important charts, not by silently overrunning.
+	for (const [rows, expectShown] of [
+		[20, 2],
+		[24, 3],
+		[40, 4],
+	] as const) {
+		const budget = Math.floor(rows * 0.5);
+		const f = fitLayout(45, 6, 4, budget);
+		assert.ok(
+			f.totalRows <= budget,
+			`rows=${rows}: totalRows=${f.totalRows} must fit budget=${budget}`,
+		);
+		assert.equal(f.shown, expectShown, `rows=${rows}`);
+		assert.equal(f.dropped, 4 - expectShown, `rows=${rows}`);
+		assert.equal(f.totalRows, f.bands * (f.plotRows + BLOCK_CHROME_ROWS));
+	}
+});
+
+test("fitLayout: dropping is the last resort — plot rows shrink first", () => {
+	// At 80 cols the four blocks are 2×2, so there IS room to shrink: a 15-row
+	// budget is met by fewer plot rows and all four charts stay visible.
+	const f = fitLayout(80, 6, 4, 15);
+	assert.equal(f.shown, 4, "all charts must survive when row shrinking suffices");
+	assert.equal(f.dropped, 0);
+	assert.ok(f.totalRows <= 15, `totalRows=${f.totalRows} must fit budget=15`);
+	assert.ok(f.plotRows >= 2, "the plot-row floor still outranks the budget");
+});
+
+test("fitLayout: never exceeds the budget unless the budget is below the floor", () => {
+	// Sweep every width × budget a real terminal can produce. Only the
+	// sub-MIN_PANEL_ROWS budgets may overrun (and `heightBudget` in index.ts
+	// clamps those away before they ever reach here).
+	for (let w = 1; w <= 220; w += 7) {
+		for (const budget of [4, 6, 8, 10, 12, 14, 16, 18]) {
+			for (const count of [3, 4, 5]) {
+				const f = fitLayout(w, 6, count, budget);
+				if (budget >= MIN_PANEL_ROWS) {
+					assert.ok(
+						f.totalRows <= budget,
+						`w=${w} budget=${budget} count=${count}: ${f.totalRows} > ${budget}`,
+					);
+				}
+				assert.ok(f.shown >= 1, `w=${w} budget=${budget} count=${count}: dropped everything`);
+				assert.equal(f.shown + f.dropped, count);
+				// The reported grid must describe the blocks actually drawn
+				assert.equal(
+					f.bands,
+					Math.ceil(f.shown / f.cols),
+					`w=${w} budget=${budget} count=${count}`,
+				);
+			}
+		}
+	}
+});
+
+test("fitLayout: zero blocks and absurd inputs stay safe", () => {
+	const zero = fitLayout(80, 6, 0, 10);
+	assert.equal(zero.totalRows, 0);
+	assert.equal(zero.shown, 0);
+	assert.equal(zero.dropped, 0);
+	for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -5]) {
+		const f = fitLayout(80, 6, 4, bad);
+		assert.ok(Number.isFinite(f.totalRows), `budget=${bad}`);
+		assert.ok(f.shown >= 1, `budget=${bad}`);
+	}
+});
+
+test("renderPanel: draws exactly `shown` blocks and the promised row count", () => {
+	// Asserts the *contract* between `fitLayout` and `renderPanel`: the drawn
+	// list is the `shown` prefix, and the row count is the promised `totalRows`.
+	//
+	// Note this does NOT prove the truncation is load-bearing: with today's
+	// `fitLayout`, `shown` is always a multiple of `cols` (see the layout test
+	// below), so the grid's empty slots would be padded with blanks anyway and
+	// the output would be byte-identical without it. The truncation is a
+	// structural invariant, not a fix for an observable bug — the real
+	// invariants are the maximality/whole-column ones asserted separately.
+	const h: History = fakeHist(60);
+	// Build the real block list once (`buildBlocks` owns the block count and the
+	// importance order), then lay it out for a terminal too short to hold it.
+	const all = buildBlocks(h, fakeSnap(), {
+		points: 30,
+		showTokens: true,
+		tpsNow: 10,
+		tokensIn: 10,
+		tokensOut: 20,
+		tokensCacheRead: 30,
+		hitNow: 50,
+		ctxPct: 40,
+		showTokenTotals: false,
+		labelMode: "title",
+		scaleWindowFrac: 1,
+	});
+	const layout = fitLayout(45, 6, all.length, 10);
+	const lines = renderPanel(ansiTheme, all, 45, layout, 60);
+	assert.equal(lines.length, layout.totalRows);
+	assert.ok(layout.shown < all.length, "this case must actually drop blocks");
+	// Names of the drawn blocks are the head of the importance order
+	const text = lines.map(stripAnsi).join("\n");
+	assert.ok(text.includes("CPU"), text);
+	assert.ok(!text.includes("Tokens"), "the tail block must not be drawn");
+});
+
+test("fitLayout: maximal and whole-column — the real invariants behind `shown`", () => {
+	// Two properties that ARE observable, unlike the renderPanel truncation:
+	//  1. **Maximality**: adding one more block must not fit. Otherwise a chart
+	//     was hidden that could have been shown.
+	//  2. **Whole column**: whenever blocks are dropped, `shown` is a multiple of
+	//     `cols` (a non-multiple would mean `shown + 1` has the same `bands`, so
+	//     maximality would already be violated — the two are the same fact seen
+	//     from two sides).
+	for (let w = 1; w <= 260; w++) {
+		for (const count of [2, 3, 4, 5, 6]) {
+			for (let budget = MIN_PANEL_ROWS; budget <= 45; budget++) {
+				const f = fitLayout(w, 6, count, budget);
+				if (f.dropped === 0) continue;
+				assert.equal(
+					f.shown % f.cols,
+					0,
+					`w=${w} count=${count} budget=${budget}: shown=${f.shown} cols=${f.cols}`,
+				);
+				// One more block must NOT fit (same grid must overflow)
+				const more = computeLayout(w, 6, f.shown + 1, budget);
+				assert.ok(
+					more.totalRows > budget,
+					`w=${w} count=${count} budget=${budget}: ${f.shown + 1} blocks fit (${more.totalRows}) but were hidden`,
+				);
+			}
+		}
+	}
 });

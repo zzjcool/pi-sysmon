@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] — 2026-11-12
 
 ### Added
 
@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `layout.shown` keeps the drawn block list and `totalRows` describing the same grid.
   `tui.terminal.rows` is now read per render (through the live Proxy, so a tuiMode switch is
   seen) and joined the memo cache key, alongside `PI_SYSMON_HEIGHT_SHARE`.
+
+### Changed
+
+- **Releases publish with npm trusted publishing (OIDC) instead of a staging token.** The
+  `v*.*.*` tag still triggers the `Release` workflow, but the run's own GitHub OIDC identity is
+  now its only registry credential — there is no `NPM_TOKEN` secret to hold, leak or rotate. The
+  old `npm stage publish` + manual `npm stage approve` split existed because a granular token can
+  only stage; with trusted publishing npm verifies the (repo, workflow filename) pair itself, so
+  the publish is direct. It still runs only after the full PR gate, still dry-runs the tarball
+  first, and still refuses to run if any registry token is set in the environment (a token would
+  silently win over OIDC and drop provenance). `zzjcool/pi-sysmon` +
+  `.github/workflows/release.yml` is the trusted publisher configured on npmjs.com — renaming
+  that file breaks publishing until the entry is updated.
 
 ### Fixed
 
@@ -472,6 +485,7 @@ installable with `pi install npm:pi-sysmon`.
   existing file that only carries the older `enabled: false` field is read as "global default off".
 - `chart` and `line` share one widget, so both follow `above`/`below` placement.
 
+[0.11.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/zzjcool/pi-sysmon/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/zzjcool/pi-sysmon/compare/v0.8.1...v0.9.0

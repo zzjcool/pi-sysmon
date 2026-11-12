@@ -108,6 +108,17 @@ async function loadExtension(flags: Record<string, unknown> = {}) {
 	const cfg = (): Record<string, unknown> =>
 		JSON.parse(readFileSync(configFile, "utf8"));
 	const notifies = () => ui.filter((u) => u.startsWith("notify:"));
+	/** The config file's **preference** keys, or `{}` when the file does not
+	 *  exist. `warned` is a startup latch, not a preference: on a host without a
+	 *  CPU temperature sensor (CI runners included) `session_start` legitimately
+	 *  creates the file just to record the notice it already showed. So "no
+	 *  config write" in these tests means "no preference was written" — a chip
+	 *  click that recorded `mode` / `placement` still fails the assertion. */
+	const prefs = (): Record<string, unknown> => {
+		if (!existsSync(configFile)) return {};
+		const { warned: _warned, ...rest } = cfg();
+		return rest;
+	};
 	// The most recently mounted widget factory (undefined after an unmount).
 	const lastWidget = () => widgets.at(-1) as AnyFn | undefined;
 	// Fake theme **with ANSI escape codes** — same reason as layout.test.ts's
@@ -151,7 +162,7 @@ async function loadExtension(flags: Record<string, unknown> = {}) {
 	const mount = (tuiMode: string) => instantiate(lastWidget(), makeTui(tuiMode));
 	const mountFooter = (tuiMode: string) =>
 		instantiate(footers.at(-1) as AnyFn | undefined, makeTui(tuiMode));
-	return { ctx, entries, ui, sessionStart, sessionShutdown, run, cfg, notifies, lastWidget, mount, mountFooter, makeTui, instantiate, ansiTheme };
+	return { ctx, entries, ui, sessionStart, sessionShutdown, run, cfg, prefs, notifies, lastWidget, mount, mountFooter, makeTui, instantiate, ansiTheme };
 }
 
 /* ------------------------------------------------------------------ */
@@ -227,8 +238,9 @@ test("/sysmon off is session-scoped and never writes the config file", async () 
 		),
 	);
 	// The whole point of the refactor: turning it off must not create/edit the
-	// global default.
-	assert.ok(!existsSync(configFile), "config file must not be created");
+	// global default. (The file itself may exist for the one-time dependency
+	// latch — see `prefs()`.)
+	assert.deepEqual(h.prefs(), {}, "session-scoped off must not write preferences");
 });
 
 test("/sysmon toggle flips state and records it in the session", async () => {
@@ -481,7 +493,7 @@ test("regular mode: no chip, no toggle, no config write — zero side effects", 
 			undefined,
 		);
 		assert.equal(h.ui.length, before, "no widget churn");
-		assert.ok(!existsSync(configFile), "no config write in regular mode");
+		assert.deepEqual(h.prefs(), {}, "no preference write in regular mode");
 	} finally {
 		comp.dispose();
 	}
@@ -516,7 +528,7 @@ test("fullscreen→regular switch: stale chip rectangle is not hit-testable (pi 
 			undefined,
 			"stale rectangle must not be hit-testable after the switch",
 		);
-		assert.ok(!existsSync(configFile), "no config write through the stale window");
+		assert.deepEqual(h.prefs(), {}, "no preference write through the stale window");
 	} finally {
 		comp.dispose();
 	}

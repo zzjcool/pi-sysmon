@@ -446,32 +446,41 @@ fetches.
 
 ### Releasing
 
-Publishing is **two steps, and only the second one is irreversible**.
+Publishing is **one step**: push a version tag. The registry credential is the workflow run's
+own OIDC identity ([npm trusted publishing](https://docs.npmjs.com/trusted-publishers)), so
+there is no `NPM_TOKEN` secret to hold, leak or rotate.
 
 ```sh
-# 1. tag — CI runs the full gate, then STAGES the package
-git tag v0.10.0 && git push origin v0.10.0
+# 1. bump + commit the version (package.json, package-lock.json, CHANGELOG)
+npm version 0.11.0 --no-git-tag-version
+npm run check && git commit -am "chore(release): v0.11.0"
+
+# 2. tag the commit that is already green on main, and push both
+git tag v0.11.0 && git push origin main v0.11.0
 ```
 
 The `Release` workflow reuses the same `check` job as PRs (a tag can never publish something a
-PR did not verify), asserts the tag matches `package.json`, and runs
-`npm stage publish --provenance`. It prints a **stage id** and writes it to the run's job
-summary. Nothing is on the registry yet and no dist-tag points at it.
+PR did not verify), asserts the tag matches `package.json`, asserts no registry token is set in
+the environment (a token would silently win over OIDC and drop provenance), dry-runs the
+tarball, then runs `npm publish --provenance`. npm accepts it because `zzjcool/pi-sysmon` +
+`release.yml` is registered as the package's **trusted publisher** (npmjs.com → package →
+Settings); the only permission involved is `id-token: write`.
 
-```sh
-# 2. approve — a human, with a 2FA OTP
-npm stage approve <stage-id>
-```
+Consequences of that setup:
 
-`npm stage approve` is deliberately not automated: a published version number can never be
-reused, so the irreversible step needs a person present. `npm stage view <id>` /
-`npm stage download <id>` inspect a stage first, and `npm stage reject <id>` discards it.
-
-This needs **npm 12+** (`npm stage` does not exist in npm 11) and an `NPM_TOKEN` repository
-secret with publish rights. The token only ever *stages*, so it never needs to bypass 2FA —
-npm is actively restricting 2FA-bypass tokens for direct publishing, which is another reason
-the irreversible step stays manual. If the approve step is run from a machine that is not
-logged in, `npm login` first.
+- **Renaming `.github/workflows/release.yml` breaks publishing** until the trusted-publisher
+  entry on npmjs.com is updated to the new filename.
+- The publish job must stay **in that file** — npm matches `job_workflow_ref`, which names the
+  called workflow, not its caller. Moving the publish steps into a reusable workflow
+  (`ci.yml`-style) makes the OIDC exchange fail.
+- The publish is irreversible once `npm publish` returns (a version number can never be
+  reused), so the **tag push is the go/no-go**. The dry run in the same job catches a broken
+  tarball or a stale version first. If the run dies after publishing, fix forward with the next
+  version rather than re-tagging.
+- Needs **npm ≥ 11.5.1**; this repo runs a pinned npm 12 via `npx` (the npm bundled with Node
+  22 is 10.x). Staging with `npm stage publish` + manual `npm stage approve` is gone with the
+  token — see the changelog for why it was dropped.
+- A failed run can be re-run from the Actions tab (same tag, no re-push).
 
 ## Implementation Notes
 

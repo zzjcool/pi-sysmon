@@ -17,9 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 22.22.2 is npm 12's floor for `npm stage`
-      # (^22.22.2 || ^24.15.0 || >=26). The release workflow stages with
-      # npm 12, so the checked and the published version are built and
+      # 22.22.2 is npm 12's floor (^22.22.2 || ^24.15.0 || >=26). The release
+      # workflow publishes with a pinned npm 12 (trusted publishing needs
+      # >= 11.5.1), so the checked and the published version are built and
       # tested on the same Node line.
       - uses: actions/setup-node@v4
         with:

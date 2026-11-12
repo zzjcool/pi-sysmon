@@ -1,38 +1,46 @@
 name: Release
 
-# Triggers on a version tag (`v0.10.0`, `v1.2.3`). A tag is the only thing that
+# Triggers on a version tag (`v0.11.0`, `v1.2.3`). A tag is the only thing that
 # can reach the registry, which keeps "what is published" traceable to exactly
 # one commit.
 #
-# This workflow **stages**, it does not publish. npm 12's `stage publish`
-# deliberately bypasses 2FA and hands back a stage id; a human then runs
-# `npm stage approve <id>` with an OTP to move it to the registry. That split is
-# the point: CI holds a granular token it can rotate, and the irreversible step
-# (a version number that can never be reused) needs a person present.
+# Authentication is **trusted publishing** (OIDC), not a token: npm accepts this
+# run because `zzjcool/pi-sysmon` + this filename are registered as the package's
+# trusted publisher on npmjs.com, and the credential is the `id-token: write`
+# permission below — minted per run, expiring with it. There is no NPM_TOKEN
+# secret to leak or rotate. Consequences worth knowing:
+#   · renaming this file **breaks publishing** until the trusted-publisher entry
+#     on npmjs.com is updated to the new name;
+#   · the publish job must stay *in this file* — npm matches `job_workflow_ref`,
+#     which names the called workflow, not its caller, so moving the publish
+#     steps into a reusable workflow makes the OIDC exchange fail;
+#   · publish is irreversible the moment `npm publish` returns, so pushing the
+#     tag is the go/no-go. The dry run below still catches a broken tarball or a
+#     stale version number before anything is written.
 on:
   push:
     tags:
       - "v*.*.*"
 
 env:
-  # Pinned npm for staging. Bump deliberately, never float.
-  NPM12_VERSION: "12.2.1"
+  # Trusted publishing needs npm >= 11.5.1; the npm bundled with this Node is
+  # 10.x. Pinned, never floating: an npm regression must not decide what
+  # publishes a version number that can never be reused. Run through `npx`, not
+  # `npm i -g npm@12`: the global install **uninstalls the npm it is running
+  # on** and dies relinking (`MODULE_NOT_FOUND: Cannot find module
+  # 'promise-retry'`). `--version` prints what is actually running, so the log
+  # records it.
+  NPM_VERSION: "12.2.1"
 
-# Never let two tags race for the same npm version, and never cancel a stage
-# halfway through — a cancelled run leaves no record of whether a stage id was
-# handed out.
+# Never let two tags race for the same npm version, and never cancel a publish
+# halfway through — the rerun would find the version already taken.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-# `contents: read` for checkout. `id-token: write` is **required** by
-# `--provenance`: sigstore mints the attestation from the OIDC token that
-# GitHub only exposes when this permission is granted
-# (`ACTIONS_ID_TOKEN_REQUEST_URL` / `_TOKEN` are absent otherwise, and
-# `@sigstore/sign` fails with "missing id token" instead of degrading).
 permissions:
-  contents: read
-  id-token: write
+  contents: read # checkout
+  id-token: write # the only credential: the OIDC token npm exchanges for publish rights
 
 jobs:
   # Reuse the PR gate instead of restating it. A tag must be exactly as green as
@@ -40,7 +48,7 @@ jobs:
   check:
     uses: ./.github/workflows/ci.yml
 
-  stage:
+  publish:
     needs: check
     runs-on: ubuntu-latest
     steps:
@@ -49,37 +57,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.22.2"
-          registry-url: "https://registry.npmjs.org"
+          # Deliberately **no** `registry-url`: setup-node would write
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc,
+          # i.e. a token path where the OIDC exchange should be. The default
+          # registry is already registry.npmjs.org, so nothing is needed.
 
-      # npm 11 (bundled with Node 22) has no `stage` command; `npm stage` only
-      # exists from npm 12. Run it through `npx npm@<pin>` rather than
-      # `npm install -g npm@12`: the global install **uninstalls the npm it is
-      # running on** and then fails to relink, dying with
-      # `MODULE_NOT_FOUND: Cannot find module 'promise-retry'` from inside its
-      # own arborist. npx leaves the host npm untouched.
-      #
-      # Pinned (not `npm@12`) so a 12.x regression cannot change what
-      # publishes a version number that can never be reused.
-      # `npx ... --version` prints what is actually running, so the log
-      # records it.
-      - name: Resolve npm 12 (the first release with `npm stage`)
+      - name: Resolve npm (trusted publishing needs >= 11.5.1)
         run: |
           set -eu
-          NPM12="npm@${NPM12_VERSION}"
-          echo "NPM12=${NPM12}" >> "$GITHUB_ENV"
-          npx --yes "$NPM12" --version
+          NPM="npm@${NPM_VERSION}"
+          echo "NPM=${NPM}" >> "$GITHUB_ENV"
+          npx --yes "$NPM" --version
 
       - name: Install dev dependencies
         run: npm install --no-audit --no-fund
 
-      # `--ignore-scripts` is deliberate. `prepublishOnly` calls
-      # `npm run check`, and this job runs after the reusable `check`
-      # job already gated the same commit — so without it the suite would
-      # run **three** times (check job, dry run, real stage). Skipping here
-      # does not weaken the guarantee: the gate that matters is the `check`
-      # job, and if it fails the stage job never starts. A manual
-      # `npm publish` from a laptop still gets the guard, because that
-      # invocation does not pass this flag.
       - name: Assert the tag matches package.json
         run: |
           set -eu
@@ -91,79 +83,43 @@ jobs:
           fi
           echo "tag ${GITHUB_REF_NAME} matches pkg ${pkg_version}"
 
-      # --dry-run first: proves the tarball assembles and that the tag/version
-      # agree, before any state is created on the registry.
-      - name: Verify the tarball (dry run)
-        run: |
-          npx --yes "$NPM12" stage publish --dry-run \
-            --access public --ignore-scripts
-
-      - name: Stage on npm
-        id: stage
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # A token in the environment silently wins over the OIDC exchange — npm
+      # then publishes with it and generates no provenance instead of failing.
+      # Refuse rather than ship a release that only *looks* trusted.
+      - name: Assert no registry token shadows OIDC
         run: |
           set -eu
-          # `--provenance` ties the staged tarball to this workflow run and
-          # commit; npm shows the attestation on the version page once approved.
-          out="$(npx --yes "$NPM12" stage publish --access public \
-            --provenance --ignore-scripts 2>&1)"
-          printf '%s\n' "$out"
-          # The stage id only appears in the human-readable trailer
-          # (`+ pkg@ver (staged with id <uuid>)`), so scrape it rather than
-          # parse the whole output. Fail loudly if the wording changes —
-          # silently losing the id leaves a stage nobody knows how to approve.
-          stage_id="$(printf '%s' "$out" \
-            | sed -n 's/.*staged with id \([0-9a-f-]\{36\}\).*/\1/p' | tail -1)"
-          if [ -z "$stage_id" ]; then
-            echo "::error::could not find a stage id in the output above"
-            exit 1
-          fi
-          echo "stage_id=$stage_id" >> "$GITHUB_OUTPUT"
+          for v in NODE_AUTH_TOKEN NPM_TOKEN NODE_TOKEN; do
+            if [ -n "${!v:-}" ]; then
+              echo "::error::$v is set; trusted publishing requires no token"
+              exit 1
+            fi
+          done
 
-      # A stage is invisible unless someone is told about it. This summary is
-      # the only place the approver learns the id.
-      - name: Summary (who approves what)
+      # `--ignore-scripts` is deliberate. `prepublishOnly` calls `npm run check`,
+      # and this job runs after the reusable `check` job already gated the same
+      # commit — so without it the suite would run **twice**. Skipping here does
+      # not weaken the guarantee: the gate that matters is the `check` job, and
+      # if it fails this job never starts. A manual `npm publish` from a laptop
+      # still gets the guard, because that invocation does not pass this flag.
+      - name: Verify the tarball (dry run)
+        run: npx --yes "$NPM" publish --dry-run --access public --ignore-scripts
+
+      # `--provenance` ties the tarball to this workflow run and commit; the
+      # attestation is minted from the same OIDC identity that authorized the
+      # publish, so it needs no extra secret.
+      - name: Publish
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Staged: pi-sysmon ${GITHUB_REF_NAME#v}
+          npx --yes "$NPM" publish --access public \
+            --provenance --ignore-scripts
 
-          The package is **staged, not published**. It does not exist on the
-          registry yet, and no dist-tag points at it.
-
-          Approve it (needs a 2FA OTP, and **npm 12+** — `npm stage` does not
-          exist in npm 11; use `npx npm@${NPM12_VERSION} stage ...` if your
-          local npm is older):
-
-          \`\`\`sh
-          npm stage approve ${{ steps.stage.outputs.stage_id }}
-          \`\`\`
-
-          Or discard it:
-
-          \`\`\`sh
-          npm stage reject ${{ steps.stage.outputs.stage_id }}
-          \`\`\`
-
-          Inspect first if you want to see the tarball:
-
-          \`\`\`sh
-          npm stage view ${{ steps.stage.outputs.stage_id }}
-          npm stage download ${{ steps.stage.outputs.stage_id }}
-          \`\`\`
-
-          Stage id: \`${{ steps.stage.outputs.stage_id }}\`
-          EOF
-
-      - name: Reject the stage if a later step fails
-        # Without this, a run that stages and then fails (e.g. the summary
-        # step) leaves an orphaned stage behind, and the version number is
-        # blocked until someone notices and rejects it by hand.
-        if: failure()
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Summary
         run: |
-          if [ -n "${{ steps.stage.outputs.stage_id }}" ]; then
-            npx --yes "$NPM12" stage reject \
-              "${{ steps.stage.outputs.stage_id }}" || true
-          fi
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "## Published: pi-sysmon ${version}"
+            echo
+            echo "https://www.npmjs.com/package/pi-sysmon/v/${version}"
+            echo
+            echo "Tagged commit: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

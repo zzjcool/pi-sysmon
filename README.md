@@ -422,6 +422,11 @@ On/off has **two scopes**, so it is stored twice:
 - the **current session's** on/off choice is a session entry, written by `/sysmon on|off`,
   so it survives `/resume` of that session without touching any other session.
 
+The same file also carries `warned`: the ids of startup dependency notices already shown
+(e.g. `temp:linux`, `unsupported:win32`). A host whose sources cannot change — no CPU
+temperature sensor, an unsupported platform — is told **once**, not on every launch; remove an
+entry from `warned` (or delete the file) to see that notice again.
+
 The `--sysmon` CLI flag forces the monitor **on for that run only** — it overrides the global
 default but not an in-session `/sysmon off`, since an explicit "off" typed inside the session is
 the more specific statement.
@@ -429,7 +434,7 @@ the more specific statement.
 > **Config compatibility:** an older `pi-sysmon.json` that only carries `enabled: false` (the
 > pre-session-scope form) is read as "the global default is off", so sessions that never touched
 > the switch start off — the behavior the old flag expressed. `/sysmon global on` restores the
-> on-by-default feel.
+> on-by-default feel. A file without `warned` simply owes the dependency notice once more.
 
 ### What gets published
 

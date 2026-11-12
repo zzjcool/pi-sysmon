@@ -60,6 +60,7 @@ import {
 	parseSysmonCommand,
 	resolveEnabled,
 	SESSION_STATE_KEY,
+	startupWarning,
 } from "./state.ts";
 
 // ThemeLike is imported uniformly from chart-panel.ts, avoiding two diverging definitions.
@@ -162,6 +163,9 @@ const STORE_CAP = 4000;
 //   · `mode` / `placement`   = display preferences, keep writing the file
 //     (otherwise every new session would need its charts re-selected)
 //   · `/sysmon on|off`       = session choice, written as a session entry
+//   · `warned`               = ids of dependency notices already shown (see
+//     `startupWarning`) — **not** a preference, a latch: a host without a CPU
+//     sensor must not be told so on every launch
 function configPath(): string {
 	const dir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 	return join(dir, "pi-sysmon.json");
@@ -171,6 +175,8 @@ interface Cfg {
 	enabled?: boolean;
 	mode?: Mode;
 	placement?: Placement;
+	/** Dependency-warning ids already shown; see `startupWarning` in state.ts. */
+	warned?: string[];
 }
 
 type WritePatch = Partial<Cfg>;
@@ -230,6 +236,12 @@ function readCfg(): Cfg {
 		if (m) c.mode = m;
 		if (o.placement === "aboveEditor" || o.placement === "belowEditor")
 			c.placement = o.placement;
+		if (Array.isArray(o.warned)) {
+			// Skip malformed entries instead of rejecting the list: one bad value
+			// must not un-latch every other notice (and re-warn forever).
+			const ids = o.warned.filter((w): w is string => typeof w === "string");
+			if (ids.length > 0) c.warned = ids;
+		}
 		return c;
 	} catch {
 		return {};
@@ -1401,32 +1413,25 @@ export default function (pi: ExtensionAPI) {
 		enabled = false;
 		if (want) enabled = enable(ctx);
 
-		// ── Dependency preflight: warn ONCE per process about unreadable groups ──
-		// Runs only when the monitor is actually mounted, and only on the first
-		// session (module-level latch): the probe spawns a couple of `which`
-		// calls, so `/new` / `/resume` within the same process shouldn't repeat
-		// the warning the user already saw. The async probe (~12ms of `which`
-		// spawns measured) never blocks the first paint — the notify lands
-		// whenever the probes finish.
+		// ── Dependency preflight: warn ONCE PER HOST about unreadable groups ──
+		// Runs only when the monitor is actually mounted. Two latches, because they
+		// answer different questions:
+		//   · `preflightWarned` (this process) — `/new` / `/resume` re-fire
+		//     `session_start`, and the async probe would otherwise notify (and
+		//     rewrite the config) again for the same host;
+		//   · `warned` in the config file — a restart is a new process, and the
+		//     notice is about hardware that will still be missing tomorrow, so the
+		//     ids already shown are persisted (see `startupWarning`).
+		// The async probe (~12ms of `which` spawns measured) never blocks the first
+		// paint — the notify lands whenever the probes finish.
 		if (want && !preflightWarned) {
 			preflightWarned = true;
+			const warned = cfg.warned ?? [];
 			preflightMetricsAsync().then((r) => {
-				if (!r.core) {
-					// Whole platform unsupported (e.g. Windows): every chart would
-					// render zeros — say so up front rather than let the user find
-					// flat lines and file "broken" issues.
-					ctx.ui.notify(
-						`pi-sysmon: ${process.platform} is not supported — CPU/memory/network/disk charts will all read 0 (supported: macOS, Linux). Disable with /sysmon global off.`,
-						"warning",
-					);
-				} else if (!r.temp) {
-					ctx.ui.notify(
-						process.platform === "darwin"
-							? "pi-sysmon: CPU temperature unavailable — install macmon (brew install macmon, Apple Silicon) or osx-cpu-temp (Intel). Other charts work normally."
-							: "pi-sysmon: CPU temperature unavailable — no CPU sensor found under /sys/class/hwmon or /sys/class/thermal. Other charts work normally.",
-						"warning",
-					);
-				}
+				const w = startupWarning(r, process.platform, warned);
+				if (!w) return;
+				ctx.ui.notify(w.message, "warning");
+				writeCfg({ warned: [...warned, w.id] });
 			});
 		}
 	});

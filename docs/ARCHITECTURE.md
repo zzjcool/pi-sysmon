@@ -138,6 +138,15 @@ session-scoping them would mean re-selecting `chart` / `below` in every new sess
 File writes are **merge patches** (read, then merge), otherwise one `/sysmon chart` would wipe
 the `enabled` key it didn't mention.
 
+The same file also carries `warned` — **not a preference, a latch**: the ids of startup
+dependency notices already shown (`temp:linux`, `unsupported:win32`, …). The old latch was a
+module-level boolean, i.e. once per **process**, and every launch is a new process — so a host
+with no CPU temperature sensor was told the same thing on every single start. The decision is
+the pure `startupWarning(verdicts, platform, warned)` in `src/state.ts`: `undefined` = nothing
+to say (all sources present, or already shown), otherwise `{ id, message }`; the caller
+notifies and then appends the id to `warned`. The id carries the platform, so a config dir
+shared between boxes (or a dual-boot) still warns once per host class.
+
 The built-in default is **on**: a fresh config dir has always started enabled — the whole point
 of a monitor is to be visible.
 

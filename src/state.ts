@@ -1,11 +1,14 @@
 /**
- * Enablement scope + command parsing.
+ * Enablement scope + command parsing + the startup-notice latch.
  *
- * Two things live here because both are "rules about scopes" that the extension
+ * Three things live here because all are "rules about scopes" that the extension
  * layer (`index.ts`) can only exercise through a live pi instance:
  *   · **which on/off applies** — session choice vs global default vs `--sysmon`;
  *   · **what a `/sysmon …` argument means** — session switch, global default,
- *     display preference, or a typo.
+ *     display preference, or a typo;
+ *   · **which dependency warning is still owed** — a missing temperature sensor
+ *     is a hardware fact, so the notice is latched across processes instead of
+ *     repeating on every launch.
  * Pure functions, no pi API / fs / state (same reason `blocks.ts` is split out).
  */
 import { parseMode, type Mode, type Placement } from "./blocks.ts";
@@ -137,4 +140,70 @@ export function mergeCfg(
 	const next = { ...prev };
 	for (const [k, v] of Object.entries(patch)) if (v !== undefined) next[k] = v;
 	return next;
+}
+
+/* ------------------------------------------------------------------ */
+/* 5. startupWarning — the once-only dependency notice                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Structural subset of `MetricsPreflight` (`metrics.ts`) the startup notice
+ * cares about. Structural so this module stays free of collector imports.
+ */
+export interface PreflightLike {
+	/** Platform basics readable (`/proc` on Linux, `sysctl` on macOS) */
+	core: boolean;
+	/** A CPU temperature source exists */
+	temp: boolean;
+}
+
+/** A startup dependency warning plus the id it is latched under. */
+export interface StartupWarning {
+	/** Stable key written into the config file's `warned` list once shown. */
+	id: string;
+	message: string;
+}
+
+/**
+ * Which dependency warning (if any) this session start still owes the user.
+ *
+ * **Warn once per host, not once per process.** The verdicts are hardware facts
+ * (no `hwmon` sensor on this box, macOS without `macmon`), so they cannot fix
+ * themselves — the old per-process latch printed the same notice on every
+ * single launch, forever. `warned` is the persisted list of ids already shown
+ * (from `<configDir>/pi-sysmon.json`); the caller appends the returned id after
+ * notifying. The platform is part of the id, so a config dir shared between
+ * boxes (or a dual-boot) still warns once per host class instead of going
+ * silent on the other one.
+ *
+ * Precedence: an unsupported platform wins over a missing sensor — when every
+ * chart reads 0, the temperature line is not the news.
+ *
+ * `undefined` = nothing to say (all sources present, or already shown).
+ */
+export function startupWarning(
+	pre: PreflightLike,
+	platform: string,
+	warned: readonly string[],
+): StartupWarning | undefined {
+	if (!pre.core) {
+		const id = `unsupported:${platform}`;
+		if (warned.includes(id)) return undefined;
+		return {
+			id,
+			message: `pi-sysmon: ${platform} is not supported — CPU/memory/network/disk charts will all read 0 (supported: macOS, Linux). Disable with /sysmon global off.`,
+		};
+	}
+	if (!pre.temp) {
+		const id = `temp:${platform}`;
+		if (warned.includes(id)) return undefined;
+		return {
+			id,
+			message:
+				platform === "darwin"
+					? "pi-sysmon: CPU temperature unavailable — install macmon (brew install macmon, Apple Silicon) or osx-cpu-temp (Intel). Other charts work normally."
+					: "pi-sysmon: CPU temperature unavailable — no CPU sensor found under /sys/class/hwmon or /sys/class/thermal. Other charts work normally.",
+		};
+	}
+	return undefined;
 }

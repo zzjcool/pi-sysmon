@@ -121,6 +121,14 @@ RSS 画成百分比、Tokens 图上把 0–100 命中率画在 tok/s 上）。�
 写文件时用的是 **merge patch**（先读再合并），否则一次 `/sysmon chart`
 会把同一次没提到的 `enabled` 一起抹掉。
 
+同一文件里还有 `warned` —— 它**不是偏好，是锁存器**：记录已经提示过的启动依赖通知 id
+（`temp:linux`、`unsupported:win32` ……）。旧的锁存只是模块级布尔量，也就是**每进程**一次，
+而每次启动都是新进程，于是没有温度传感器的机器每次都被念一遍同样的通知。
+判定逻辑是纯函数 `startupWarning(verdicts, platform, warned)`（`src/state.ts`）：
+返回 `undefined` 表示无话可说（源都正常，或已提示过），否则给出 `{ id, message }`，
+调用方 notify 完之后把 id 追加进 `warned`。id 里带平台，
+所以一份 config dir 被多台机器共用（或双系统）时，每类主机仍然各提示一次。
+
 内置默认是**开**：一个全新的 config dir 从来就是默认开的，监控的意义就是被看见。
 
 ### 5. 响应式列数必须只依赖宽度

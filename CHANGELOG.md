@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tui.terminal.rows` is now read per render (through the live Proxy, so a tuiMode switch is
   seen) and joined the memo cache key, alongside `PI_SYSMON_HEIGHT_SHARE`.
 
+### Fixed
+
+- **The "CPU temperature unavailable" notice now appears once per host, not on every launch.**
+  The latch was a module-level boolean — once per **process** — and every pi launch is a new
+  process, so a machine without a sensor (or without `macmon` on macOS) was told the same thing
+  forever. The ids already shown are persisted in `<configDir>/pi-sysmon.json` as
+  `warned: ["temp:linux", …]`, and the decision moved into the pure
+  `startupWarning(verdicts, platform, warned)` in `src/state.ts`. The id carries the platform, so
+  a config dir shared between boxes still warns once per host class. The same latch covers the
+  "platform not supported" notice (`unsupported:<platform>`), which outranks the temperature
+  one. Delete the `warned` key to see the notice again.
+
 ## [0.10.0] — 2026-10-19
 
 ### Added

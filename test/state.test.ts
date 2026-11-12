@@ -15,6 +15,7 @@ import {
 	parseSysmonCommand,
 	resolveEnabled,
 	SESSION_STATE_KEY,
+	startupWarning,
 	type SessionStateLike,
 } from "../src/state.ts";
 
@@ -276,4 +277,58 @@ test("mergeCfg: empty patch and empty prev both work", () => {
 	assert.deepEqual(mergeCfg({}, { enabled: false }), { enabled: false });
 	assert.deepEqual(mergeCfg({ enabled: false }, {}), { enabled: false });
 	assert.deepEqual(mergeCfg({}, {}), {});
+});
+
+/* ------------------------------------------------------------------ */
+/* 5. startupWarning — the dependency notice is latched across runs     */
+/* ------------------------------------------------------------------ */
+
+const linuxNoTemp = { core: true, temp: false };
+const linuxOk = { core: true, temp: true };
+const unsupported = { core: false, temp: false };
+
+test("startupWarning: a host all of whose sources work gets no notice", () => {
+	assert.equal(startupWarning(linuxOk, "linux", []), undefined);
+});
+
+test("startupWarning: missing temperature sensor warns on the first run", () => {
+	const w = startupWarning(linuxNoTemp, "linux", []);
+	assert.equal(w?.id, "temp:linux");
+	assert.match(w?.message ?? "", /CPU temperature unavailable/);
+	assert.match(w?.message ?? "", /hwmon/);
+});
+
+test("startupWarning: the same notice is NOT repeated once latched", () => {
+	// The regression this guards: the notice printed on **every** pi launch,
+	// because the old latch was a module-level boolean — i.e. per process, and
+	// every launch is a new process.
+	const first = startupWarning(linuxNoTemp, "linux", []);
+	assert.ok(first);
+	assert.equal(startupWarning(linuxNoTemp, "linux", [first.id]), undefined);
+});
+
+test("startupWarning: latching is per host class, not global", () => {
+	// A config dir shared across boxes (or a dual-boot) must not go quiet on the
+	// host that has never been warned.
+	assert.ok(startupWarning(linuxNoTemp, "linux", ["temp:darwin"]));
+	assert.ok(startupWarning(linuxNoTemp, "darwin", ["temp:linux"]));
+});
+
+test("startupWarning: macOS hint names the installable tools", () => {
+	const w = startupWarning(linuxNoTemp, "darwin", []);
+	assert.equal(w?.id, "temp:darwin");
+	assert.match(w?.message ?? "", /macmon/);
+	assert.match(w?.message ?? "", /osx-cpu-temp/);
+});
+
+test("startupWarning: an unsupported platform outranks the missing sensor", () => {
+	// Windows has no temp source either, but "every chart reads 0" is the news.
+	const w = startupWarning(unsupported, "win32", []);
+	assert.equal(w?.id, "unsupported:win32");
+	assert.match(w?.message ?? "", /is not supported/);
+	assert.doesNotMatch(w?.message ?? "", /CPU temperature/);
+});
+
+test("startupWarning: unrelated latched ids do not suppress the notice", () => {
+	assert.ok(startupWarning(linuxNoTemp, "linux", ["unsupported:win32"]));
 });
